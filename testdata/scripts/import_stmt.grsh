@@ -1,0 +1,7 @@
+# import lines are accepted (registry-validated, otherwise documentation).
+import "strings"
+import (
+    "fmt"
+    "sort"
+)
+fmt.Println(strings.ToUpper("imports ok"))

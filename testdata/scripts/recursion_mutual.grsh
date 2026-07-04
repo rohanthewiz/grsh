@@ -1,0 +1,14 @@
+# Mutual recursion works because top-level funcs are hoisted.
+func isEven(n int) bool {
+    if n == 0 {
+        return true
+    }
+    return isOdd(n - 1)
+}
+func isOdd(n int) bool {
+    if n == 0 {
+        return false
+    }
+    return isEven(n - 1)
+}
+fmt.Println(isEven(10), isOdd(7), isEven(3))

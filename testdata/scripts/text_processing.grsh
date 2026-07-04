@@ -1,0 +1,11 @@
+# Log filtering: shell finds, Go processes.
+writeFile("app.log", "INFO start\nERROR disk full\nINFO ok\nERROR net down\nWARN slow\n")
+errs := []string{}
+for _, ln := range lines($(grep ERROR app.log)) {
+    errs = append(errs, strings.TrimPrefix(ln, "ERROR "))
+}
+fmt.Println(len(errs), "errors")
+for _, e := range errs {
+    fmt.Println("-", e)
+}
+grep -c INFO app.log

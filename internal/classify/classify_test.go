@@ -172,6 +172,8 @@ func TestCorpus(t *testing.T) {
 		{`serr.New("boom")`, Go},
 		{`(count > 0)`, Go},
 		{`func retry(n int, f func() error) error {`, Go},
+		{`import "strings"`, Go},
+		{`_ = result`, Go},
 
 		// --- documented tie-breaks ---
 		// httpie-style `a:=1` unquoted contains := and classifies Go;

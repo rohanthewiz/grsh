@@ -19,13 +19,16 @@ for _, f := range glob("*.go") {
 }
 ```
 
-## Status: alpha
+## Status: alpha — v1 feature-complete
 
-**grsh is alpha software** — functional and well-tested, but the language
-surface is still settling and may change without notice. Not yet
-recommended as your login shell or for production automation.
+**grsh is alpha software** — the language surface is still settling and
+may change without notice. Not yet recommended as your login shell or
+for production automation.
 
-Milestones 1–4 of v1 are complete:
+All five v1 milestones are complete. Verified by 40 end-to-end golden
+scripts, a ~160-line real-world classification corpus, per-package unit
+tables, and CLI tests covering exit codes, error positions, and shebang
+execution.
 
 - **Shell core** — pipes, redirections (`>`, `>>`, `<`, `2>`, `2>&1`, `&>`),
   `&&`/`||`/`;`, quoting, `$VAR`/`${VAR}`, tilde and glob expansion,
@@ -99,4 +102,7 @@ go test ./...
 
 Inspired by [goshell](https://github.com/ahmedakef/goshell); design notes
 live in the milestone plan. v2 targets the interactive REPL (the
-`runner.Session.Eval` seam), background jobs, and more Go surface.
+`runner.Session.Eval` seam is already in place — classifier scope,
+interpreter globals, and the shell side table all persist across Eval
+calls), background jobs and job control, heredocs, struct methods, and a
+wider registry surface.

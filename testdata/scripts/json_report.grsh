@@ -1,0 +1,23 @@
+# JSON in, computed report out.
+writeFile("data.json", `[{"name":"api","errors":3},{"name":"web","errors":1},{"name":"db","errors":7}]`)
+raw, _ := readFile("data.json")
+data, err := json.Parse(raw)
+if err != nil {
+    fmt.Println("bad json")
+    exit 1
+}
+items := data.([]any)
+worst := ""
+most := -1
+total := 0
+for _, it := range items {
+    m := it.(map[string]any)
+    n := int(m["errors"].(float64))
+    total += n
+    if n > most {
+        most = n
+        worst = m["name"].(string)
+    }
+}
+fmt.Println("services:", len(items), "total errors:", total)
+fmt.Println("worst:", worst, "with", most)

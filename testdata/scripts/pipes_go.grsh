@@ -1,0 +1,9 @@
+# A classic bash-awkward task: word frequency with a real map.
+printf 'apple\nbanana\napple\ncherry\napple\nbanana\n' > fruits.txt
+counts := map[string]int{}
+for _, w := range lines($(cat fruits.txt)) {
+    counts[w]++
+}
+for w, n := range counts {
+    fmt.Println(w, n)
+}

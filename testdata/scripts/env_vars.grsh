@@ -1,0 +1,8 @@
+# Environment round trip between shell and Go.
+export GRSH_E1=alpha
+echo $GRSH_E1 ${GRSH_E1}beta
+fmt.Println(env("GRSH_E1"))
+setenv("GRSH_E2", "from go")
+echo $GRSH_E2
+unset GRSH_E1
+echo "gone: [$GRSH_E1]"

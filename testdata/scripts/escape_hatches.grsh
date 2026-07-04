@@ -1,0 +1,7 @@
+# Escape hatches: a declared variable shadowing a command name.
+time := "shadowed value"
+fmt.Println(time)
+sh time true 2> /dev/null
+fmt.Println("time command ok:", ok())
+(1 + 2)
+echo done

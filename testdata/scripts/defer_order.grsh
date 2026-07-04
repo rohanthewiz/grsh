@@ -1,0 +1,9 @@
+# Defer: LIFO order, arguments evaluated at defer time, per-frame.
+func work() {
+    for i := 1; i <= 3; i++ {
+        defer fmt.Println("cleanup", i)
+    }
+    fmt.Println("working")
+}
+work()
+fmt.Println("after work")

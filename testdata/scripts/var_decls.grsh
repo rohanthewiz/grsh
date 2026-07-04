@@ -1,0 +1,15 @@
+# var/const declaration forms and zero values.
+var n int
+var s string
+var f float64
+var flag bool
+fmt.Println(n, s == "", f, flag)
+var x, y = 1, "two"
+fmt.Println(x, y)
+const answer = 42
+fmt.Println(answer * 1)
+var zs []string
+zs = append(zs, "z")
+fmt.Println(zs, len(zs))
+var m map[string]int
+fmt.Println(len(m))

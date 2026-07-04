@@ -56,6 +56,7 @@ var goKeywords = map[string]bool{
 	"defer": true, "break": true, "continue": true, "fallthrough": true,
 	"case": true, "default": true, "else": true, "struct": true,
 	"interface": true, "map": true, "chan": true, "range": true,
+	"import": true,
 }
 
 // Scope tracks declared identifiers for rule 6a.
