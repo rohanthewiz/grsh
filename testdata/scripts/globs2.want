@@ -1,0 +1,6 @@
+car.txt cat.txt
+cab.log cat.txt
+cab.log
+*.log
+missing-*.xyz
+3

@@ -166,10 +166,11 @@ func (c *Classifier) classifyLine(t string) (Kind, string) {
 	if hasTopLevelDefine(t) {
 		return Go, "define"
 	}
-	// Rule 6: leading identifier known to Go.
+	// Rule 6: leading identifier known to Go. The blank identifier is
+	// always "declared" (`_ = expr` discards a value).
 	if tok != "" {
 		rest := strings.TrimLeft(t[len(tok):], " \t")
-		if c.scope.Has(tok) && startsGoOp(rest) {
+		if (tok == "_" || c.scope.Has(tok)) && startsGoOp(rest) {
 			return Go, "declared-ident"
 		}
 		// Package selector must be immediate: `fmt.Println` yes, `time ls` no.

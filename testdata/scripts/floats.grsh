@@ -1,0 +1,9 @@
+# Float arithmetic, promotion, math package.
+x := 1.5
+y := x * 2
+fmt.Println(y)
+fmt.Println(3 / 2, 3.0 / 2, float64(3) / 2)
+fmt.Println(math.Sqrt(81), math.Floor(2.9), math.Ceil(2.1))
+fmt.Println(math.Round(2.5), math.Abs(-4.25))
+fmt.Println(int(9.99))
+fmt.Println(min(2.5, 2), max(10, 9.5))

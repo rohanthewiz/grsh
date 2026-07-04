@@ -1,0 +1,6 @@
+# source shares functions, variables, and aliases with the caller.
+writeFile("lib.grsh", "func triple(n int) int {\n    return n * 3\n}\nshared := \"from lib\"\nalias hi='echo hey'\n")
+source lib.grsh
+fmt.Println(triple(7))
+fmt.Println(shared)
+hi there

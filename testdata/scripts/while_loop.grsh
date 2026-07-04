@@ -1,0 +1,22 @@
+# for as while, infinite for with break, continue.
+n := 1
+for n < 100 {
+    n = n * 3
+}
+fmt.Println(n)
+count := 0
+for {
+    count++
+    if count >= 5 {
+        break
+    }
+}
+fmt.Println(count)
+evens := 0
+for i := range 10 {
+    if i%2 == 1 {
+        continue
+    }
+    evens++
+}
+fmt.Println(evens)

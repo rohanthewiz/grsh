@@ -1,0 +1,4 @@
+built at runtime
+sh err is nil: true
+captured: 2 err nil: true
+failure reported: true

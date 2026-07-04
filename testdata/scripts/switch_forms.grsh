@@ -1,0 +1,25 @@
+# switch: tagged, tagless, with init, default, multi-value cases.
+mode := "fast"
+switch mode {
+case "slow", "medium":
+    fmt.Println("take your time")
+case "fast":
+    fmt.Println("zoom")
+default:
+    fmt.Println("unknown")
+}
+n := 42
+switch {
+case n < 0:
+    fmt.Println("negative")
+case n == 0:
+    fmt.Println("zero")
+default:
+    fmt.Println("positive")
+}
+switch k := n % 5; k {
+case 2:
+    fmt.Println("remainder two")
+default:
+    fmt.Println("remainder", k)
+}

@@ -1,0 +1,8 @@
+# sh() and capture() run dynamically built command lines.
+word := "runtime"
+err := sh("echo built at " + word)
+fmt.Println("sh err is nil:", err == nil)
+out, err2 := capture("printf 'a\\nb\\n' | wc -l | tr -d ' '")
+fmt.Println("captured:", out, "err nil:", err2 == nil)
+_, err3 := capture("false")
+fmt.Println("failure reported:", err3 != nil)

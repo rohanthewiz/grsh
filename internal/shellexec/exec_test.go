@@ -175,6 +175,8 @@ func TestSplitQuoted(t *testing.T) {
 		{`printf a\ b`, []string{"printf", "a b"}},
 		{`ls  -la`, []string{"ls", "-la"}},
 		{`x ''`, []string{"x", ""}},
+		{`printf "%s!\n"`, []string{"printf", `%s!\n`}},
+		{`echo "a \" b" '\n'`, []string{"echo", `a " b`, `\n`}},
 	}
 	for _, tc := range tests {
 		got := splitQuoted(tc.in)

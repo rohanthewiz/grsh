@@ -1,0 +1,8 @@
+# Redirection combos. (/bin/sh because a leading `sh` is grsh's own
+# force-shell escape prefix.)
+/bin/sh -c 'echo to-out; echo to-err 1>&2' > both.txt 2>&1
+sort both.txt
+/bin/sh -c 'echo more-err 1>&2' 2>> both.txt
+grep -c err both.txt
+/bin/sh -c 'echo all1; echo all2 1>&2' &> all.txt
+wc -l < all.txt | tr -d ' '

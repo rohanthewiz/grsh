@@ -1,0 +1,20 @@
+# Slices and maps: make, append, copy, delete, comma-ok, slicing.
+xs := make([]int, 0, 4)
+xs = append(xs, 3, 1, 2)
+fmt.Println(len(xs), cap(xs) >= 3)
+ys := make([]int, 3)
+copy(ys, xs)
+ys[0] = 99
+fmt.Println(xs[0], ys[0])
+fmt.Println(xs[1:3])
+
+m := make(map[string]int)
+m["a"] = 1
+m["b"] = 2
+v, found := m["a"]
+_, missing := m["nope"]
+fmt.Println(v, found, missing)
+delete(m, "a")
+fmt.Println(len(m))
+sort.Ints(xs)
+fmt.Println(xs)

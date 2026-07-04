@@ -290,7 +290,9 @@ func splitQuoted(s string) []string {
 			inWord = true
 			q := c
 			for i++; i < len(s) && s[i] != q; i++ {
-				if q == '"' && s[i] == '\\' && i+1 < len(s) {
+				// Inside double quotes, backslash escapes only \ and ";
+				// otherwise it is literal (so "%s!\n" keeps its \n).
+				if q == '"' && s[i] == '\\' && i+1 < len(s) && (s[i+1] == '\\' || s[i+1] == '"') {
 					i++
 				}
 				w.WriteByte(s[i])

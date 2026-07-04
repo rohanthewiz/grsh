@@ -1,0 +1,25 @@
+# Closures: shared capture, factories, functions as values.
+func makeCounter(start int) func() int {
+    n := start
+    return func() int {
+        n++
+        return n
+    }
+}
+c1 := makeCounter(10)
+c2 := makeCounter(100)
+fmt.Println(c1(), c1(), c2(), c1())
+
+# Closures share their captured variable.
+base := 0
+inc := func() { base += 10 }
+inc()
+inc()
+fmt.Println("base is now", base)
+
+# Function values pass as arguments.
+func apply(n int, f func(int) int) int {
+    return f(n)
+}
+double := func(x int) int { return x * 2 }
+fmt.Println(apply(21, double))

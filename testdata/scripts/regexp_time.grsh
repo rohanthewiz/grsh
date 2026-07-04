@@ -1,0 +1,12 @@
+# Registry methods via reflection: regexp and time.
+re := regexp.MustCompile(`[0-9]+`)
+fmt.Println(re.FindString("order 1234 shipped"))
+fmt.Println(re.FindAllString("a1 b22 c333", -1))
+matched, err := regexp.MatchString(`^gr.h$`, "grsh")
+fmt.Println(matched, err == nil)
+
+t, err2 := time.Parse(time.DateOnly, "2026-07-04")
+if err2 == nil {
+    fmt.Println(t.Year(), t.Month(), t.Day())
+    fmt.Println(t.Format("Jan 2, 2006"))
+}

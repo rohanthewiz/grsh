@@ -1,0 +1,6 @@
+# Nested command substitution, both in shell and Go contexts.
+echo outer $(echo mid $(echo inner))
+depth := $(echo $(echo two levels))
+fmt.Println(depth)
+combined := $(printf '%s-%s' $(echo left) $(echo right))
+fmt.Println(combined)

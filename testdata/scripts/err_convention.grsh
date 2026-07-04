@@ -1,0 +1,9 @@
+# (T, error) convention: two-value form hands you the error.
+content, err := readFile("does-not-exist.txt")
+fmt.Println("missing file handled:", err != nil, "content empty:", content == "")
+writeFile("note.txt", "hello file\n")
+got, err2 := readFile("note.txt")
+if err2 == nil {
+    fmt.Print(got)
+}
+fmt.Println("exists:", exists("note.txt"), exists("nope.txt"))

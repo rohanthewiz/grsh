@@ -1,0 +1,8 @@
+[two words]
+[prefix two words suffix]
+<a>
+<b c>
+<d>
+the answer is 42
+braces {n} stay literal in single quotes
+{n} escaped braces

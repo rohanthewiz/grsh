@@ -1,0 +1,19 @@
+# Struct declaration forms: zero values, var, positional literals.
+type Job struct {
+    Name    string
+    Retries int
+    Done    bool
+}
+var j Job
+fmt.Println(j)
+j.Name = "backup"
+j.Retries = j.Retries + 2
+fmt.Println(j.Name, j.Retries, j.Done)
+k := Job{"sync", 1, true}
+fmt.Println(k)
+jobs := []any{j, k}
+for _, item := range jobs {
+    jb := item.(any)
+    _ = jb
+}
+fmt.Println("jobs held:", len(jobs))

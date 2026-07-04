@@ -1,0 +1,15 @@
+# strings/strconv surface and string handling.
+s := "  Hello, grsh!  "
+fmt.Println(trim(s))
+fmt.Println(strings.ToUpper("loud"), strings.ToLower("QUIET"))
+fmt.Println(strings.Split("a,b,c", ","))
+fmt.Println(strings.Join([]string{"x", "y", "z"}, "-"))
+fmt.Println(strings.Contains("haystack", "hay"), strings.HasSuffix("file.go", ".go"))
+fmt.Println(strings.ReplaceAll("na na na", "na", "batman"))
+n, err := strconv.Atoi("42")
+if err == nil {
+    fmt.Println(n + 1)
+}
+fmt.Println(strconv.Itoa(7) + "!")
+fmt.Println(len("abc"), "abc"[0] == byte('a'))
+fmt.Println("abcdef"[2:4])

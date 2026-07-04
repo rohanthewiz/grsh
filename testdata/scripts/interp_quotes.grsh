@@ -1,0 +1,10 @@
+# {expr} interpolation: one word per string, splicing, quoting contexts.
+name := "two words"
+printf '[%s]\n' {name}
+printf '[%s]\n' "prefix {name} suffix"
+parts := []string{"a", "b c", "d"}
+printf '<%s>\n' {parts}
+n := 6 * 7
+echo "the answer is {n}"
+echo 'braces {n} stay literal in single quotes'
+echo \{n\} escaped braces

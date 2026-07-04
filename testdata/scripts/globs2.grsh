@@ -1,0 +1,8 @@
+# Glob forms: star, question mark, char class, quoting, no-match.
+touch cat.txt car.txt cab.log dog.txt
+echo ca?.txt
+echo ca[bt].*
+echo *.log
+echo "*.log"
+echo missing-*.xyz
+fmt.Println(len(glob("*.txt")))
