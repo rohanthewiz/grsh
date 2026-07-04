@@ -19,9 +19,13 @@ for _, f := range glob("*.go") {
 }
 ```
 
-## Status
+## Status: alpha
 
-Early but functional. Milestones 1–4 of v1 are complete:
+**grsh is alpha software** — functional and well-tested, but the language
+surface is still settling and may change without notice. Not yet
+recommended as your login shell or for production automation.
+
+Milestones 1–4 of v1 are complete:
 
 - **Shell core** — pipes, redirections (`>`, `>>`, `<`, `2>`, `2>&1`, `&>`),
   `&&`/`||`/`;`, quoting, `$VAR`/`${VAR}`, tilde and glob expansion,
