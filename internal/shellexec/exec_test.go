@@ -163,3 +163,23 @@ func TestAlias(t *testing.T) {
 		t.Errorf("alias: out=%q", out)
 	}
 }
+
+func TestSplitQuoted(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{`echo hello`, []string{"echo", "hello"}},
+		{`grep "two words"`, []string{"grep", "two words"}},
+		{`grep 'a b' c`, []string{"grep", "a b", "c"}},
+		{`printf a\ b`, []string{"printf", "a b"}},
+		{`ls  -la`, []string{"ls", "-la"}},
+		{`x ''`, []string{"x", ""}},
+	}
+	for _, tc := range tests {
+		got := splitQuoted(tc.in)
+		if strings.Join(got, "\x00") != strings.Join(tc.want, "\x00") {
+			t.Errorf("splitQuoted(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

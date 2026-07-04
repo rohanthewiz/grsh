@@ -266,10 +266,50 @@ func expandAlias(st *State, argv []string) []string {
 			break
 		}
 		seen[argv[0]] = true
-		// v1: alias values are split on whitespace (no nested quoting).
-		argv = append(strings.Fields(val), argv[1:]...)
+		argv = append(splitQuoted(val), argv[1:]...)
 	}
 	return argv
+}
+
+// splitQuoted splits an alias value into words, honoring single/double
+// quotes and backslash escapes (no expansion — aliases are literal).
+func splitQuoted(s string) []string {
+	var out []string
+	var w strings.Builder
+	inWord := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case ' ', '\t':
+			if inWord {
+				out = append(out, w.String())
+				w.Reset()
+				inWord = false
+			}
+		case '\'', '"':
+			inWord = true
+			q := c
+			for i++; i < len(s) && s[i] != q; i++ {
+				if q == '"' && s[i] == '\\' && i+1 < len(s) {
+					i++
+				}
+				w.WriteByte(s[i])
+			}
+		case '\\':
+			inWord = true
+			if i+1 < len(s) {
+				i++
+				w.WriteByte(s[i])
+			}
+		default:
+			inWord = true
+			w.WriteByte(c)
+		}
+	}
+	if inWord {
+		out = append(out, w.String())
+	}
+	return out
 }
 
 // userErr reports a user-level failure bash-style: message on stderr,

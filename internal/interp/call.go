@@ -462,6 +462,30 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 		}
 		return []Value{reflect.Copy(dst, src)}, true, nil
 
+	case "min", "max":
+		if len(call.Args) == 0 {
+			return nil, true, in.errAt(call, name+" expects at least one argument")
+		}
+		args, err := in.evalArgs(env, call)
+		if err != nil {
+			return nil, true, err
+		}
+		best := args[0]
+		for _, a := range args[1:] {
+			op := token.LSS
+			if name == "max" {
+				op = token.GTR
+			}
+			better, berr := in.binaryOp(call, op, a, best)
+			if berr != nil {
+				return nil, true, berr
+			}
+			if better == true {
+				best = a
+			}
+		}
+		return []Value{best}, true, nil
+
 	case "make":
 		if len(call.Args) < 1 {
 			return nil, true, in.errAt(call, "make expects a type")

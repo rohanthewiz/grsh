@@ -85,6 +85,9 @@ func NewSession(o Options) *Session {
 	for name := range fns {
 		cls.Predeclare(name)
 	}
+	// Go builtin functions classify as Go in call position (`delete(m, k)`)
+	// — but only with Go punctuation after, so `make build` stays shell.
+	cls.Predeclare("len", "cap", "append", "delete", "copy", "make", "min", "max")
 	s := &Session{
 		st:      st,
 		stdio:   stdio,

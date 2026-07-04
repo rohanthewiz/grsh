@@ -49,6 +49,10 @@ Milestones 1–4 of v1 are complete:
 Errors report real `script.grsh:line` positions (a `//line` directive maps
 the transformed program back to your source).
 
+**Full language reference: [docs/LANGUAGE.md](docs/LANGUAGE.md)** —
+classification rules, shell features, the Go subset, bridge semantics,
+builtins, and every deliberate difference from bash.
+
 ## How a line is classified
 
 Deterministic rules, in order — see `internal/classify`:
