@@ -1,0 +1,33 @@
+#!/usr/bin/env grsh
+# The bridge between worlds: captures, status, splicing, helpers.
+
+# Two-value capture: err is nil on success, set on failure.
+out, err := $(echo captured fine)
+if err == nil {
+    fmt.Println("ok:", out)
+}
+bad, err2 := $(false)
+if err2 != nil {
+    fmt.Println("bad exit noticed, empty output:", bad == "")
+}
+
+# Single-value capture never aborts; status() reports the exit code.
+nothing := $(false)
+fmt.Println("status after false:", status(), "ok():", ok())
+fmt.Println("nothing is empty:", nothing == "")
+
+# []string interpolation splices into multiple argv words.
+words := []string{"alpha", "beta", "gamma"}
+printf '%s\n' {words}
+
+# lines/fields/trim helpers.
+multi := $(printf 'one\ntwo\nthree\n')
+fmt.Println("line count:", len(lines(multi)))
+fmt.Println("fields:", len(fields("a b  c")))
+fmt.Println("trimmed:", trim("  padded  "))
+
+# Shell status drives Go control flow.
+true
+if ok() {
+    fmt.Println("true left status 0")
+}

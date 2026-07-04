@@ -1,0 +1,6 @@
+# && and || short-circuiting; ; continues past failure.
+true && echo and-ok
+false || echo or-ok
+false && echo hidden
+true || echo hidden
+false; echo after-false

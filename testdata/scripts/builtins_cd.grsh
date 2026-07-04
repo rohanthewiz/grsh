@@ -1,0 +1,9 @@
+# Builtins: cd, alias/unalias, quoted-empty args.
+mkdir -p d1
+cd d1
+echo "in $(basename $PWD)"
+cd ..
+alias ll='echo LL'
+ll works
+unalias ll
+echo "args: $# [$1] [$2]"

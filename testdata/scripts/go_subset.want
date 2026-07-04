@@ -1,0 +1,14 @@
+HOISTED!
+fib(10) = 55
+counter = 2
+sum = 10
+Repo{Name: grsh, Stars: 43}
+body
+defer: last registered, first run
+defer: first registered, last run
+amy 9
+kai 5
+zoe 3
+tool: grsh
+alpha,bravo,charlie,delta
+git says: true

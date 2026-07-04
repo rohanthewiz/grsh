@@ -1,0 +1,81 @@
+#!/usr/bin/env grsh
+# M4 acceptance: functions (incl. recursion + forward refs), closures,
+# structs, defer, maps, slices, JSON, sorting, and shelling out.
+
+# Forward reference: shout is defined below but callable here via hoisting.
+fmt.Println(shout("hoisted"))
+
+func fib(n int) int {
+    if n < 2 {
+        return n
+    }
+    return fib(n-1) + fib(n-2)
+}
+
+func shout(s string) string {
+    return strings.ToUpper(s) + "!"
+}
+
+fmt.Println("fib(10) =", fib(10))
+
+# Closures capture by reference.
+counter := 0
+bump := func() int {
+    counter++
+    return counter
+}
+bump()
+bump()
+fmt.Println("counter =", counter)
+
+# Variadic user function.
+func sum(nums ...int) int {
+    total := 0
+    for _, n := range nums {
+        total += n
+    }
+    return total
+}
+fmt.Println("sum =", sum(1, 2, 3, 4))
+
+# Structs.
+type Repo struct {
+    Name  string
+    Stars int
+}
+r := Repo{Name: "grsh", Stars: 42}
+r.Stars = r.Stars + 1
+fmt.Println(r)
+
+# Defer runs LIFO at scope exit.
+func withDefers() {
+    defer fmt.Println("defer: first registered, last run")
+    defer fmt.Println("defer: last registered, first run")
+    fmt.Println("body")
+}
+withDefers()
+
+# Maps + sorted iteration (grsh ranges string-keyed maps in sorted order).
+ages := map[string]int{"zoe": 3, "amy": 9, "kai": 5}
+for name, age := range ages {
+    fmt.Println(name, age)
+}
+
+# JSON round trip.
+payload := `{"tool": "grsh", "version": 1, "tags": ["go", "shell"]}`
+data, err := json.Parse(payload)
+if err != nil {
+    fmt.Println("json error")
+} else {
+    m := data.(map[string]any)
+    fmt.Println("tool:", m["tool"])
+}
+
+# Sorting.
+names := []string{"delta", "alpha", "charlie", "bravo"}
+sort.Strings(names)
+fmt.Println(strings.Join(names, ","))
+
+# Shell out to git (deterministic prefix only).
+v := $(git --version)
+fmt.Println("git says:", strings.HasPrefix(v, "git version"))

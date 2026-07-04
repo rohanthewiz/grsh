@@ -1,0 +1,5 @@
+# errexit(true) = bash set -e for statement-position commands.
+errexit(true)
+echo first
+false
+echo never reached

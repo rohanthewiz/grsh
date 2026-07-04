@@ -1,0 +1,11 @@
+ok: captured fine
+bad exit noticed, empty output: true
+status after false: 1 ok(): false
+nothing is empty: true
+alpha
+beta
+gamma
+line count: 3
+fields: 3
+trimmed: padded
+true left status 0

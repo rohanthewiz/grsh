@@ -1,0 +1,7 @@
+# Script arguments: $1..$9, $#, $@ (always one field per arg), args().
+echo "count: $#"
+echo "first: $1, second: $2"
+printf '[%s]\n' "$@"
+for i, a := range args() {
+    fmt.Println("arg", i, "=", a)
+}

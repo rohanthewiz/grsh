@@ -1,0 +1,9 @@
+# Command substitution and globbing.
+printf 'alpha\n' > a1.txt
+printf 'beta\n' > a2.txt
+echo a*.txt
+echo "count: $(ls a*.txt | wc -l | tr -d ' ')"
+echo nomatch*.xyz
+echo $(printf 'one two\n')
+echo "$(printf 'one   two\n')"
+echo up: $(echo hi | tr a-z A-Z)

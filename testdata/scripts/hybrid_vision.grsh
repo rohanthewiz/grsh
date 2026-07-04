@@ -1,0 +1,16 @@
+#!/usr/bin/env grsh
+# The vision script from the plan: shell and Go interleaved.
+printf 'package main\n' > tiny.go
+printf 'line\nline\nline\n' > big.go
+
+for _, f := range glob("*.go") {
+    out := $(wc -l {f})
+    if len(fields(out)) > 0 && fields(out)[0] > "1" {
+        fmt.Println(f, "has multiple lines")
+    } else {
+        fmt.Println(f, "is small")
+    }
+}
+
+count := $(ls *.go | wc -l | tr -d ' ')
+echo "go files: {count}"

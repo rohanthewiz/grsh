@@ -1,0 +1,4 @@
+# source runs another script in the current session.
+printf 'echo sourced-ok\nexport GRSH_SRC=yes\n' > lib.grsh
+source lib.grsh
+echo "var: $GRSH_SRC"

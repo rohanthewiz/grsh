@@ -1,0 +1,8 @@
+count: 3
+first: one, second: two
+[one]
+[two]
+[three]
+arg 0 = one
+arg 1 = two
+arg 2 = three

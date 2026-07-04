@@ -1,0 +1,7 @@
+# Line continuations: trailing &&, backslash, trailing pipe.
+echo start &&
+  echo continued
+printf '%s\n' \
+  wrapped
+printf 'z\ny\n' |
+  sort

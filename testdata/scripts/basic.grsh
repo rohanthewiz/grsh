@@ -1,0 +1,8 @@
+#!/usr/bin/env grsh
+# Basics: words, quoting, env vars, sequencing, comments.
+echo hello world
+echo 'single $HOME stays literal'
+export GRSH_G1=hi
+echo "$GRSH_G1 there"
+echo one; echo two
+echo skipped # trailing comment

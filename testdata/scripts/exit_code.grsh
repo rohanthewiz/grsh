@@ -1,0 +1,4 @@
+# exit stops the script with the given code.
+echo before
+exit 3
+echo never

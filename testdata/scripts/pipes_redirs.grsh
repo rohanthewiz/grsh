@@ -1,0 +1,7 @@
+# Pipes and redirections.
+printf 'b\na\nc\n' | sort > sorted.txt
+cat sorted.txt
+printf 'x\n' >> sorted.txt
+wc -l < sorted.txt | tr -d ' '
+ls nofile_xyz 2> err.txt || echo failed as expected
+grep -c nofile_xyz err.txt
