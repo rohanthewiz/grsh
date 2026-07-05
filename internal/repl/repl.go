@@ -34,6 +34,15 @@ func Run(sess *runner.Session, version string) int {
 		AutoComplete:    newCompleter(sess.Idents),
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
+		// Drop ^Z at the prompt: readline's default handler SIGTSTPs the
+		// PARENT process on macOS — suspending the user's outer shell.
+		// ^Z during a foreground command suspends that job instead.
+		FuncFilterInputRune: func(r rune) (rune, bool) {
+			if r == readline.CharCtrlZ {
+				return r, false
+			}
+			return r, true
+		},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "grsh: %v\n", err)
@@ -51,6 +60,13 @@ func Run(sess *runner.Session, version string) int {
 		}
 	}()
 	defer signal.Stop(sigc)
+
+	// Job control. Note: no blanket signal.Ignore here — SIG_IGN survives
+	// exec, so children would inherit an ignored SIGTSTP and ^Z would do
+	// nothing. grsh itself doesn't need TSTP ignored (readline is raw at
+	// the prompt and filters ^Z; a running job owns the terminal), and
+	// SIGTTOU is ignored only around tcsetpgrp (see shellexec.tcSetpgrp).
+	sess.SetInteractive(true)
 
 	fmt.Printf("grsh %s — type exit or Ctrl+D to quit\n", version)
 	return loop(sess, rl, os.Stdout, os.Stderr)

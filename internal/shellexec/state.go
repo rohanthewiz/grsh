@@ -15,12 +15,13 @@ import (
 
 // State is the mutable shell state threaded through execution.
 type State struct {
-	LastStatus int
-	ErrExit    bool // abort script when a statement-position command fails
-	PipeFail   bool // pipeline status = rightmost nonzero, not just the last
-	Aliases    map[string]string
-	ScriptName string   // $0
-	ScriptArgs []string // $1.. / $@ / $#
+	LastStatus  int
+	ErrExit     bool // abort script when a statement-position command fails
+	PipeFail    bool // pipeline status = rightmost nonzero, not just the last
+	Interactive bool // REPL session: enables job control (own pgroups, ^Z)
+	Aliases     map[string]string
+	ScriptName  string   // $0
+	ScriptArgs  []string // $1.. / $@ / $#
 
 	// SourceFn runs another script in the current session (the `source`
 	// builtin). Wired up by the runner to avoid an import cycle.

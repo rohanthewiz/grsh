@@ -14,7 +14,7 @@ import (
 var builtinNames = map[string]bool{
 	"cd": true, "export": true, "unset": true, "exit": true,
 	"alias": true, "unalias": true, "source": true, ".": true,
-	"jobs": true, "wait": true, "fg": true,
+	"jobs": true, "wait": true, "fg": true, "bg": true,
 }
 
 func isBuiltin(name string) bool { return builtinNames[name] }
@@ -55,6 +55,8 @@ func runBuiltin(st *State, name string, args []string, stdio Stdio) (int, error)
 		return builtinWait(st, args, stdio)
 	case "fg":
 		return builtinFg(st, args, stdio)
+	case "bg":
+		return builtinBg(st, args, stdio)
 	}
 	return userErr(stdio, serr.New("unknown builtin", "name", name))
 }
@@ -66,6 +68,8 @@ func builtinJobs(st *State, stdio Stdio) (int, error) {
 			fmt.Fprintf(stdio.Out, "[%d]  Done       %s\n", ji.ID, ji.Cmdline)
 		case ji.State == JobDone:
 			fmt.Fprintf(stdio.Out, "[%d]  Exit %-5d %s\n", ji.ID, ji.Status, ji.Cmdline)
+		case ji.State == JobStopped:
+			fmt.Fprintf(stdio.Out, "[%d]  Stopped    %s\n", ji.ID, ji.Cmdline)
 		default:
 			fmt.Fprintf(stdio.Out, "[%d]  Running    %s\n", ji.ID, ji.Cmdline)
 		}
@@ -76,10 +80,16 @@ func builtinJobs(st *State, stdio Stdio) (int, error) {
 }
 
 // builtinWait collects jobs and, like bash, removes them from the table —
-// a later `wait %1` must never match an already-collected job.
+// a later `wait %1` must never match an already-collected job. Stopped
+// jobs are skipped with a warning: blocking on one would deadlock the
+// shell (nothing left to resume it, and the REPL absorbs Ctrl+C).
 func builtinWait(st *State, args []string, stdio Stdio) (int, error) {
 	if len(args) == 0 {
 		for _, j := range st.Jobs.All() {
+			if state, _ := st.Jobs.stateOf(j); state == JobStopped {
+				fmt.Fprintf(stdio.Err, "grsh: wait: job %d is stopped (fg/bg it first)\n", j.ID)
+				continue
+			}
 			st.Jobs.Wait(j)
 			st.Jobs.Reap(j)
 		}
@@ -92,15 +102,20 @@ func builtinWait(st *State, args []string, stdio Stdio) (int, error) {
 			fmt.Fprintf(stdio.Err, "grsh: wait: %s: no such job\n", spec)
 			return 127, nil
 		}
+		if state, _ := st.Jobs.stateOf(j); state == JobStopped {
+			fmt.Fprintf(stdio.Err, "grsh: wait: job %d is stopped (fg/bg it first)\n", j.ID)
+			return 1, nil
+		}
 		status = st.Jobs.Wait(j)
 		st.Jobs.Reap(j)
 	}
 	return status, nil
 }
 
-// builtinFg waits for a job in the foreground. v1 has no terminal handoff
-// (the job was started on /dev/null stdin and is never stopped), so fg
-// means "block until it finishes and take its status".
+// builtinFg brings a job to the foreground. A stopped (adopted) job gets
+// the terminal back, a SIGCONT, and a suspendable wait; a running
+// background (&) job is simply waited for — its stdin is /dev/null, so
+// there is no terminal to hand it.
 func builtinFg(st *State, args []string, stdio Stdio) (int, error) {
 	spec := ""
 	if len(args) > 0 {
@@ -116,9 +131,58 @@ func builtinFg(st *State, args []string, stdio Stdio) (int, error) {
 		return 1, nil
 	}
 	fmt.Fprintln(stdio.Out, j.Cmdline)
+
+	state, adopted := st.Jobs.stateOf(j)
+	// A bg-resumed adopted job is watcher-owned; stop it briefly so fg can
+	// take over the wait.
+	if adopted && state == JobRunning {
+		if st.Jobs.StopForFg(j) {
+			state = JobStopped
+		}
+	}
+	if adopted && state == JobStopped {
+		tty, _ := interactiveTTY(st, stdio) // nil is fine: resume without handoff
+		status, stopped := st.Jobs.ResumeForeground(j, tty)
+		if stopped {
+			fmt.Fprintf(stdio.Err, "\n[%d]  Stopped    %s\n", j.ID, j.Cmdline)
+			return 128 + int(syscall.SIGTSTP), nil
+		}
+		st.Jobs.Reap(j)
+		return status, nil
+	}
+
 	status := st.Jobs.Wait(j)
 	st.Jobs.Reap(j)
 	return status, nil
+}
+
+// builtinBg resumes a stopped job in the background.
+func builtinBg(st *State, args []string, stdio Stdio) (int, error) {
+	spec := ""
+	if len(args) > 0 {
+		spec = args[0]
+	}
+	j := st.Jobs.Find(spec)
+	if j == nil {
+		if spec == "" {
+			fmt.Fprintf(stdio.Err, "grsh: bg: no current job\n")
+		} else {
+			fmt.Fprintf(stdio.Err, "grsh: bg: %s: no such job\n", spec)
+		}
+		return 1, nil
+	}
+	state, adopted := st.Jobs.stateOf(j)
+	switch {
+	case state == JobDone:
+		fmt.Fprintf(stdio.Err, "grsh: bg: job %d has terminated\n", j.ID)
+		return 1, nil
+	case state == JobRunning || !adopted:
+		fmt.Fprintf(stdio.Err, "grsh: bg: job %d already in background\n", j.ID)
+		return 1, nil
+	}
+	fmt.Fprintf(stdio.Out, "[%d]  %s\n", j.ID, j.Cmdline)
+	st.Jobs.ResumeBackground(j)
+	return 0, nil
 }
 
 // hasJobSpec reports whether any non-flag argument is a %job spec.
@@ -167,6 +231,13 @@ func builtinKillJob(st *State, args []string, stdio Stdio) (int, error) {
 		if err := st.Jobs.Signal(j, sig); err != nil {
 			fmt.Fprintf(stdio.Err, "grsh: kill: %s: %s\n", spec, serr.StringFromErr(err))
 			status = 1
+			continue
+		}
+		// Signaling a stopped adopted job: a terminating signal would sit
+		// pending forever, and nobody is waiting to reap the outcome. The
+		// background watcher sends SIGCONT and collects either way.
+		if state, adopted := st.Jobs.stateOf(j); state == JobStopped && adopted && sig != syscall.SIGSTOP {
+			st.Jobs.ResumeBackground(j)
 		}
 	}
 	return status, nil

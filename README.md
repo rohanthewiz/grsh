@@ -35,11 +35,14 @@ execution. v2 has begun with the interactive REPL.
   blocks and shell pipes, history (`~/.grsh_history`), tab completion
   (PATH commands, your identifiers, file paths), cwd-and-status prompt.
   Piped stdin runs as a script: `echo 'ls | wc -l' | grsh`.
-- **Background jobs** (new in v2) — `make -j8 &`, `jobs`, `wait [%N]`,
-  `fg`, `kill %N`. Jobs run in their own process group (Ctrl+C safe)
-  with stdin from `/dev/null`; the prompt announces completions.
-  Expansion is eager at launch and builtins can't background — see
+- **Background jobs & job control** (new in v2) — `make -j8 &`, `jobs`,
+  `wait [%N]`, `fg`, `bg`, `kill %N`, and **Ctrl+Z** suspends the
+  foreground command into the job table (full terminal handoff on
+  `fg`). Jobs run in their own process group (Ctrl+C safe) with stdin
+  from `/dev/null`; the prompt announces completions. Expansion is
+  eager at launch and builtins can't background — see
   [docs/LANGUAGE.md](docs/LANGUAGE.md#background-jobs-) for semantics.
+  `pipefail(true)` = `set -o pipefail`.
 
 - **Shell core** — pipes, redirections (`>`, `>>`, `<`, `2>`, `2>&1`, `&>`),
   `&&`/`||`/`;`, quoting, `$VAR`/`${VAR}`, tilde and glob expansion,

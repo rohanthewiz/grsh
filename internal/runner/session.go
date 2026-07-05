@@ -116,6 +116,11 @@ func (s *Session) Idents() []string { return s.cls.Names() }
 // jobs; the REPL prints them before each prompt.
 func (s *Session) Notifications() []string { return s.st.Jobs.Notifications() }
 
+// SetInteractive enables job control: foreground pipelines run in their
+// own process group so Ctrl+Z suspends them into the job table. Only the
+// REPL turns this on.
+func (s *Session) SetInteractive(on bool) { s.st.Interactive = on }
+
 func (s *Session) RunFile(path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {

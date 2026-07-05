@@ -103,6 +103,9 @@ func runSimple(st *State, cmd *shellparse.Command, ev WordEvaluator, stdio Stdio
 
 	c := exec.Command(argv[0], argv[1:]...)
 	c.Stdin, c.Stdout, c.Stderr = sio.In, sio.Out, sio.Err
+	if tty, ok := interactiveTTY(st, stdio); ok {
+		return runForegroundJobControl(st, []*exec.Cmd{c}, []string{strings.Join(argv, " ")}, tty, stdio, nil)
+	}
 	if err := c.Run(); err != nil {
 		return externalStatus(sio, argv[0], err)
 	}
@@ -149,6 +152,7 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 	stdio.Out = wrap(stdio.Out)
 	stdio.Err = wrap(stdio.Err)
 	execs := make([]*exec.Cmd, n)
+	names := make([]string, n)
 	statuses := make([]int, n)
 	var parentFiles []io.Closer // parent-side pipe fds to close after start
 
@@ -169,6 +173,7 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 		}
 		execs[i] = exec.Command(argv[0], argv[1:]...)
 		execs[i].Stderr = stdio.Err
+		names[i] = strings.Join(argv, " ")
 	}
 
 	execs[0].Stdin = stdio.In
@@ -201,6 +206,12 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 		execs[i].Stdin, execs[i].Stdout, execs[i].Stderr = sio.In, sio.Out, sio.Err
 	}
 	defer closeAll(allClosers)
+
+	// Interactive terminal: run as a foreground job (own pgroup, ^Z
+	// suspends into the job table). parentFiles close after Start there.
+	if tty, ok := interactiveTTY(st, stdio); ok {
+		return runForegroundJobControl(st, execs, names, tty, stdio, parentFiles)
+	}
 
 	started := make([]bool, n)
 	for i, c := range execs {

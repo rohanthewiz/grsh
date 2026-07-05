@@ -17,7 +17,7 @@ var goKeywords = []string{
 // shellBuiltins are grsh's shell-side builtins (not in PATH).
 var shellBuiltins = []string{
 	"cd", "export", "unset", "exit", "alias", "unalias", "source",
-	"command", "jobs", "wait", "fg", "kill",
+	"command", "jobs", "wait", "fg", "bg", "kill",
 }
 
 // completer implements readline.AutoCompleter.

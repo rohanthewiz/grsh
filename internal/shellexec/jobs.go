@@ -26,6 +26,7 @@ type JobState int
 
 const (
 	JobRunning JobState = iota
+	JobStopped
 	JobDone
 )
 
@@ -44,6 +45,16 @@ type Job struct {
 	state     JobState
 	status    int
 	notified  bool
+
+	// Adopted jobs (a foreground pipeline suspended with ^Z). Background
+	// (&) jobs are owned by their launch goroutine; adopted jobs are
+	// waited on by whoever resumes them (fg inline, bg via a watcher).
+	adopted      bool
+	pids         []int       // not-yet-exited processes
+	order        map[int]int // pid → pipeline position
+	statuses     []int       // per-position statuses (filled as pids exit)
+	pipefail     bool        // captured at suspension
+	stopNotified bool        // "[N] Stopped" already shown
 }
 
 // JobInfo is a lock-free snapshot for builtins and notifications.
@@ -185,16 +196,55 @@ func (t *JobTable) Signal(j *Job, sig syscall.Signal) error {
 	return syscall.Kill(-pgid, sig)
 }
 
-// Notifications drains completion messages for finished jobs and removes
-// them from the table (the REPL prints these before each prompt).
+// AdoptStopped registers a suspended foreground pipeline as a Stopped
+// job. The suspension message is printed by the suspender, so it is born
+// already stop-notified.
+func (t *JobTable) AdoptStopped(cmdline string, pgid int, pids []int, order map[int]int, statuses []int, pipefail bool) *Job {
+	j := t.Add(cmdline)
+	t.mu.Lock()
+	j.pgid = pgid
+	j.state = JobStopped
+	j.adopted = true
+	j.pids = pids
+	j.order = order
+	j.statuses = statuses
+	j.pipefail = pipefail
+	j.stopNotified = true
+	t.mu.Unlock()
+	j.readyOnce.Do(func() { close(j.pgidSet) })
+	return j
+}
+
+func (t *JobTable) markRunning(j *Job) {
+	t.mu.Lock()
+	j.state = JobRunning
+	t.mu.Unlock()
+}
+
+// markStopped flags a suspended job. notified=false queues a REPL
+// announcement (a bg-resumed job hitting SIGTTIN); notified=true means
+// the suspender already printed it (fg's own ^Z).
+func (t *JobTable) markStopped(j *Job, notified bool) {
+	t.mu.Lock()
+	j.state = JobStopped
+	j.stopNotified = notified
+	t.mu.Unlock()
+}
+
+// Notifications drains completion messages for finished jobs (removing
+// them) and stop announcements for newly stopped ones (which stay).
 func (t *JobTable) Notifications() []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var notes []string
 	for _, j := range t.jobs {
-		if j.state == JobDone && !j.notified {
+		switch {
+		case j.state == JobDone && !j.notified:
 			j.notified = true
 			notes = append(notes, doneLine(j.ID, j.status, j.Cmdline))
+		case j.state == JobStopped && !j.stopNotified:
+			j.stopNotified = true
+			notes = append(notes, fmt.Sprintf("[%d]  Stopped    %s", j.ID, j.Cmdline))
 		}
 	}
 	t.removeNotified()

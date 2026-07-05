@@ -153,7 +153,8 @@ comment; mid-word `#` is literal (`file#1` is one word).
 | `command cmd ...` | Bypasses aliases and builtins. |
 | `jobs` | Lists background jobs; finished jobs are reported once and removed. |
 | `wait [%N ...]` | No args: collect every job (status 0). With specs: block on those jobs; the status is the last job's. Collected jobs leave the table. |
-| `fg [%N]` | Waits for the job (newest by default), echoes its command line, takes its status. v1: no terminal handoff — fg means "block until done". |
+| `fg [%N]` | Brings a job to the foreground (newest by default): a stopped job gets the terminal back, SIGCONT, and a suspendable wait; a running `&` job is simply waited for (its stdin is `/dev/null`). Echoes the command line, takes the job's status. |
+| `bg [%N]` | Resumes a stopped job in the background; it is announced at the prompt when it finishes. |
 | `kill [-SIG] %N ...` | Signals the job's whole process group (default TERM; names like `-KILL`/`-9` accepted). `kill` with plain pids stays the external command. |
 
 ### Background jobs (`&`)
@@ -185,8 +186,29 @@ Deliberate v1 semantics (each differs from bash — see §8):
 - The interactive prompt announces finished jobs (`[1]  Done    cmd &`);
   scripts exit without waiting for jobs (use `wait`). There is no `$!`;
   use `wait %N` + `status()`.
-- Not yet: Ctrl+Z suspend, `bg`, stopped jobs (planned with terminal
-  handoff).
+
+### Suspending with Ctrl+Z (interactive only)
+
+At the REPL, foreground commands run in their own process group with the
+terminal, so **Ctrl+Z suspends them** into the job table:
+
+```
+grsh ~/proj> make -j8
+^Z
+[1]  Stopped    make -j8
+grsh ~/proj [146]> bg %1     # resume in the background…
+grsh ~/proj> fg %1           # …or bring it back (Ctrl+Z again works)
+```
+
+- `$?` after a suspension is 128+SIGTSTP (like bash).
+- `kill %N` on a stopped job also sends SIGCONT so the outcome is
+  collected — a terminating signal never sits pending on a frozen job.
+- **`wait` skips stopped jobs** with a warning instead of blocking:
+  nothing could ever resume them while the shell is stuck waiting. `fg`
+  or `bg` the job first. (Deviation from bash, which blocks.)
+- Only external commands suspend; builtins and Go code run inside the
+  shell itself (bash builtins are not suspendable either). Script mode
+  has no job control: Ctrl+Z suspends the whole script, as with bash.
 
 ### Failure behavior
 
@@ -430,5 +452,5 @@ function call trail. `--explain` prints every line's classification.
 | `cmd &` subshell (lazy expansion, builtins ok) | eager expansion at launch; external commands only | single-threaded interpreter; no fork |
 | `$!` | `wait %N` + `status()` | explicit, like `$?` → `status()` |
 | bg job shares tty stdin | stdin is `/dev/null` | jobs can't steal interactive input |
-| Ctrl+Z / `bg` / stopped jobs | not yet | planned with terminal handoff |
+| `wait` blocks on stopped jobs | warns and skips them | a blocked shell could never resume them |
 | heredocs, `<(...)` | not in v1 | planned/considered for v2 |
