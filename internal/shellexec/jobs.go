@@ -279,13 +279,14 @@ func launchJob(st *State, ao *shellparse.AndOr, ev WordEvaluator, stdio Stdio) (
 	}
 
 	job := st.Jobs.Add(strings.Join(names, " | ") + " &")
-	go runJob(st.Jobs, job, pipes, ao.Ops, stdio)
+	// PipeFail is captured at launch, like the rest of the expansion.
+	go runJob(st.Jobs, job, pipes, ao.Ops, stdio, st.PipeFail)
 	return 0, nil
 }
 
 // runJob executes the prepared chain in the background: && / || logic on
 // local statuses only, final status recorded in the job table.
-func runJob(jt *JobTable, job *Job, pipes [][]preparedCmd, ops []shellparse.LogicOp, stdio Stdio) {
+func runJob(jt *JobTable, job *Job, pipes [][]preparedCmd, ops []shellparse.LogicOp, stdio Stdio, pipefail bool) {
 	// Only real files (terminal, redirected file) are safe for concurrent
 	// writes; in capture/buffer contexts the job's output is discarded —
 	// use explicit redirection to keep it.
@@ -304,7 +305,7 @@ func runJob(jt *JobTable, job *Job, pipes [][]preparedCmd, ops []shellparse.Logi
 				continue
 			}
 		}
-		status = runPreparedPipeline(jt, job, pl, stdio)
+		status = runPreparedPipeline(jt, job, pl, stdio, pipefail)
 	}
 	jt.finish(job, status)
 }
@@ -312,7 +313,7 @@ func runJob(jt *JobTable, job *Job, pipes [][]preparedCmd, ops []shellparse.Logi
 // runPreparedPipeline mirrors runPipes for pre-expanded commands, adding
 // job-control process semantics: the pipeline runs in its own process
 // group and reads stdin from /dev/null.
-func runPreparedPipeline(jt *JobTable, job *Job, cmds []preparedCmd, stdio Stdio) int {
+func runPreparedPipeline(jt *JobTable, job *Job, cmds []preparedCmd, stdio Stdio, pipefail bool) int {
 	n := len(cmds)
 	execs := make([]*exec.Cmd, n)
 	statuses := make([]int, n)
@@ -384,5 +385,5 @@ func runPreparedPipeline(jt *JobTable, job *Job, cmds []preparedCmd, stdio Stdio
 			statuses[i], _ = externalStatus(stdio, cmds[i].argv[0], err)
 		}
 	}
-	return statuses[n-1]
+	return pipelineStatus(statuses, pipefail)
 }

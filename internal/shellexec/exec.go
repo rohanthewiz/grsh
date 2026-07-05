@@ -221,7 +221,20 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 			statuses[i], _ = externalStatus(stdio, c.Path, err)
 		}
 	}
-	return statuses[n-1], nil
+	return pipelineStatus(statuses, st.PipeFail), nil
+}
+
+// pipelineStatus is the last command's status, or with pipefail the
+// rightmost nonzero one (bash `set -o pipefail`).
+func pipelineStatus(statuses []int, pipefail bool) int {
+	if pipefail {
+		for i := len(statuses) - 1; i >= 0; i-- {
+			if statuses[i] != 0 {
+				return statuses[i]
+			}
+		}
+	}
+	return statuses[len(statuses)-1]
 }
 
 // resolvedRedir is a redirection with its target already expanded to a

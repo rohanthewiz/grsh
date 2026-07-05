@@ -52,7 +52,8 @@ execution. v2 has begun with the interactive REPL.
 - **The bridge** — shell lines inside Go blocks; `$(cmd)` capture with
   one- or two-value assignment (`out, err := $(...)`); `{expr}` Go
   interpolation inside commands (a `[]string` splices into argv);
-  `status()`, `ok()`, `errexit(true)` (= `set -e`).
+  `status()`, `ok()`, `errexit(true)` (= `set -e`), `pipefail(true)`
+  (= `set -o pipefail`).
 - **Curated stdlib** — `fmt`, `strings`, `strconv`, `os`, `filepath`,
   `time`, `regexp`, `json` (script-friendly `Parse`/`Marshal`), `sort`,
   `math`, `errors`, plus [serr](https://github.com/rohanthewiz/serr) and

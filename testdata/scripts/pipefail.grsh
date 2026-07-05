@@ -1,0 +1,21 @@
+# pipefail: pipeline status = rightmost nonzero instead of last command.
+
+false | true
+fmt.Println("default:", status())
+
+pipefail(true)
+false | true
+fmt.Println("pipefail:", status())
+
+# Rightmost nonzero wins (sh-prefix is the escape hatch, so /bin/sh here).
+/bin/sh -c "exit 3" | true | true
+fmt.Println("rightmost:", status())
+
+# Captured at launch for background jobs too.
+/bin/sh -c "exit 4" | true &
+wait %1
+fmt.Println("bg:", status())
+
+pipefail(false)
+false | true
+fmt.Println("off:", status())

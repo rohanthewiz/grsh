@@ -98,9 +98,10 @@ func Make(st *shellexec.State, stdio shellexec.Stdio) map[string]any {
 			d, _ := os.Getwd()
 			return d
 		},
-		"args":    func() []string { return st.ScriptArgs },
-		"status":  func() int { return st.LastStatus },
-		"ok":      func() bool { return st.LastStatus == 0 },
-		"errexit": func(on bool) { st.ErrExit = on },
+		"args":     func() []string { return st.ScriptArgs },
+		"status":   func() int { return st.LastStatus },
+		"ok":       func() bool { return st.LastStatus == 0 },
+		"errexit":  func(on bool) { st.ErrExit = on },
+		"pipefail": func(on bool) { st.PipeFail = on },
 	}
 }

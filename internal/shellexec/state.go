@@ -17,6 +17,7 @@ import (
 type State struct {
 	LastStatus int
 	ErrExit    bool // abort script when a statement-position command fails
+	PipeFail   bool // pipeline status = rightmost nonzero, not just the last
 	Aliases    map[string]string
 	ScriptName string   // $0
 	ScriptArgs []string // $1.. / $@ / $#

@@ -1,0 +1,5 @@
+default: 0
+pipefail: 1
+rightmost: 3
+bg: 4
+off: 0

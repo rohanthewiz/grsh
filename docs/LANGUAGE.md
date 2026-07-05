@@ -202,8 +202,11 @@ command silently ends the script with that command's status. Read the
 last status from Go with `status()` (int) or `ok()` (bool). There is no
 `$?`.
 
-A pipeline's status is its **last** command's status (bash default; no
-pipefail in v1).
+A pipeline's status is its **last** command's status (bash default).
+`pipefail(true)` switches to the rightmost *nonzero* status, like
+`set -o pipefail`; it applies to foreground pipelines and is captured at
+launch for background jobs. Combine with `errexit(true)` for strict
+mode.
 
 Statement-position commands inherit the terminal (stdin/stdout/stderr),
 so interactive tools — `less`, `vim`, password prompts — work. Only
@@ -331,6 +334,7 @@ Pre-declared in every script:
 | `args() []string` | Script arguments |
 | `status() int` / `ok() bool` | Last pipeline status |
 | `errexit(on bool)` | Toggle abort-on-failure (`set -e`) |
+| `pipefail(on bool)` | Pipeline status = rightmost nonzero (`set -o pipefail`) |
 | `sh(cmdline) error` / `capture(cmdline) (string, error)` | Dynamic commands |
 
 ## 6. Registry packages
@@ -419,6 +423,7 @@ function call trail. `--explain` prints every line's classification.
 | `"$v"` needed everywhere | quoting rarely needed | strings are values |
 | `$?` | `status()` / `ok()` | Go-side, explicit |
 | `set -e` | `errexit(true)` | explicit, greppable |
+| `set -o pipefail` | `pipefail(true)` | same |
 | `` `cmd` `` backticks | not supported | `$(...)` only |
 | `$((math))` | Go expressions | a real language is right there |
 | brace expansion `{a,b}` | not in v1 | `{...}` is Go interpolation |
