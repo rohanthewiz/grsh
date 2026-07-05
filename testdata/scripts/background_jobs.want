@@ -1,0 +1,8 @@
+first
+second
+bg pipeline status: 1
+fallback
+sleep 0.05 &
+fg status: 0
+foreground continues
+[1]  Running    sleep 0.2 &

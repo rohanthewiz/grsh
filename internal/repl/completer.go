@@ -14,6 +14,12 @@ var goKeywords = []string{
 	"switch", "defer", "import",
 }
 
+// shellBuiltins are grsh's shell-side builtins (not in PATH).
+var shellBuiltins = []string{
+	"cd", "export", "unset", "exit", "alias", "unalias", "source",
+	"command", "jobs", "wait", "fg", "kill",
+}
+
 // completer implements readline.AutoCompleter.
 //
 //	command position → PATH executables, known idents, Go keywords
@@ -43,6 +49,7 @@ func (c *completer) Do(line []rune, pos int) ([][]rune, int) {
 		cands = fileCandidates(word)
 	case commandPosition(before, word):
 		cands = append(cands, c.commands()...)
+		cands = append(cands, shellBuiltins...)
 		cands = append(cands, c.idents()...)
 		cands = append(cands, goKeywords...)
 	default:

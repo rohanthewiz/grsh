@@ -24,10 +24,13 @@ type State struct {
 	// SourceFn runs another script in the current session (the `source`
 	// builtin). Wired up by the runner to avoid an import cycle.
 	SourceFn func(path string) error
+
+	// Jobs tracks background (&) jobs for this session.
+	Jobs *JobTable
 }
 
 func NewState() *State {
-	return &State{Aliases: map[string]string{}}
+	return &State{Aliases: map[string]string{}, Jobs: NewJobTable()}
 }
 
 // Stdio is the trio of streams a command runs with.

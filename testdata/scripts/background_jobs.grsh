@@ -1,0 +1,28 @@
+# Background jobs: & launches a job, wait collects it.
+# Job output goes to files — background stdout in a capture/test context
+# is discarded by design (only real terminals/files are safe).
+
+echo first > bg1.txt &
+echo second > bg2.txt &
+wait
+cat bg1.txt bg2.txt
+
+# wait %N returns that job's status; a failing pipeline reports through it.
+true | false &
+wait %1
+fmt.Println("bg pipeline status:", status())
+
+# && / || short-circuit inside a background chain.
+false && echo skipped > c.txt || echo fallback > c.txt &
+wait
+cat c.txt
+
+# fg waits for the newest job and takes its status; it echoes the cmdline.
+sleep 0.05 &
+fg
+fmt.Println("fg status:", status())
+
+# & also separates: the echo runs immediately, before the job finishes.
+sleep 0.2 > /dev/null & echo foreground continues
+jobs
+wait

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/rohanthewiz/serr"
 )
@@ -13,6 +14,7 @@ import (
 var builtinNames = map[string]bool{
 	"cd": true, "export": true, "unset": true, "exit": true,
 	"alias": true, "unalias": true, "source": true, ".": true,
+	"jobs": true, "wait": true, "fg": true,
 }
 
 func isBuiltin(name string) bool { return builtinNames[name] }
@@ -47,8 +49,127 @@ func runBuiltin(st *State, name string, args []string, stdio Stdio) (int, error)
 		return 0, nil
 	case "source", ".":
 		return builtinSource(st, args, stdio)
+	case "jobs":
+		return builtinJobs(st, stdio)
+	case "wait":
+		return builtinWait(st, args, stdio)
+	case "fg":
+		return builtinFg(st, args, stdio)
 	}
 	return userErr(stdio, serr.New("unknown builtin", "name", name))
+}
+
+func builtinJobs(st *State, stdio Stdio) (int, error) {
+	for _, ji := range st.Jobs.Snapshot() {
+		switch {
+		case ji.State == JobDone && ji.Status == 0:
+			fmt.Fprintf(stdio.Out, "[%d]  Done       %s\n", ji.ID, ji.Cmdline)
+		case ji.State == JobDone:
+			fmt.Fprintf(stdio.Out, "[%d]  Exit %-5d %s\n", ji.ID, ji.Status, ji.Cmdline)
+		default:
+			fmt.Fprintf(stdio.Out, "[%d]  Running    %s\n", ji.ID, ji.Cmdline)
+		}
+	}
+	// Listing counts as notification: finished jobs are reaped, as in bash.
+	_ = st.Jobs.Notifications()
+	return 0, nil
+}
+
+// builtinWait collects jobs and, like bash, removes them from the table —
+// a later `wait %1` must never match an already-collected job.
+func builtinWait(st *State, args []string, stdio Stdio) (int, error) {
+	if len(args) == 0 {
+		for _, j := range st.Jobs.All() {
+			st.Jobs.Wait(j)
+			st.Jobs.Reap(j)
+		}
+		return 0, nil
+	}
+	status := 0
+	for _, spec := range args {
+		j := st.Jobs.Find(spec)
+		if j == nil {
+			fmt.Fprintf(stdio.Err, "grsh: wait: %s: no such job\n", spec)
+			return 127, nil
+		}
+		status = st.Jobs.Wait(j)
+		st.Jobs.Reap(j)
+	}
+	return status, nil
+}
+
+// builtinFg waits for a job in the foreground. v1 has no terminal handoff
+// (the job was started on /dev/null stdin and is never stopped), so fg
+// means "block until it finishes and take its status".
+func builtinFg(st *State, args []string, stdio Stdio) (int, error) {
+	spec := ""
+	if len(args) > 0 {
+		spec = args[0]
+	}
+	j := st.Jobs.Find(spec)
+	if j == nil {
+		if spec == "" {
+			fmt.Fprintf(stdio.Err, "grsh: fg: no current job\n")
+		} else {
+			fmt.Fprintf(stdio.Err, "grsh: fg: %s: no such job\n", spec)
+		}
+		return 1, nil
+	}
+	fmt.Fprintln(stdio.Out, j.Cmdline)
+	status := st.Jobs.Wait(j)
+	st.Jobs.Reap(j)
+	return status, nil
+}
+
+// hasJobSpec reports whether any non-flag argument is a %job spec.
+func hasJobSpec(args []string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, "%") {
+			return true
+		}
+	}
+	return false
+}
+
+// jobSignals is the subset of named signals kill accepts for job specs.
+var jobSignals = map[string]syscall.Signal{
+	"TERM": syscall.SIGTERM, "KILL": syscall.SIGKILL, "INT": syscall.SIGINT,
+	"HUP": syscall.SIGHUP, "QUIT": syscall.SIGQUIT, "USR1": syscall.SIGUSR1,
+	"USR2": syscall.SIGUSR2, "STOP": syscall.SIGSTOP, "CONT": syscall.SIGCONT,
+}
+
+// builtinKillJob handles `kill [-SIG] %spec...`. Plain-pid kill never gets
+// here — it stays an external command.
+func builtinKillJob(st *State, args []string, stdio Stdio) (int, error) {
+	sig := syscall.SIGTERM
+	if len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		name := strings.TrimPrefix(strings.TrimPrefix(args[0], "-"), "SIG")
+		if n, err := strconv.Atoi(name); err == nil {
+			sig = syscall.Signal(n)
+		} else if s, ok := jobSignals[strings.ToUpper(name)]; ok {
+			sig = s
+		} else {
+			return userErr(stdio, serr.New("kill: invalid signal", "sig", args[0]))
+		}
+		args = args[1:]
+	}
+	status := 0
+	for _, spec := range args {
+		if !strings.HasPrefix(spec, "%") {
+			return userErr(stdio, serr.New("kill: mixing pids and job specs is not supported", "arg", spec))
+		}
+		j := st.Jobs.Find(spec)
+		if j == nil {
+			fmt.Fprintf(stdio.Err, "grsh: kill: %s: no such job\n", spec)
+			status = 1
+			continue
+		}
+		if err := st.Jobs.Signal(j, sig); err != nil {
+			fmt.Fprintf(stdio.Err, "grsh: kill: %s: %s\n", spec, serr.StringFromErr(err))
+			status = 1
+		}
+	}
+	return status, nil
 }
 
 func builtinCd(args []string, stdio Stdio) (int, error) {

@@ -26,7 +26,11 @@ func dump(l *CmdList) string {
 			}
 			pipes = append(pipes, s)
 		}
-		items = append(items, strings.Join(pipes, " "))
+		s := strings.Join(pipes, " ")
+		if ao.Background {
+			s += " &"
+		}
+		items = append(items, s)
 	}
 	return strings.Join(items, " ; ")
 }
@@ -117,6 +121,14 @@ func TestParse(t *testing.T) {
 		{`echo "escaped \" quote"`, `echo q(escaped " quote)`},
 		{`echo ""`, `echo q()`},
 		{`true;`, `true`},
+		{`sleep 5 &`, `sleep 5 &`},
+		{`sleep 5&`, `sleep 5 &`},
+		{`make build && notify done &`, `make build && notify done &`},
+		{`sleep 1 & echo now`, `sleep 1 & ; echo now`},
+		{`sleep 1 & sleep 2 &`, `sleep 1 & ; sleep 2 &`},
+		{`sleep 1 &; echo hi`, `sleep 1 & ; echo hi`},
+		{`cmd | tee log &`, `cmd | tee log &`},
+		{`cmd &> all.txt &`, `cmd &>all.txt &`},
 	}
 	for _, tc := range tests {
 		got, err := Parse(tc.in)
@@ -142,7 +154,8 @@ func TestParseErrors(t *testing.T) {
 		{`| sort`, "missing command before |"},
 		{`ls | | sort`, "missing command"},
 		{`ls &&`, "missing command after"},
-		{`sleep 5 &`, "background jobs"},
+		{`& ls`, "missing command before &"},
+		{`ls && &`, "missing command after"},
 		{`echo hi \`, "trailing backslash"},
 		{`cmd >`, "missing redirection target"},
 	}

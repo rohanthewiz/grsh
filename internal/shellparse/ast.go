@@ -12,9 +12,11 @@ type CmdList struct {
 
 // AndOr is a chain of pipelines joined by && and ||.
 // len(Ops) == len(Pipes)-1; Ops[i] joins Pipes[i] and Pipes[i+1].
+// Background marks a trailing & — the whole chain runs as a job.
 type AndOr struct {
-	Pipes []*Pipeline
-	Ops   []LogicOp
+	Pipes      []*Pipeline
+	Ops        []LogicOp
+	Background bool
 }
 
 type LogicOp int

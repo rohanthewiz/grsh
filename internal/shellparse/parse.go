@@ -68,6 +68,16 @@ func (p *parser) parseCmdList() (*CmdList, error) {
 			p.i++
 			continue
 		}
+		// Lone & backgrounds the preceding and-or chain and, like ;,
+		// separates it from what follows (`sleep 9 & echo hi`).
+		if !p.eof() && p.peek() == '&' && !p.at("&&") {
+			if ao == nil {
+				return nil, p.errf("missing command before &")
+			}
+			ao.Background = true
+			p.i++
+			continue
+		}
 		break
 	}
 	return list, nil
@@ -168,7 +178,7 @@ func (p *parser) parseCommand() (*Command, error) {
 			if p.at("&&") {
 				break
 			}
-			return nil, p.errf("background jobs (&) are not supported yet")
+			break // lone &: background marker, handled at list level
 		}
 		if c == '#' {
 			// Comment at word start: rest of line is ignored.

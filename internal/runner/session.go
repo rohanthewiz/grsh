@@ -112,6 +112,10 @@ func (s *Session) NeedsMore(src string) bool { return s.cls.NeedsMore(src) }
 // declared since. The REPL completes on these.
 func (s *Session) Idents() []string { return s.cls.Names() }
 
+// Notifications drains "[1]  Done  cmd &" messages for finished background
+// jobs; the REPL prints them before each prompt.
+func (s *Session) Notifications() []string { return s.st.Jobs.Notifications() }
+
 func (s *Session) RunFile(path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {

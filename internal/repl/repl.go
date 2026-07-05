@@ -53,12 +53,17 @@ func Run(sess *runner.Session, version string) int {
 	defer signal.Stop(sigc)
 
 	fmt.Printf("grsh %s — type exit or Ctrl+D to quit\n", version)
-	return loop(sess, rl, os.Stderr)
+	return loop(sess, rl, os.Stdout, os.Stderr)
 }
 
-func loop(sess *runner.Session, rd lineReader, errW io.Writer) int {
+func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer) int {
 	var buf []string
 	for {
+		if len(buf) == 0 {
+			for _, note := range sess.Notifications() {
+				fmt.Fprintln(outW, note)
+			}
+		}
 		rd.SetPrompt(promptFor(sess, len(buf) > 0))
 		line, err := rd.Readline()
 		switch {

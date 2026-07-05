@@ -5,14 +5,16 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chzyer/readline"
 	"github.com/rohanthewiz/grsh/internal/runner"
 )
 
 type step struct {
-	line string
-	err  error
+	line  string
+	err   error
+	delay time.Duration // simulates the user pausing before this line
 }
 
 // fakeReader scripts a Readline sequence and records the prompts shown.
@@ -27,6 +29,7 @@ func (f *fakeReader) Readline() (string, error) {
 	}
 	s := f.steps[0]
 	f.steps = f.steps[1:]
+	time.Sleep(s.delay)
 	return s.line, s.err
 }
 
@@ -37,7 +40,7 @@ func run(t *testing.T, steps ...step) (stdout, stderr string, code int, prompts 
 	var out, errB bytes.Buffer
 	sess := runner.NewSession(runner.Options{Stdout: &out, Stderr: &errB, ScriptName: "repl"})
 	rd := &fakeReader{steps: steps}
-	code = loop(sess, rd, &errB)
+	code = loop(sess, rd, &out, &errB)
 	return out.String(), errB.String(), code, rd.prompts
 }
 
@@ -134,6 +137,24 @@ func TestLoopEOFMidContinuationAbandons(t *testing.T) {
 	}
 	if stdout != "after\n" {
 		t.Errorf("stdout %q — ^D mid-block should abandon it, not exit", stdout)
+	}
+}
+
+// A job that finishes uncollected is announced before the next prompt.
+// (An explicitly waited job is reaped silently — bash behavior.)
+func TestLoopBackgroundJobNotification(t *testing.T) {
+	stdout, stderr, code, _ := run(t,
+		step{line: "true &"},
+		// The pause lets the job finish; the notification prints when the
+		// loop comes back around for the line after it.
+		step{line: "# prompt cycle", delay: 500 * time.Millisecond},
+		step{line: "# one more so the drain after the pause is observed"},
+	)
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "[1]") || !strings.Contains(stdout, "Done") {
+		t.Errorf("stdout %q, want a [1] Done notification", stdout)
 	}
 }
 

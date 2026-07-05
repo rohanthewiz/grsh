@@ -127,7 +127,7 @@ A trailing `{` behaves two ways, matching Go intuition:
 
 ### Operators and redirection
 
-Pipes `|`, sequencing `;`, short-circuit `&&` / `||`, and:
+Pipes `|`, sequencing `;`, short-circuit `&&` / `||`, background `&`, and:
 
 | Redirection | Meaning |
 |------------|---------|
@@ -151,6 +151,42 @@ comment; mid-word `#` is literal (`file#1` is one word).
 | `alias k='v'`, `alias`, `unalias k` | Command-position substitution. v1 limitation: alias values are split on whitespace (no nested quoting). |
 | `source f.grsh`, `. f.grsh` | Runs another script **in the current session** — its variables, functions, aliases, and exports persist. |
 | `command cmd ...` | Bypasses aliases and builtins. |
+| `jobs` | Lists background jobs; finished jobs are reported once and removed. |
+| `wait [%N ...]` | No args: collect every job (status 0). With specs: block on those jobs; the status is the last job's. Collected jobs leave the table. |
+| `fg [%N]` | Waits for the job (newest by default), echoes its command line, takes its status. v1: no terminal handoff — fg means "block until done". |
+| `kill [-SIG] %N ...` | Signals the job's whole process group (default TERM; names like `-KILL`/`-9` accepted). `kill` with plain pids stays the external command. |
+
+### Background jobs (`&`)
+
+A trailing `&` runs the whole and-or chain as a job: `make -j8 &`,
+`build && notify done &`. `&` also separates, so `sleep 9 & echo hi`
+prints immediately. Job specs are `%N`, `%%`, or `%+` (newest).
+
+```
+grsh ~/proj> make -j8 > build.log 2>&1 &
+grsh ~/proj> jobs
+[1]  Running    make -j8 &
+grsh ~/proj> wait %1        # block; status() reports make's exit
+```
+
+Deliberate v1 semantics (each differs from bash — see §8):
+
+- **Expansion is eager.** `$VAR`, `{expr}`, aliases, and redirect targets
+  are expanded when the job *launches*, not lazily in a subshell. The
+  async part never touches interpreter state.
+- **Builtins cannot be backgrounded** (`cd /tmp &` is an error) — there
+  is no subshell to run them in.
+- Jobs run in their **own process group**: Ctrl+C at the prompt never
+  kills them. Stdin is `/dev/null`, so a background job cannot steal
+  interactive input.
+- Job stdout/stderr go to the terminal (or wherever redirected). Inside
+  a `$(...)` capture, background output is **discarded** — redirect to a
+  file to keep it.
+- The interactive prompt announces finished jobs (`[1]  Done    cmd &`);
+  scripts exit without waiting for jobs (use `wait`). There is no `$!`;
+  use `wait %N` + `status()`.
+- Not yet: Ctrl+Z suspend, `bg`, stopped jobs (planned with terminal
+  handoff).
 
 ### Failure behavior
 
@@ -386,4 +422,8 @@ function call trail. `--explain` prints every line's classification.
 | `` `cmd` `` backticks | not supported | `$(...)` only |
 | `$((math))` | Go expressions | a real language is right there |
 | brace expansion `{a,b}` | not in v1 | `{...}` is Go interpolation |
-| heredocs, `&`, `<(...)` | not in v1 | planned/considered for v2 |
+| `cmd &` subshell (lazy expansion, builtins ok) | eager expansion at launch; external commands only | single-threaded interpreter; no fork |
+| `$!` | `wait %N` + `status()` | explicit, like `$?` → `status()` |
+| bg job shares tty stdin | stdin is `/dev/null` | jobs can't steal interactive input |
+| Ctrl+Z / `bg` / stopped jobs | not yet | planned with terminal handoff |
+| heredocs, `<(...)` | not in v1 | planned/considered for v2 |

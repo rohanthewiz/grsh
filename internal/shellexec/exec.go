@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/rohanthewiz/grsh/internal/shellparse"
 	"github.com/rohanthewiz/serr"
@@ -21,7 +23,11 @@ func Run(st *State, list *shellparse.CmdList, ev WordEvaluator, stdio Stdio) (in
 	status := 0
 	for _, ao := range list.Items {
 		var err error
-		status, err = runAndOr(st, ao, ev, stdio)
+		if ao.Background {
+			status, err = launchJob(st, ao, ev, stdio)
+		} else {
+			status, err = runAndOr(st, ao, ev, stdio)
+		}
 		if err != nil {
 			return status, err
 		}
@@ -90,6 +96,10 @@ func runSimple(st *State, cmd *shellparse.Command, ev WordEvaluator, stdio Stdio
 	if !force && isBuiltin(argv[0]) {
 		return runBuiltin(st, argv[0], argv[1:], sio)
 	}
+	// kill with a %job spec is ours; plain-pid kill stays external.
+	if !force && argv[0] == "kill" && hasJobSpec(argv[1:]) {
+		return builtinKillJob(st, argv[1:], sio)
+	}
 
 	c := exec.Command(argv[0], argv[1:]...)
 	c.Stdin, c.Stdout, c.Stderr = sio.In, sio.Out, sio.Err
@@ -99,10 +109,45 @@ func runSimple(st *State, cmd *shellparse.Command, ev WordEvaluator, stdio Stdio
 	return 0, nil
 }
 
+// syncWriter serializes writes to a shared non-file writer. Pipeline
+// commands each get an exec copy goroutine for buffer-backed stderr;
+// without this they race on the same bytes.Buffer.
+type syncWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 // runPipes runs cmd1 | cmd2 | ... with real OS pipes.
 // The pipeline status is the last command's status (bash default).
 func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Stdio) (int, error) {
 	n := len(cmds)
+
+	// Wrap shared non-file writers once per distinct writer (identity is
+	// preserved so exec's Stdout==Stderr fd dedup still applies).
+	mu := &sync.Mutex{}
+	wrapped := map[io.Writer]io.Writer{}
+	wrap := func(w io.Writer) io.Writer {
+		if w == nil {
+			return nil
+		}
+		if _, ok := w.(*os.File); ok {
+			return w
+		}
+		if sw, ok := wrapped[w]; ok {
+			return sw
+		}
+		sw := &syncWriter{mu: mu, w: w}
+		wrapped[w] = sw
+		return sw
+	}
+	stdio.Out = wrap(stdio.Out)
+	stdio.Err = wrap(stdio.Err)
 	execs := make([]*exec.Cmd, n)
 	statuses := make([]int, n)
 	var parentFiles []io.Closer // parent-side pipe fds to close after start
@@ -179,26 +224,43 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 	return statuses[n-1], nil
 }
 
-// applyRedirs opens redirection targets in order and layers them over base.
-func applyRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator, base Stdio) (Stdio, []io.Closer, error) {
+// resolvedRedir is a redirection with its target already expanded to a
+// path — safe to apply from a background goroutine (no State/ev access).
+type resolvedRedir struct {
+	shellparse.Redir
+	path string // "" for RedirDup
+}
+
+// resolveRedirs expands redirection targets (the State/ev-touching half).
+func resolveRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator) ([]resolvedRedir, error) {
+	var out []resolvedRedir
+	for _, r := range redirs {
+		if r.FD > 2 || r.DupTo > 2 {
+			return nil, serr.New("only file descriptors 0, 1, 2 are supported")
+		}
+		rr := resolvedRedir{Redir: r}
+		if r.Target != nil {
+			fields, err := ExpandWords(st, []*shellparse.Word{r.Target}, ev)
+			if err != nil {
+				return nil, err
+			}
+			if len(fields) != 1 {
+				return nil, serr.New("ambiguous redirect", "fields", fmt.Sprint(fields))
+			}
+			rr.path = fields[0]
+		}
+		out = append(out, rr)
+	}
+	return out, nil
+}
+
+// applyResolved opens resolved targets in order and layers them over base
+// (the fd-only half; goroutine-safe).
+func applyResolved(redirs []resolvedRedir, base Stdio) (Stdio, []io.Closer, error) {
 	var closers []io.Closer
 	fds := map[int]any{0: base.In, 1: base.Out, 2: base.Err}
 
-	target := func(r shellparse.Redir) (string, error) {
-		fields, err := ExpandWords(st, []*shellparse.Word{r.Target}, ev)
-		if err != nil {
-			return "", err
-		}
-		if len(fields) != 1 {
-			return "", serr.New("ambiguous redirect", "fields", fmt.Sprint(fields))
-		}
-		return fields[0], nil
-	}
-	open := func(r shellparse.Redir, flags int) (*os.File, error) {
-		path, err := target(r)
-		if err != nil {
-			return nil, err
-		}
+	open := func(path string, flags int) (*os.File, error) {
 		f, err := os.OpenFile(path, flags, 0644)
 		if err != nil {
 			return nil, serr.Wrap(err, "op", "redirect")
@@ -208,24 +270,21 @@ func applyRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator, base St
 	}
 
 	for _, r := range redirs {
-		if r.FD > 2 || r.DupTo > 2 {
-			return base, closers, serr.New("only file descriptors 0, 1, 2 are supported")
-		}
 		switch r.Op {
 		case shellparse.RedirOut:
-			f, err := open(r, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
+			f, err := open(r.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY)
 			if err != nil {
 				return base, closers, err
 			}
 			fds[r.FD] = f
 		case shellparse.RedirAppend:
-			f, err := open(r, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+			f, err := open(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 			if err != nil {
 				return base, closers, err
 			}
 			fds[r.FD] = f
 		case shellparse.RedirIn:
-			f, err := open(r, os.O_RDONLY)
+			f, err := open(r.path, os.O_RDONLY)
 			if err != nil {
 				return base, closers, err
 			}
@@ -237,7 +296,7 @@ func applyRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator, base St
 			if r.Op == shellparse.RedirOutErrApp {
 				flags = os.O_CREATE | os.O_APPEND | os.O_WRONLY
 			}
-			f, err := open(r, flags)
+			f, err := open(r.path, flags)
 			if err != nil {
 				return base, closers, err
 			}
@@ -256,6 +315,15 @@ func applyRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator, base St
 		out.Err = v
 	}
 	return out, closers, nil
+}
+
+// applyRedirs resolves and applies in one step (the foreground path).
+func applyRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator, base Stdio) (Stdio, []io.Closer, error) {
+	resolved, err := resolveRedirs(st, redirs, ev)
+	if err != nil {
+		return base, nil, err
+	}
+	return applyResolved(resolved, base)
 }
 
 func expandAlias(st *State, argv []string) []string {
@@ -324,6 +392,11 @@ func userErr(stdio Stdio, err error) (int, error) {
 // externalStatus converts an exec error into a shell status.
 func externalStatus(stdio Stdio, name string, err error) (int, error) {
 	if xe, ok := errors.AsType[*exec.ExitError](err); ok {
+		// A signaled process reports 128+signal (bash convention), not
+		// Go's -1 (kill %1 → wait %1 must yield 143, not [-1] prompts).
+		if ws, ok := xe.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal()), nil
+		}
 		return xe.ExitCode(), nil
 	}
 	if errors.Is(err, exec.ErrNotFound) {
