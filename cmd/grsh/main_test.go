@@ -27,12 +27,16 @@ type result struct {
 }
 
 func run(t *testing.T, bin string, dir string, args ...string) result {
+	return runIn(t, bin, dir, "", args...)
+}
+
+func runIn(t *testing.T, bin string, dir string, stdin string, args ...string) result {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = dir
 	var so, se bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &so, &se
-	cmd.Stdin = strings.NewReader("")
+	cmd.Stdin = strings.NewReader(stdin)
 	err := cmd.Run()
 	code := 0
 	if xe, ok := err.(*exec.ExitError); ok {
@@ -71,9 +75,23 @@ func TestCLI(t *testing.T) {
 		}
 	})
 
-	t.Run("no args usage", func(t *testing.T) {
+	t.Run("no args empty stdin exits 0", func(t *testing.T) {
 		r := run(t, bin, dir)
-		if r.code != 2 || !strings.Contains(r.stderr, "usage:") {
+		if r.code != 0 || r.stderr != "" {
+			t.Errorf("got %+v", r)
+		}
+	})
+
+	t.Run("piped stdin runs as script", func(t *testing.T) {
+		r := runIn(t, bin, dir, "msg := \"from stdin\"\necho {msg}\n")
+		if r.code != 0 || r.stdout != "from stdin\n" {
+			t.Errorf("got %+v", r)
+		}
+	})
+
+	t.Run("piped stdin exit code propagates", func(t *testing.T) {
+		r := runIn(t, bin, dir, "exit 4\n")
+		if r.code != 4 {
 			t.Errorf("got %+v", r)
 		}
 	})

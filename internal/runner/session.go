@@ -102,6 +102,16 @@ func NewSession(o Options) *Session {
 // LastStatus exposes the status of the last executed pipeline.
 func (s *Session) LastStatus() int { return s.st.LastStatus }
 
+// NeedsMore reports whether src is an incomplete input unit (unclosed
+// block, mid-expression Go line, or trailing shell continuation). The REPL
+// keeps reading lines while this is true. Classifier state is not mutated.
+func (s *Session) NeedsMore(src string) bool { return s.cls.NeedsMore(src) }
+
+// Idents lists every identifier the classifier currently knows — builtins,
+// registry packages were seeded at construction, plus anything the user has
+// declared since. The REPL completes on these.
+func (s *Session) Idents() []string { return s.cls.Names() }
+
 func (s *Session) RunFile(path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {

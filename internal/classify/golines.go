@@ -1,12 +1,16 @@
 package classify
 
 import (
+	"errors"
 	"go/scanner"
 	"go/token"
 	"strings"
-
-	"github.com/rohanthewiz/serr"
 )
+
+// ErrIncomplete marks source that ends mid-statement (unclosed paren,
+// composite literal, or trailing binary operator). A script run reports it
+// as a parse error; the REPL treats it as "read another line".
+var ErrIncomplete = errors.New("incomplete Go statement at end of script")
 
 type tokLit struct {
 	tok token.Token
@@ -132,7 +136,7 @@ func consumeGo(lines []string, i int) (string, int, error) {
 			return frag, j, nil
 		}
 	}
-	return "", 0, serr.New("incomplete Go statement at end of script")
+	return "", 0, ErrIncomplete
 }
 
 // predeclare records top-level-looking func/var/const/type names so

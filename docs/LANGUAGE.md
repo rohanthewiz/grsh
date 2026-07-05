@@ -323,7 +323,47 @@ curated; ask for what you're missing.
 grsh script.grsh [args...]      # run a script
 grsh -c "ls | wc -l"            # run a one-liner
 ./script.grsh                   # via shebang: #!/usr/bin/env grsh
+grsh                            # interactive REPL (stdin is a terminal)
+echo 'ls | wc -l' | grsh        # piped stdin runs as a script
 ```
+
+### Interactive mode
+
+Running `grsh` with no arguments at a terminal starts the REPL. The same
+classifier and interpreter run behind the prompt, and state persists
+across inputs: variables, functions, structs, aliases, the working
+directory, and exported environment all carry forward, exactly as if the
+lines were a script evaluated incrementally.
+
+```
+grsh ~/projs> x := 40
+grsh ~/projs> if x > 1 {
+  ... fmt.Println("x is", x+2)
+  ... }
+x is 42
+grsh ~/projs> echo shell sees {x}
+shell sees 40
+```
+
+- **Prompt** — `grsh <cwd>> `; after a failing command it shows the
+  status: `grsh <cwd> [1]> `.
+- **Continuation** — the `... ` prompt appears while the input unit is
+  incomplete: an open `{` block or composite literal, a Go line ending
+  mid-expression, or a shell line ending in `\`, `|`, `&&`, `||`.
+- **History** — persisted to `~/.grsh_history`; arrow keys and Ctrl+R
+  search work as usual.
+- **Completion** — Tab completes command names from `$PATH`, declared
+  identifiers and builtins, registry package names, Go keywords, and file
+  paths (path-shaped words always complete as files).
+- **Ctrl+C** — at the prompt, discards the current line (and any pending
+  continuation). While a command runs, interrupts the command; the shell
+  survives.
+- **Ctrl+D** — on an empty line, exits with the last status.
+  Mid-continuation, abandons the open block.
+- **`exit [n]`** — exits the shell. An `errexit(true)` failure also exits
+  (same `set -e` semantics as scripts).
+- Single-line eval errors print without a location; multi-line inputs
+  keep their line number (`grsh: line 2: undefined: x`).
 
 | Exit code | Meaning |
 |-----------|---------|

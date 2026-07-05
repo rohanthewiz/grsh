@@ -19,7 +19,7 @@ for _, f := range glob("*.go") {
 }
 ```
 
-## Status: alpha — v1 feature-complete
+## Status: alpha — v1 feature-complete, v2 underway
 
 **grsh is alpha software** — the language surface is still settling and
 may change without notice. Not yet recommended as your login shell or
@@ -28,7 +28,13 @@ for production automation.
 All five v1 milestones are complete. Verified by 40 end-to-end golden
 scripts, a ~160-line real-world classification corpus, per-package unit
 tables, and CLI tests covering exit codes, error positions, and shebang
-execution.
+execution. v2 has begun with the interactive REPL.
+
+- **Interactive REPL** (new in v2) — run `grsh` with no arguments:
+  full session state across inputs, multi-line continuation for Go
+  blocks and shell pipes, history (`~/.grsh_history`), tab completion
+  (PATH commands, your identifiers, file paths), cwd-and-status prompt.
+  Piped stdin runs as a script: `echo 'ls | wc -l' | grsh`.
 
 - **Shell core** — pipes, redirections (`>`, `>>`, `<`, `2>`, `2>&1`, `&>`),
   `&&`/`||`/`;`, quoting, `$VAR`/`${VAR}`, tilde and glob expansion,
