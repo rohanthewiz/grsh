@@ -29,6 +29,20 @@ func TestNeedsMore(t *testing.T) {
 		// Unbalanced shell quote is NOT a continuation — matches script
 		// pipeline behavior (shellparse reports it at eval time).
 		{"echo \"foo", false},
+		// Heredocs keep reading until the delimiter line.
+		{"cat <<EOF", true},
+		{"cat <<EOF\nhello", true},
+		{"cat <<EOF\nhello\nEOF", false},
+		{"cat <<-EOF\n\thello\n\tEOF", false},
+		{"cat <<'STOP'\n$X\nSTOP", false},
+		{"cat <<A <<B\none\nA", true},
+		{"cat <<A <<B\none\nA\ntwo\nB", false},
+		{"cat <<EOF | wc -l\nbody", true},
+		{"cat <<EOF | wc -l\nbody\nEOF", false},
+		// Not heredocs: quoted, herestring-ish, Go interpolation shift.
+		{"echo '<<EOF'", false},
+		{"echo {x << 2}", false},
+		{"echo hi # <<EOF", false},
 	}
 	for _, tc := range cases {
 		c := New([]string{"fmt"})

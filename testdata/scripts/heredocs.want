@@ -1,0 +1,11 @@
+hello world
+sub: captured
+json: {"a": [1, 2]}
+esc: $HD_WHO
+raw $HD_WHO and $(no sub)
+indented away
+QUIET
+saved line
+second
+from the background
+done

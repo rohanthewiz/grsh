@@ -249,13 +249,16 @@ func pipelineStatus(statuses []int, pipefail bool) int {
 }
 
 // resolvedRedir is a redirection with its target already expanded to a
-// path — safe to apply from a background goroutine (no State/ev access).
+// path (or heredoc body) — safe to apply from a background goroutine
+// (no State/ev access).
 type resolvedRedir struct {
 	shellparse.Redir
-	path string // "" for RedirDup
+	path     string // "" for RedirDup and RedirHeredoc
+	hereBody string // expanded body for RedirHeredoc
 }
 
-// resolveRedirs expands redirection targets (the State/ev-touching half).
+// resolveRedirs expands redirection targets and heredoc bodies (the
+// State/ev-touching half).
 func resolveRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator) ([]resolvedRedir, error) {
 	var out []resolvedRedir
 	for _, r := range redirs {
@@ -263,7 +266,13 @@ func resolveRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator) ([]re
 			return nil, serr.New("only file descriptors 0, 1, 2 are supported")
 		}
 		rr := resolvedRedir{Redir: r}
-		if r.Target != nil {
+		if r.Op == shellparse.RedirHeredoc {
+			body, err := expandHeredoc(st, r.Here, ev)
+			if err != nil {
+				return nil, serr.Wrap(err, "in", "heredoc <<"+r.Here.Delim)
+			}
+			rr.hereBody = body
+		} else if r.Target != nil {
 			fields, err := ExpandWords(st, []*shellparse.Word{r.Target}, ev)
 			if err != nil {
 				return nil, err
@@ -315,6 +324,22 @@ func applyResolved(redirs []resolvedRedir, base Stdio) (Stdio, []io.Closer, erro
 			fds[0] = f
 		case shellparse.RedirDup:
 			fds[r.FD] = fds[r.DupTo]
+		case shellparse.RedirHeredoc:
+			// The body goes through a real pipe so the child gets an
+			// actual fd (job-control safe; no exec copy goroutines). If
+			// the reader exits early, the write fails with EPIPE once the
+			// read end is closed by our closers, ending the goroutine.
+			pr, pw, err := os.Pipe()
+			if err != nil {
+				return base, closers, serr.Wrap(err, "op", "heredoc")
+			}
+			closers = append(closers, pr)
+			body := r.hereBody
+			go func() {
+				pw.WriteString(body)
+				pw.Close()
+			}()
+			fds[r.FD] = pr
 		case shellparse.RedirOutErr, shellparse.RedirOutErrApp:
 			flags := os.O_CREATE | os.O_TRUNC | os.O_WRONLY
 			if r.Op == shellparse.RedirOutErrApp {

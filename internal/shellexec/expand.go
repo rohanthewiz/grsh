@@ -1,6 +1,7 @@
 package shellexec
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -147,6 +148,34 @@ func expandWord(st *State, w *shellparse.Word, ev WordEvaluator) ([]string, erro
 		out = append(out, plain)
 	}
 	return out, nil
+}
+
+// expandHeredoc renders a heredoc body: $VAR joins multi-value specials
+// with spaces, $(...) substitutes its trimmed output, everything else is
+// literal. No field splitting, globbing, or tilde — the body is one text
+// block. A quoted delimiter parses to a single literal segment upstream.
+func expandHeredoc(st *State, h *shellparse.Heredoc, ev WordEvaluator) (string, error) {
+	var b strings.Builder
+	for _, seg := range h.Segs {
+		switch s := seg.(type) {
+		case shellparse.Lit:
+			b.WriteString(s.Text)
+		case shellparse.EnvVar:
+			vals, _ := lookupVar(st, s.Name)
+			b.WriteString(strings.Join(vals, " "))
+		case shellparse.CmdSub:
+			out, _, err := Capture(st, s.List, ev)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(out)
+		default:
+			// GoExpr is never produced by the heredoc parser ({} stays
+			// literal so JSON bodies survive).
+			return "", serr.New(fmt.Sprintf("internal: unexpected %T in heredoc body", seg))
+		}
+	}
+	return b.String(), nil
 }
 
 // lookupVar resolves $NAME. The second result is true when the value should

@@ -1,0 +1,43 @@
+# Heredocs: << expands $VAR and $(...); {braces} are always literal.
+export HD_WHO=world
+cat <<EOF
+hello $HD_WHO
+sub: $(echo captured)
+json: {"a": [1, 2]}
+esc: \$HD_WHO
+EOF
+
+# Quoted delimiter: body is fully literal.
+cat <<'STOP'
+raw $HD_WHO and $(no sub)
+STOP
+
+# <<- strips leading tabs from body and delimiter lines.
+cat <<-END
+	indented away
+	END
+
+# Heredocs feed pipelines and combine with redirects.
+cat <<EOF | tr a-z A-Z
+quiet
+EOF
+cat <<EOF > hd.txt
+saved line
+EOF
+cat hd.txt
+
+# Two heredocs on one line: bodies read in order, last one wins fd 0.
+cat <<A <<B
+first
+A
+second
+B
+
+# Heredoc into a background job, collected with wait.
+cat <<EOF > bg.txt &
+from the background
+EOF
+wait %1
+cat bg.txt
+
+echo done

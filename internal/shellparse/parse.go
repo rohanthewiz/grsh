@@ -24,6 +24,16 @@ func Parse(src string) (*CmdList, error) {
 type parser struct {
 	s string
 	i int
+	// pending heredocs on the current line, in operator order; their
+	// bodies are consumed from the lines after the next newline.
+	pending []pendingHeredoc
+}
+
+// pendingHeredoc locates a heredoc redirection by owner and index (the
+// Redirs slice may still grow, so no pointer into it is held).
+type pendingHeredoc struct {
+	cmd *Command
+	idx int
 }
 
 func (p *parser) eof() bool  { return p.i >= len(p.s) }
@@ -39,8 +49,10 @@ func (p *parser) rest(n int) string {
 	return r
 }
 
+// skipSpaces skips spaces and tabs. Newlines are NOT whitespace: they
+// separate commands and mark where pending heredoc bodies begin.
 func (p *parser) skipSpaces() {
-	for !p.eof() && (p.peek() == ' ' || p.peek() == '\t' || p.peek() == '\n') {
+	for !p.eof() && (p.peek() == ' ' || p.peek() == '\t') {
 		p.i++
 	}
 }
@@ -56,6 +68,12 @@ func (p *parser) parseCmdList() (*CmdList, error) {
 		if p.eof() {
 			break
 		}
+		if p.peek() == '\n' {
+			if err := p.endLine(); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		ao, err := p.parseAndOr()
 		if err != nil {
 			return nil, err
@@ -66,6 +84,14 @@ func (p *parser) parseCmdList() (*CmdList, error) {
 		p.skipSpaces()
 		if !p.eof() && p.peek() == ';' {
 			p.i++
+			continue
+		}
+		// Newline separates commands like ;, after collecting any
+		// heredoc bodies that start on the following lines.
+		if !p.eof() && p.peek() == '\n' {
+			if err := p.endLine(); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		// Lone & backgrounds the preceding and-or chain and, like ;,
@@ -80,7 +106,107 @@ func (p *parser) parseCmdList() (*CmdList, error) {
 		}
 		break
 	}
+	if len(p.pending) > 0 {
+		ph := p.pending[0]
+		return nil, p.errf("unterminated heredoc <<%s (missing body)",
+			ph.cmd.Redirs[ph.idx].Here.Delim)
+	}
 	return list, nil
+}
+
+// endLine consumes a newline and reads the bodies of any heredocs opened
+// on the line that just ended, in operator order.
+func (p *parser) endLine() error {
+	p.i++ // consume '\n'
+	for _, ph := range p.pending {
+		if err := p.readHeredocBody(ph.cmd.Redirs[ph.idx].Here); err != nil {
+			return err
+		}
+	}
+	p.pending = nil
+	return nil
+}
+
+// readHeredocBody consumes physical lines until the delimiter line and
+// fills in the heredoc's Body and Segs.
+func (p *parser) readHeredocBody(h *Heredoc) error {
+	var body strings.Builder
+	for {
+		if p.eof() {
+			return p.errf("unterminated heredoc <<%s (missing closing delimiter)", h.Delim)
+		}
+		start := p.i
+		nl := strings.IndexByte(p.s[p.i:], '\n')
+		var line string
+		if nl < 0 {
+			line = p.s[start:]
+			p.i = len(p.s)
+		} else {
+			line = p.s[start : start+nl]
+			p.i = start + nl + 1
+		}
+		if h.StripTabs {
+			line = strings.TrimLeft(line, "\t")
+		}
+		if line == h.Delim {
+			break
+		}
+		if nl < 0 {
+			return p.errf("unterminated heredoc <<%s (missing closing delimiter)", h.Delim)
+		}
+		body.WriteString(line)
+		body.WriteByte('\n')
+	}
+	h.Body = body.String()
+	if h.Quoted {
+		h.Segs = []Segment{Lit{Text: h.Body, Quoted: true}}
+		return nil
+	}
+	segs, err := parseHeredocSegs(h.Body)
+	if err != nil {
+		return serr.Wrap(err, "in", "heredoc <<"+h.Delim)
+	}
+	h.Segs = segs
+	return nil
+}
+
+// parseHeredocSegs parses an expandable heredoc body: $VAR, ${VAR} and
+// $(...) are live; \$ and \\ escape; everything else (quotes, braces) is
+// literal, as in bash.
+func parseHeredocSegs(body string) ([]Segment, error) {
+	p := &parser{s: body}
+	var segs []Segment
+	var lit strings.Builder
+	flush := func() {
+		if lit.Len() > 0 {
+			segs = append(segs, Lit{Text: lit.String(), Quoted: true})
+			lit.Reset()
+		}
+	}
+	for !p.eof() {
+		switch c := p.peek(); c {
+		case '\\':
+			if p.i+1 < len(p.s) && (p.s[p.i+1] == '$' || p.s[p.i+1] == '\\') {
+				lit.WriteByte(p.s[p.i+1])
+				p.i += 2
+				continue
+			}
+			lit.WriteByte('\\')
+			p.i++
+		case '$':
+			flush()
+			seg, err := p.parseDollar(true)
+			if err != nil {
+				return nil, err
+			}
+			segs = append(segs, seg)
+		default:
+			lit.WriteByte(c)
+			p.i++
+		}
+	}
+	flush()
+	return segs, nil
 }
 
 func (p *parser) parseAndOr() (*AndOr, error) {
@@ -160,7 +286,7 @@ func (p *parser) parseCommand() (*Command, error) {
 			break
 		}
 		c := p.peek()
-		if c == ';' {
+		if c == ';' || c == '\n' {
 			break
 		}
 		if c == '|' {
@@ -181,8 +307,11 @@ func (p *parser) parseCommand() (*Command, error) {
 			break // lone &: background marker, handled at list level
 		}
 		if c == '#' {
-			// Comment at word start: rest of line is ignored.
-			p.i = len(p.s)
+			// Comment at word start: rest of the physical line is ignored
+			// (not beyond the newline — heredoc bodies may follow).
+			for !p.eof() && p.peek() != '\n' {
+				p.i++
+			}
 			break
 		}
 		if c == '<' || c == '>' || p.atFDRedir() {
@@ -191,6 +320,9 @@ func (p *parser) parseCommand() (*Command, error) {
 				return nil, err
 			}
 			cmd.Redirs = append(cmd.Redirs, *r)
+			if r.Op == RedirHeredoc {
+				p.pending = append(p.pending, pendingHeredoc{cmd: cmd, idx: len(cmd.Redirs) - 1})
+			}
 			continue
 		}
 		w, err := p.parseWord()
@@ -268,6 +400,12 @@ func (p *parser) parseRedir() (*Redir, error) {
 			r.DupTo = d
 			return r, nil
 		}
+	case p.at("<<-"):
+		p.i += 3
+		return p.finishHeredoc(r, true)
+	case p.at("<<"):
+		p.i += 2
+		return p.finishHeredoc(r, false)
 	case p.at("<"):
 		p.i++
 		r.Op = RedirIn
@@ -287,6 +425,48 @@ func (p *parser) parseRedir() (*Redir, error) {
 		return nil, p.errf("missing redirection target")
 	}
 	r.Target = w
+	return r, nil
+}
+
+// finishHeredoc parses the delimiter word after << or <<-. Any quoting
+// (whole or partial) makes the body literal, as in bash. The body itself
+// is read later, after the current line's newline (see endLine).
+func (p *parser) finishHeredoc(r *Redir, stripTabs bool) (*Redir, error) {
+	r.Op = RedirHeredoc
+	if r.FD < 0 {
+		r.FD = 0
+	}
+	p.skipSpaces()
+	var delim strings.Builder
+	quoted := false
+	for !p.eof() && !isWordDelim(p.peek()) {
+		switch c := p.peek(); c {
+		case '\'', '"':
+			quoted = true
+			p.i++
+			end := strings.IndexByte(p.s[p.i:], c)
+			if end < 0 {
+				return nil, p.errf("unterminated quote in heredoc delimiter")
+			}
+			delim.WriteString(p.s[p.i : p.i+end])
+			p.i += end + 1
+		case '\\':
+			quoted = true
+			p.i++
+			if p.eof() {
+				return nil, p.errf("trailing backslash in heredoc delimiter")
+			}
+			delim.WriteByte(p.peek())
+			p.i++
+		default:
+			delim.WriteByte(c)
+			p.i++
+		}
+	}
+	if delim.Len() == 0 {
+		return nil, p.errf("missing heredoc delimiter after <<")
+	}
+	r.Here = &Heredoc{Delim: delim.String(), Quoted: quoted, StripTabs: stripTabs}
 	return r, nil
 }
 

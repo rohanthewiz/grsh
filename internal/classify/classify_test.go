@@ -1,6 +1,7 @@
 package classify
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -98,7 +99,7 @@ func TestCorpus(t *testing.T) {
 		{`rm -rf build/`, Shell},
 		{`cp -R assets dist/`, Shell},
 		{`mv old.name new.name`, Shell},
-		{`cat <<gone.txt`, Shell}, // heredoc-ish still lexes as shell redirect
+		{`cat <gone.txt`, Shell}, // << is a real heredoc now — see TestHeredocChunks
 		{`diff -u a.txt b.txt`, Shell},
 		{`tee out.log`, Shell},
 		{`sleep 2`, Shell},
@@ -313,5 +314,52 @@ func TestDepthTracking(t *testing.T) {
 		if chunks[i].Depth != d {
 			t.Errorf("chunk %d (%q): depth %d, want %d", i, chunks[i].Text, chunks[i].Depth, d)
 		}
+	}
+}
+
+// TestHeredocChunks verifies heredoc bodies are swallowed into the shell
+// chunk verbatim (newlines preserved, body lines never classified).
+func TestHeredocChunks(t *testing.T) {
+	src := strings.Join([]string{
+		`cat <<EOF > out.txt`, // 1
+		`x := 1`,              // 2: Go-looking, but it's heredoc body
+		`# not a comment`,     // 3: body too
+		`EOF`,                 // 4
+		`echo done`,           // 5
+	}, "\n")
+	c := New(testPkgs)
+	chunks, err := c.File(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 {
+		for _, ch := range chunks {
+			t.Logf("chunk: %v %d-%d %q", ch.Kind, ch.StartLine, ch.EndLine, ch.Text)
+		}
+		t.Fatalf("got %d chunks, want 2", len(chunks))
+	}
+	ch := chunks[0]
+	if ch.Kind != Shell || ch.StartLine != 1 || ch.EndLine != 4 {
+		t.Errorf("heredoc chunk: got %v %d-%d, want shell 1-4", ch.Kind, ch.StartLine, ch.EndLine)
+	}
+	wantText := "cat <<EOF > out.txt\nx := 1\n# not a comment\nEOF"
+	if ch.Text != wantText {
+		t.Errorf("heredoc chunk text:\n got %q\nwant %q", ch.Text, wantText)
+	}
+	if chunks[1].Kind != Shell || chunks[1].StartLine != 5 {
+		t.Errorf("follow-on chunk: got %v line %d, want shell line 5", chunks[1].Kind, chunks[1].StartLine)
+	}
+}
+
+// An unterminated heredoc in a script is a hard error wrapping
+// ErrIncomplete (the REPL turns that into "read more").
+func TestHeredocUnterminated(t *testing.T) {
+	c := New(testPkgs)
+	_, err := c.File("cat <<EOF\nno end in sight")
+	if err == nil {
+		t.Fatal("expected error for unterminated heredoc")
+	}
+	if !errors.Is(err, ErrIncomplete) {
+		t.Errorf("error should wrap ErrIncomplete, got: %v", err)
 	}
 }

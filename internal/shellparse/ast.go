@@ -89,12 +89,27 @@ const (
 	RedirDup                      // N>&M e.g. 2>&1
 	RedirOutErr                   // &>  (stdout and stderr to file)
 	RedirOutErrApp                // &>>
+	RedirHeredoc                  // <<DELIM / <<-DELIM (fd defaults to 0)
 )
 
-// Redir is one redirection. For RedirDup, DupTo holds M and Target is nil.
+// Redir is one redirection. For RedirDup, DupTo holds M and Target is nil;
+// for RedirHeredoc, Here holds the body and Target is nil.
 type Redir struct {
 	Op     RedirOp
 	FD     int
 	DupTo  int
 	Target *Word
+	Here   *Heredoc
+}
+
+// Heredoc is a << body. Unless the delimiter was quoted, Segs holds the
+// body parsed for $VAR/${VAR}/$(...) expansion. {expr} interpolation is
+// deliberately NOT special inside heredocs (JSON braces pass through);
+// a quoted delimiter (<<'EOF') makes the whole body literal.
+type Heredoc struct {
+	Delim     string
+	Quoted    bool   // delimiter was quoted: body is literal
+	StripTabs bool   // <<-: leading tabs stripped from body and delimiter lines
+	Body      string // raw body (tabs already stripped for <<-)
+	Segs      []Segment
 }

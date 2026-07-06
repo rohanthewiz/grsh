@@ -47,8 +47,12 @@ func dumpCmd(c *Command) string {
 }
 
 func dumpWord(w *Word) string {
+	return dumpSegs(w.Segs)
+}
+
+func dumpSegs(segs []Segment) string {
 	var b strings.Builder
-	for _, seg := range w.Segs {
+	for _, seg := range segs {
 		switch s := seg.(type) {
 		case Lit:
 			if s.Quoted {
@@ -81,6 +85,16 @@ func dumpRedir(r Redir) string {
 		return fmt.Sprintf("&>%s", dumpWord(r.Target))
 	case RedirOutErrApp:
 		return fmt.Sprintf("&>>%s", dumpWord(r.Target))
+	case RedirHeredoc:
+		h := r.Here
+		op := "<<"
+		if h.StripTabs {
+			op = "<<-"
+		}
+		if h.Quoted {
+			return fmt.Sprintf("%s'%s'[%s]", op, h.Delim, dumpSegs(h.Segs))
+		}
+		return fmt.Sprintf("%s%s[%s]", op, h.Delim, dumpSegs(h.Segs))
 	}
 	return "?"
 }
@@ -158,6 +172,67 @@ func TestParseErrors(t *testing.T) {
 		{`ls && &`, "missing command after"},
 		{`echo hi \`, "trailing backslash"},
 		{`cmd >`, "missing redirection target"},
+	}
+	for _, tc := range tests {
+		_, err := Parse(tc.in)
+		if err == nil {
+			t.Errorf("Parse(%q): expected error containing %q, got nil", tc.in, tc.errPart)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.errPart) {
+			t.Errorf("Parse(%q) error = %q, want it to contain %q", tc.in, err, tc.errPart)
+		}
+	}
+}
+
+func TestParseHeredocs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"basic", "cat <<EOF\nhello\nworld\nEOF", "cat <<EOF[q(hello\nworld\n)]"},
+		{"expansion", "cat <<EOF\nhi $USER\nEOF", "cat <<EOF[q(hi )var(USER)q(\n)]"},
+		{"cmdsub", "cat <<EOF\nnow: $(date)\nEOF", "cat <<EOF[q(now: )sub(date)q(\n)]"},
+		{"escaped dollar", "cat <<EOF\ncost \\$5\nEOF", "cat <<EOF[q(cost $5\n)]"},
+		{"braces literal", "cat <<EOF\n{\"a\": 1}\nEOF", "cat <<EOF[q({\"a\": 1}\n)]"},
+		{"quoted delim single", "cat <<'EOF'\nno $EXPAND\nEOF", "cat <<'EOF'[q(no $EXPAND\n)]"},
+		{"quoted delim double", "cat <<\"EOF\"\nno $EXPAND\nEOF", "cat <<'EOF'[q(no $EXPAND\n)]"},
+		{"strip tabs", "cat <<-EOF\n\tindented\n\tEOF", "cat <<-EOF[q(indented\n)]"},
+		{"empty body", "cat <<EOF\nEOF", "cat <<EOF[]"},
+		{"delim at eof no newline", "cat <<EOF\nbody\nEOF\n", "cat <<EOF[q(body\n)]"},
+		{"two heredocs", "cat <<A <<B\nfirst\nA\nsecond\nB", "cat <<A[q(first\n)] <<B[q(second\n)]"},
+		{"in pipeline", "cat <<EOF | wc -l\none\nEOF", "cat <<EOF[q(one\n)] | wc -l"},
+		{"command after body", "cat <<EOF\nbody\nEOF\necho done", "cat <<EOF[q(body\n)] ; echo done"},
+		{"background", "cat <<EOF &\nbody\nEOF", "cat <<EOF[q(body\n)] &"},
+		{"comment on heredoc line", "cat <<EOF # note\nbody\nEOF", "cat <<EOF[q(body\n)]"},
+		{"newline separates commands", "echo a\necho b", "echo a ; echo b"},
+		{"fd prefix", "cat 0<<EOF\nx\nEOF", "cat <<EOF[q(x\n)]"},
+	}
+	for _, tc := range tests {
+		got, err := Parse(tc.in)
+		if err != nil {
+			t.Errorf("%s: Parse(%q) error: %v", tc.name, tc.in, err)
+			continue
+		}
+		if d := dump(got); d != tc.want {
+			t.Errorf("%s: Parse(%q)\n got: %s\nwant: %s", tc.name, tc.in, d, tc.want)
+		}
+	}
+}
+
+func TestParseHeredocErrors(t *testing.T) {
+	tests := []struct {
+		in      string
+		errPart string
+	}{
+		{"cat <<EOF", "unterminated heredoc <<EOF (missing body)"},
+		{"cat <<EOF\nbody", "missing closing delimiter"},
+		{"cat <<EOF\nbody\nEO", "missing closing delimiter"},
+		{"cat <<", "missing heredoc delimiter"},
+		{"cat <<'EOF\nx\nEOF", "unterminated quote in heredoc delimiter"},
+		{"cat <<EOF | wc\nEOF ", "missing closing delimiter"}, // trailing space ≠ delimiter
+		{"echo $(cat <<EOF)\nbody\nEOF", "unterminated heredoc"},
 	}
 	for _, tc := range tests {
 		_, err := Parse(tc.in)
