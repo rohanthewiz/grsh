@@ -145,10 +145,14 @@ func (in *Interp) evalCall(env *Env, call *ast.CallExpr) ([]Value, error) {
 				}
 			}
 		}
-		// Method on a value via reflection.
+		// Method on a value: script-declared struct methods dispatch
+		// through the __m_Type_Name globals; everything else reflects.
 		recv, err := in.eval1(env, fn.X)
 		if err != nil {
 			return nil, err
+		}
+		if sv, ok := recv.(*StructVal); ok {
+			return in.callStructMethod(env, call, sv, fn.Sel.Name)
 		}
 		m := reflect.ValueOf(recv).MethodByName(fn.Sel.Name)
 		if !m.IsValid() {
@@ -380,6 +384,24 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 
 func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value, bool, error) {
 	switch name {
+	case "iff":
+		// Lazy ternary — grsh's stand-in for Go's missing `cond ? a : b`:
+		// the condition evaluates first, then ONLY the chosen branch (so
+		// iff(len(xs) > 0, xs[0], "none") never panics on the dead arm).
+		if len(call.Args) != 3 {
+			return nil, true, in.errAt(call, "iff expects (condition, thenValue, elseValue)")
+		}
+		cond, err := in.evalBool(env, call.Args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		branch := call.Args[1]
+		if !cond {
+			branch = call.Args[2]
+		}
+		v, err := in.eval1(env, branch)
+		return []Value{v}, true, err
+
 	case "len", "cap":
 		if len(call.Args) != 1 {
 			return nil, true, in.errAt(call, name+" expects one argument")

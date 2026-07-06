@@ -100,10 +100,75 @@ func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) 
 	return sv, nil
 }
 
+// shallowCopy duplicates the instance for value-receiver method calls
+// (Go semantics: the method sees a copy; reference fields still share).
+func (sv *StructVal) shallowCopy() *StructVal {
+	vals := make([]Value, len(sv.Vals))
+	copy(vals, sv.Vals)
+	return &StructVal{Type: sv.Type, Vals: vals}
+}
+
+// methodKey is the global a top-level method declaration transforms into
+// (transform.MethodPrefix; spelled out here to avoid the import cycle).
+func methodKey(typeName, method string) string {
+	return "__m_" + typeName + "_" + method
+}
+
+// lookupMethod finds a script-declared method for a struct type.
+func (in *Interp) lookupMethod(typeName, method string) (*Closure, bool) {
+	v, ok := in.globals.Get(methodKey(typeName, method))
+	if !ok {
+		return nil, false
+	}
+	cl, ok := v.(*Closure)
+	return cl, ok
+}
+
+// methodHasPtrRecv reports whether the method was declared with a pointer
+// receiver — its first parameter, after the transform rewrite.
+func methodHasPtrRecv(cl *Closure) bool {
+	fl := cl.Fn.Type.Params
+	if fl == nil || len(fl.List) == 0 {
+		return false
+	}
+	_, ok := fl.List[0].Type.(*ast.StarExpr)
+	return ok
+}
+
+// callStructMethod dispatches sv.Method(args...). Pointer receivers share
+// the instance; value receivers get a shallow copy.
+func (in *Interp) callStructMethod(env *Env, call *ast.CallExpr, sv *StructVal, name string) ([]Value, error) {
+	cl, ok := in.lookupMethod(sv.Type.Name, name)
+	if !ok {
+		// Native methods on the value itself (e.g. String) still work.
+		if m := reflect.ValueOf(sv).MethodByName(name); m.IsValid() {
+			return in.callValue(env, call, m.Interface(), name)
+		}
+		return nil, in.errAt(call, fmt.Sprintf("unknown method %s on %s", name, sv.Type.Name),
+			"hint", fmt.Sprintf("declare it at top level: func (v %s) %s(...) { ... }", sv.Type.Name, name))
+	}
+	if call.Ellipsis.IsValid() {
+		return nil, in.errAt(call, "spread calls (xs...) are not supported yet")
+	}
+	self := sv
+	if !methodHasPtrRecv(cl) {
+		self = sv.shallowCopy()
+	}
+	args, err := in.evalArgs(env, call)
+	if err != nil {
+		return nil, err
+	}
+	return in.callClosure(call, cl, append([]Value{self}, args...))
+}
+
 // structField reads sv.Field.
 func (in *Interp) structField(n ast.Node, sv *StructVal, field string) (Value, error) {
 	idx, ok := sv.Type.Index[field]
 	if !ok {
+		if _, isMethod := in.lookupMethod(sv.Type.Name, field); isMethod {
+			return nil, in.errAt(n, fmt.Sprintf("%s is a method of %s — call it: .%s(...)", field, sv.Type.Name, field),
+				"hint", "method values are not supported in grsh")
+		}
 		return nil, in.errAt(n, fmt.Sprintf("unknown field %s in %s", field, sv.Type.Name))
 	}
 	return sv.Vals[idx], nil

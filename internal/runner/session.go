@@ -87,7 +87,8 @@ func NewSession(o Options) *Session {
 	}
 	// Go builtin functions classify as Go in call position (`delete(m, k)`)
 	// — but only with Go punctuation after, so `make build` stays shell.
-	cls.Predeclare("len", "cap", "append", "delete", "copy", "make", "min", "max")
+	// iff is grsh's lazy ternary intrinsic.
+	cls.Predeclare("len", "cap", "append", "delete", "copy", "make", "min", "max", "iff")
 	s := &Session{
 		st:      st,
 		stdio:   stdio,

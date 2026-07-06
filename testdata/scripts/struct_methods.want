@@ -1,0 +1,6 @@
+norm2: 25
+scaled: 6 8
+value receiver copies: 6
+shell sees: rect area 15
+empty
+size: big

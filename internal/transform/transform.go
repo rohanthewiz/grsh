@@ -77,9 +77,16 @@ func File(name string, chunks []classify.Chunk, baseTab int) (*Result, error) {
 
 var (
 	topFuncRe    = regexp.MustCompile(`^(\s*)func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	methodRe     = regexp.MustCompile(`^(\s*)func\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+(\*?)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
 	importRe     = regexp.MustCompile(`^\s*import\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"([^"]+)"\s*$`)
 	quotedPathRe = regexp.MustCompile(`"([^"]+)"`)
 )
+
+// MethodPrefix names the globals that top-level method declarations become:
+// `func (p Point) Dist(...)` → `__m_Point_Dist := func(p Point, ...)`. The
+// interpreter hoists them like other top-level funcs and dispatches
+// sv.Dist(...) to __m_Point_Dist with the receiver prepended.
+const MethodPrefix = "__m_"
 
 func rewriteGoChunk(name string, ch classify.Chunk, lines []string, addTab func(*shellparse.CmdList) int) ([]string, error) {
 	// import "x" (single-line or grouped) → __import calls, blank filler.
@@ -91,6 +98,19 @@ func rewriteGoChunk(name string, ch classify.Chunk, lines []string, addTab func(
 	if ch.Depth == 0 {
 		if m := topFuncRe.FindStringSubmatch(lines[0]); m != nil {
 			lines[0] = m[1] + m[2] + " := func(" + lines[0][len(m[0]):]
+		}
+		// Method `func (p Point) Dist(` → `__m_Point_Dist := func(p Point, `
+		// (receiver becomes the first parameter).
+		if m := methodRe.FindStringSubmatch(lines[0]); m != nil {
+			indent, recvName, star, recvType, name := m[1], m[2], m[3], m[4], m[5]
+			rest := lines[0][len(m[0]):]
+			head := indent + MethodPrefix + recvType + "_" + name +
+				" := func(" + recvName + " " + star + recvType
+			if strings.HasPrefix(strings.TrimLeft(rest, " \t"), ")") {
+				lines[0] = head + rest
+			} else {
+				lines[0] = head + ", " + rest
+			}
 		}
 	}
 

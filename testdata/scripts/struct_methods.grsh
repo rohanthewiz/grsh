@@ -1,0 +1,44 @@
+# Struct methods: value receivers copy, pointer receivers mutate.
+type Point struct {
+	X, Y float64
+}
+
+func (p Point) Norm2() float64 {
+	return p.X*p.X + p.Y*p.Y
+}
+
+func (p *Point) Scale(f float64) {
+	p.X *= f
+	p.Y *= f
+}
+
+func (p Point) TryMutate() {
+	p.X = 999
+}
+
+p := Point{3, 4}
+fmt.Println("norm2:", p.Norm2())
+p.Scale(2)
+fmt.Println("scaled:", p.X, p.Y)
+p.TryMutate()
+fmt.Println("value receiver copies:", p.X)
+
+# Methods compose and hoist (Describe calls Area declared below it).
+type Rect struct { W, H float64 }
+
+func (r Rect) Describe() string {
+	return "rect area " + fmt.Sprint(r.Area())
+}
+
+func (r Rect) Area() float64 {
+	return r.W * r.H
+}
+
+r := Rect{W: 3, H: 5}
+echo shell sees: {r.Describe()}
+
+# iff: the lazy ternary. Only the taken branch evaluates.
+var xs []string
+fmt.Println(iff(len(xs) > 0, xs[0], "empty"))
+n := 42
+echo size: {iff(n > 10, "big", "small")}

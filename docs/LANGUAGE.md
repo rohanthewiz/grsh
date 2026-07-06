@@ -136,9 +136,34 @@ Pipes `|`, sequencing `;`, short-circuit `&&` / `||`, background `&`, and:
 | `2> f`, `2>> f` | stderr truncate / append |
 | `2>&1`, `1>&2` | duplicate one fd onto another |
 | `&> f`, `&>> f` | stdout **and** stderr |
+| `<<EOF`, `<<-EOF`, `<<'EOF'` | heredoc — see below |
 
 Only fds 0–2 are supported. A `#` at the start of a word begins a
 comment; mid-word `#` is literal (`file#1` is one word).
+
+### Heredocs
+
+```
+cat <<EOF > cfg.json
+{"user": "$USER", "host": "$(hostname)"}
+EOF
+```
+
+The body is the following lines up to a line that is exactly the
+delimiter. Inside it, `$VAR`, `${VAR}` and `$(...)` expand (`\$` and
+`\\` escape); **`{expr}` Go interpolation is deliberately NOT live in
+heredoc bodies**, so JSON braces pass through untouched — interpolate
+via `$(...)` or a variable if you need a computed value. Quote the
+delimiter (`<<'EOF'`) for a fully literal body. `<<-EOF` strips leading
+tabs from body and delimiter lines. Heredocs feed pipelines
+(`cat <<EOF | jq .`), combine with other redirects, and work on
+background jobs (the body expands eagerly at launch, like every other
+redirect). Two on one line read their bodies in operator order; the
+last one owns stdin. Heredocs inside `$(...)` command substitution are
+not supported.
+
+In the REPL, an open heredoc keeps the continuation prompt until you
+type the delimiter line.
 
 ### Builtins
 
@@ -243,7 +268,13 @@ captures buffer output.
 - `var`, `const`, `:=`, `=`, multi-assignment, `+=` and friends, `++`/`--`
 - Types: `bool`, `int`, `int64`, `float64`, `string`, `byte`, `rune`,
   `any`, `error`; slices `[]T`; maps `map[K]V`; struct **types**
-  (declaration, literals, field get/set — no methods or embedding yet)
+  (declaration, literals, field get/set — no embedding yet)
+- **Struct methods**: top-level `func (p Point) Norm() float64 {...}`
+  and `func (p *Point) Scale(f float64) {...}`. Go semantics: a value
+  receiver sees a copy, a pointer receiver mutates the instance.
+  Methods hoist like functions (declaration order doesn't matter) and
+  work in `{expr}` interpolation. Method *values* (`f := p.Norm`) are
+  not supported — call them.
 - `if`/`else` (with init), all `for` forms, `range` (slices, strings,
   maps, integers), expression `switch` (with init and `default`),
   `break`/`continue` (unlabeled), `defer` (LIFO, args evaluated at defer
@@ -252,6 +283,9 @@ captures buffer output.
   and recursion work), closures via `f := func(...)`, variadic parameters,
   multiple returns
 - Builtin functions: `len`, `cap`, `append`, `make`, `delete`, `copy`
+- `iff(cond, a, b)` — the missing ternary. Lazy like a real `?:`: only
+  the taken branch evaluates, so `iff(len(xs) > 0, xs[0], "none")` is
+  safe on an empty slice. Nest it for chains.
 - Conversions: `int(x)`, `float64(x)`, `string(r)` (from rune/byte/[]byte),
   `rune(x)`, `byte(x)`, `int64(x)`. **`string(65)` of an int is refused**
   (a classic Go footgun) — use `strconv.Itoa`.
@@ -262,10 +296,11 @@ captures buffer output.
 
 ### Not in v1
 
-Goroutines/channels/`select`, methods on script types, interfaces beyond
-`any`/`error`, generics, labels, type switches, `fallthrough`, spread
-calls (`xs...`), fixed-size arrays, pointers. Unsupported constructs fail
-with a positioned error naming the construct.
+Goroutines/channels/`select`, struct embedding, method values, interfaces
+beyond `any`/`error`, generics, labels, type switches, `fallthrough`,
+spread calls (`xs...`), fixed-size arrays, pointers (beyond method
+receivers). Unsupported constructs fail with a positioned error naming
+the construct.
 
 ### Semantics notes
 
@@ -453,4 +488,7 @@ function call trail. `--explain` prints every line's classification.
 | `$!` | `wait %N` + `status()` | explicit, like `$?` → `status()` |
 | bg job shares tty stdin | stdin is `/dev/null` | jobs can't steal interactive input |
 | `wait` blocks on stopped jobs | warns and skips them | a blocked shell could never resume them |
-| heredocs, `<(...)` | not in v1 | planned/considered for v2 |
+| heredoc bodies expand `` ` `` and `{`...`}` freely | `$VAR`/`$(...)` only; `{expr}` stays literal | JSON/config bodies survive; quote the delimiter for fully raw |
+| heredocs inside `$(...)` | not supported | rarely needed; keeps one-line substitution |
+| `<(...)` process substitution | not supported | considered for v2 |
+| — | `iff(cond, a, b)` lazy ternary | Go has no `?:`; scripts want one |
