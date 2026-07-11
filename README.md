@@ -105,6 +105,17 @@ go test ./...
 ./bin/grsh -c "ls | wc -l"
 ```
 
+## Embedding
+
+The root `grsh` package hosts a persistent session inside another Go
+program — streaming output, `Interrupt`/`Kill` cancellation, no
+terminal claims. See [docs/EMBEDDING.md](docs/EMBEDDING.md).
+
+```go
+sess := grsh.NewSession(grsh.Options{Stdout: out, Stderr: out})
+err := sess.Eval(`ls | wc -l`)
+```
+
 ## Architecture
 
 ```

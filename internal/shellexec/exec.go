@@ -37,10 +37,22 @@ func Run(st *State, list *shellparse.CmdList, ev WordEvaluator, stdio Stdio) (in
 }
 
 // Capture runs a command list buffering stdout, with trailing newlines
-// trimmed (command substitution semantics). Stderr passes through.
+// trimmed (command substitution semantics). Stderr passes through to
+// CaptureErr when set (the session's stderr), else the process stderr.
 func Capture(st *State, list *shellparse.CmdList, ev WordEvaluator) (string, int, error) {
 	var buf bytes.Buffer
-	status, err := Run(st, list, ev, Stdio{In: os.Stdin, Out: &buf, Err: os.Stderr})
+	in := io.Reader(os.Stdin)
+	if st.Embedded {
+		// The host owns the real stdin (often a raw-mode tty); a $()
+		// child reading it would steal the host's input, so embedded
+		// substitutions read EOF instead.
+		in = eofReader{}
+	}
+	errW := io.Writer(os.Stderr)
+	if st.CaptureErr != nil {
+		errW = st.CaptureErr
+	}
+	status, err := Run(st, list, ev, Stdio{In: in, Out: &buf, Err: errW})
 	return strings.TrimRight(buf.String(), "\n"), status, err
 }
 
@@ -105,6 +117,9 @@ func runSimple(st *State, cmd *shellparse.Command, ev WordEvaluator, stdio Stdio
 	c.Stdin, c.Stdout, c.Stderr = sio.In, sio.Out, sio.Err
 	if tty, ok := interactiveTTY(st, stdio); ok {
 		return runForegroundJobControl(st, []*exec.Cmd{c}, []string{strings.Join(argv, " ")}, tty, stdio, nil)
+	}
+	if embeddedPgroup(st) {
+		return runForegroundEmbedded(st, []*exec.Cmd{c}, []string{strings.Join(argv, " ")}, sio, nil)
 	}
 	if err := c.Run(); err != nil {
 		return externalStatus(sio, argv[0], err)
@@ -211,6 +226,10 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 	// suspends into the job table). parentFiles close after Start there.
 	if tty, ok := interactiveTTY(st, stdio); ok {
 		return runForegroundJobControl(st, execs, names, tty, stdio, parentFiles)
+	}
+	// Embedded host: own pgroup so the host can cancel, no tty handoff.
+	if embeddedPgroup(st) {
+		return runForegroundEmbedded(st, execs, names, stdio, parentFiles)
 	}
 
 	started := make([]bool, n)

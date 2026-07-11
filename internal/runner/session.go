@@ -15,6 +15,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"syscall"
 
 	"github.com/rohanthewiz/grsh/internal/builtins"
 	"github.com/rohanthewiz/grsh/internal/classify"
@@ -33,6 +34,12 @@ type Options struct {
 	ScriptName string
 	ScriptArgs []string
 	Explain    io.Writer // when set, classification decisions are printed
+
+	// Embedded marks a session hosted inside another program (editor
+	// panel, bot): foreground pipelines run in their own process group
+	// so SignalForeground can cancel them without touching the host,
+	// and nothing ever claims the terminal.
+	Embedded bool
 }
 
 type Session struct {
@@ -79,6 +86,10 @@ func NewSession(o Options) *Session {
 	st := shellexec.NewState()
 	st.ScriptName = o.ScriptName
 	st.ScriptArgs = o.ScriptArgs
+	st.Embedded = o.Embedded
+	// $() substitution stderr follows the session's stderr rather than
+	// the process's — vital when the host owns the real terminal.
+	st.CaptureErr = stdio.Err
 
 	fns := builtins.Make(st, stdio)
 	cls := classify.New(stdlibreg.Names())
@@ -121,6 +132,15 @@ func (s *Session) Notifications() []string { return s.st.Jobs.Notifications() }
 // own process group so Ctrl+Z suspends them into the job table. Only the
 // REPL turns this on.
 func (s *Session) SetInteractive(on bool) { s.st.Interactive = on }
+
+// SignalForeground delivers sig to the process group of the embedded
+// foreground pipeline currently running (an editor's stop button). It
+// is the one Session method that is safe to call from another
+// goroutine while Eval blocks. Returns false when nothing signalable
+// is running.
+func (s *Session) SignalForeground(sig syscall.Signal) bool {
+	return s.st.SignalForeground(sig)
+}
 
 func (s *Session) RunFile(path string) error {
 	b, err := os.ReadFile(path)

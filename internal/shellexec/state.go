@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
+	"syscall"
 )
 
 // State is the mutable shell state threaded through execution.
@@ -19,13 +21,27 @@ type State struct {
 	ErrExit     bool // abort script when a statement-position command fails
 	PipeFail    bool // pipeline status = rightmost nonzero, not just the last
 	Interactive bool // REPL session: enables job control (own pgroups, ^Z)
+	Embedded    bool // host-embedded session: own fg pgroups (cancelable), no tty ownership
 	Aliases     map[string]string
 	ScriptName  string   // $0
 	ScriptArgs  []string // $1.. / $@ / $#
 
+	// The embedded foreground process group. Guarded by its own mutex
+	// because SignalForeground is the one State entry point that runs on
+	// a different goroutine than the (single-threaded) evaluator: the
+	// host's cancel button fires while Eval is blocked in Wait.
+	fgMu   sync.Mutex
+	fgPgid int
+
 	// SourceFn runs another script in the current session (the `source`
 	// builtin). Wired up by the runner to avoid an import cycle.
 	SourceFn func(path string) error
+
+	// CaptureErr is where $() substitution stderr goes; nil falls back
+	// to the process stderr. The runner points it at the session's
+	// stderr so an embedded host never gets stray writes to the real
+	// terminal it owns.
+	CaptureErr io.Writer
 
 	// Jobs tracks background (&) jobs for this session.
 	Jobs *JobTable
@@ -33,6 +49,27 @@ type State struct {
 
 func NewState() *State {
 	return &State{Aliases: map[string]string{}, Jobs: NewJobTable()}
+}
+
+// setForegroundPgid records (or with 0, clears) the process group of
+// the embedded foreground pipeline currently running.
+func (st *State) setForegroundPgid(pgid int) {
+	st.fgMu.Lock()
+	st.fgPgid = pgid
+	st.fgMu.Unlock()
+}
+
+// SignalForeground delivers sig to the whole foreground process group
+// of an embedded session. Returns false when no external pipeline is
+// running (builtins and pure-Go evaluation are not signalable).
+func (st *State) SignalForeground(sig syscall.Signal) bool {
+	st.fgMu.Lock()
+	pgid := st.fgPgid
+	st.fgMu.Unlock()
+	if pgid == 0 {
+		return false
+	}
+	return syscall.Kill(-pgid, sig) == nil
 }
 
 // Stdio is the trio of streams a command runs with.
