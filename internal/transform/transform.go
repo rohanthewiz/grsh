@@ -29,9 +29,6 @@ type Result struct {
 	Tab   []*shellparse.CmdList // side table; __shell(n)/__capture(n) index it
 }
 
-// HeaderLines is the number of lines emitted before script line 1.
-const HeaderLines = 3 // package main / func __main() { / //line file:1
-
 // File transforms classified chunks. baseTab offsets side-table indices so
 // a Session can accumulate fragments across Eval calls (REPL seam).
 func File(name string, chunks []classify.Chunk, baseTab int) (*Result, error) {

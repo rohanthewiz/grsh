@@ -6,18 +6,15 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/rohanthewiz/grsh/internal/shellexec"
+	"github.com/rohanthewiz/grsh/internal/stdlibreg"
 )
 
 // goKeywords a user plausibly starts an input line with.
 var goKeywords = []string{
 	"if", "for", "func", "var", "const", "type", "return",
 	"switch", "defer", "import",
-}
-
-// shellBuiltins are grsh's shell-side builtins (not in PATH).
-var shellBuiltins = []string{
-	"cd", "export", "unset", "exit", "alias", "unalias", "source",
-	"command", "jobs", "wait", "fg", "bg", "kill",
 }
 
 // completer implements readline.AutoCompleter.
@@ -47,9 +44,11 @@ func (c *completer) Do(line []rune, pos int) ([][]rune, int) {
 	switch {
 	case pathShaped(word):
 		cands = fileCandidates(word)
+	case selectorShaped(word):
+		cands = memberCandidates(word)
 	case commandPosition(before, word):
 		cands = append(cands, c.commands()...)
-		cands = append(cands, shellBuiltins...)
+		cands = append(cands, shellexec.BuiltinNames()...)
 		cands = append(cands, c.idents()...)
 		cands = append(cands, goKeywords...)
 	default:
@@ -84,6 +83,26 @@ func currentWord(before string) string {
 func pathShaped(word string) bool {
 	return strings.ContainsRune(word, '/') ||
 		strings.HasPrefix(word, ".") || strings.HasPrefix(word, "~")
+}
+
+// selectorShaped reports whether word is pkg.Partial for a registered
+// package — `fmt.Pr` completes to fmt.Print/Printf/... . Checked before
+// commandPosition: a selector at the start of a line is Go, not a command.
+func selectorShaped(word string) bool {
+	pkg, _, ok := strings.Cut(word, ".")
+	return ok && stdlibreg.Has(pkg)
+}
+
+// memberCandidates returns pkg.Member forms for every member of word's
+// package (prefix filtering happens in Do, like every other source).
+func memberCandidates(word string) []string {
+	pkg, _, _ := strings.Cut(word, ".")
+	members := stdlibreg.Members(pkg)
+	out := make([]string, 0, len(members))
+	for _, m := range members {
+		out = append(out, pkg+"."+m)
+	}
+	return out
 }
 
 // commandPosition reports whether word starts an input line or follows a

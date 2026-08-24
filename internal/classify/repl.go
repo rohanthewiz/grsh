@@ -2,16 +2,18 @@ package classify
 
 import (
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 )
 
 // Clone returns an independent copy of the classifier: same declared
-// scopes, brace depth, and package set (shared — it is never mutated).
-// NeedsMore classifies speculatively on a clone so the real classifier
-// only advances when the input is actually evaluated.
+// scopes, brace depth, block labels, and package set (shared — it is
+// never mutated). Pending/NeedsMore classify speculatively on a clone so
+// the real classifier only advances when the input is actually evaluated.
 func (c *Classifier) Clone() *Classifier {
-	return &Classifier{scope: c.scope.clone(), pkgs: c.pkgs, depth: c.depth}
+	return &Classifier{scope: c.scope.clone(), pkgs: c.pkgs, depth: c.depth,
+		blocks: slices.Clone(c.blocks)}
 }
 
 func (s *Scope) clone() *Scope {
@@ -25,18 +27,34 @@ func (s *Scope) clone() *Scope {
 	return &Scope{parent: s.parent.clone(), names: names}
 }
 
-// NeedsMore reports whether src is an incomplete REPL input unit: a Go
-// statement that ends mid-expression, an unclosed block (brace depth still
-// positive after classification), or a shell line with a trailing
-// continuation (\, |, &&, ||). c is not mutated.
-func (c *Classifier) NeedsMore(src string) bool {
+// PendingInfo describes the state of a (possibly incomplete) REPL input
+// unit: whether more lines are needed, how deep the open blocks nest, and
+// what those blocks are — innermost last, e.g. {"func greet", "for"}.
+// The REPL renders Constructs as a continuation-prompt breadcrumb and
+// Depth as auto-indent.
+type PendingInfo struct {
+	NeedsMore  bool
+	Depth      int
+	Constructs []string
+}
+
+// Pending speculatively classifies src on a clone (c is not mutated) and
+// reports its continuation state. Incomplete means: a Go statement that
+// ends mid-expression, an unclosed block, a pending heredoc body, or a
+// shell line with a trailing continuation (\, |, &&, ||).
+func (c *Classifier) Pending(src string) PendingInfo {
 	cc := c.Clone()
 	chunks, err := cc.File(src)
+	info := PendingInfo{Depth: cc.depth, Constructs: cc.blocks}
 	if err != nil {
-		return errors.Is(err, ErrIncomplete)
+		// Mid-statement Go or an unterminated heredoc: incomplete. Any
+		// other classify error is "complete" — Eval will report it.
+		info.NeedsMore = errors.Is(err, ErrIncomplete)
+		return info
 	}
 	if cc.depth > 0 {
-		return true
+		info.NeedsMore = true
+		return info
 	}
 	for i := len(chunks) - 1; i >= 0; i-- {
 		ch := chunks[i]
@@ -45,11 +63,16 @@ func (c *Classifier) NeedsMore(src string) bool {
 		}
 		if ch.Kind == Shell {
 			_, cont := shellContinues(strings.TrimRight(ch.Text, " \t"))
-			return cont
+			info.NeedsMore = cont
 		}
 		break
 	}
-	return false
+	return info
+}
+
+// NeedsMore reports whether src is an incomplete REPL input unit.
+func (c *Classifier) NeedsMore(src string) bool {
+	return c.Pending(src).NeedsMore
 }
 
 // Names lists every identifier visible in the current scope chain plus the

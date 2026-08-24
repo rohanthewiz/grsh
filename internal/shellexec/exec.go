@@ -99,6 +99,15 @@ func runSimple(st *State, cmd *shellparse.Command, ev WordEvaluator, stdio Stdio
 		return 0, nil // redirs only, e.g. `> file` truncates
 	}
 
+	assigns, argv := splitAssignPrefix(argv)
+	if len(argv) == 0 {
+		// Bare FOO=bar would create a shell variable namespace parallel to
+		// Go's — grsh's model is "variables are Go", so reject with the
+		// two supported spellings.
+		return userErr(stdio, serr.New("shell assignment is not supported",
+			"hint", `use FOO := "bar" (Go) or export FOO=bar (environment)`))
+	}
+
 	argv = expandAlias(st, argv)
 
 	force := false
@@ -115,6 +124,9 @@ func runSimple(st *State, cmd *shellparse.Command, ev WordEvaluator, stdio Stdio
 
 	c := exec.Command(argv[0], argv[1:]...)
 	c.Stdin, c.Stdout, c.Stderr = sio.In, sio.Out, sio.Err
+	if len(assigns) > 0 {
+		c.Env = append(os.Environ(), assigns...)
+	}
 	if tty, ok := interactiveTTY(st, stdio); ok {
 		return runForegroundJobControl(st, []*exec.Cmd{c}, []string{strings.Join(argv, " ")}, tty, stdio, nil)
 	}
@@ -177,6 +189,7 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 		if err != nil {
 			return userErr(stdio, err)
 		}
+		assigns, argv := splitAssignPrefix(argv)
 		argv = expandAlias(st, argv)
 		if len(argv) == 0 {
 			return userErr(stdio, serr.New("empty command in pipeline"))
@@ -187,6 +200,9 @@ func runPipes(st *State, cmds []*shellparse.Command, ev WordEvaluator, stdio Std
 			return userErr(stdio, serr.New("builtin '"+argv[0]+"' cannot be used in a pipeline"))
 		}
 		execs[i] = exec.Command(argv[0], argv[1:]...)
+		if len(assigns) > 0 {
+			execs[i].Env = append(os.Environ(), assigns...)
+		}
 		execs[i].Stderr = stdio.Err
 		names[i] = strings.Join(argv, " ")
 	}
@@ -392,6 +408,37 @@ func applyRedirs(st *State, redirs []shellparse.Redir, ev WordEvaluator, base St
 		return base, nil, err
 	}
 	return applyResolved(resolved, base)
+}
+
+// splitAssignPrefix strips leading NAME=value words (per-command
+// environment, `GOOS=linux go build` style) from argv. Only the prefix is
+// inspected, so `dd if=/dev/null` is untouched. Prefix assignments before
+// a builtin are stripped but have no effect (builtins run in-process and
+// grsh has no temporary-environment mechanism).
+func splitAssignPrefix(argv []string) (assigns, rest []string) {
+	for i, w := range argv {
+		if !isAssignWord(w) {
+			return argv[:i], argv[i:]
+		}
+	}
+	return argv, nil
+}
+
+// isAssignWord reports whether w is IDENT=... with a valid environment
+// variable name.
+func isAssignWord(w string) bool {
+	eq := strings.IndexByte(w, '=')
+	if eq <= 0 {
+		return false
+	}
+	for i := 0; i < eq; i++ {
+		c := w[i]
+		ok := c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || (i > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func expandAlias(st *State, argv []string) []string {

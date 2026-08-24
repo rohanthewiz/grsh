@@ -139,6 +139,38 @@ func consumeGo(lines []string, i int) (string, int, error) {
 	return "", 0, ErrIncomplete
 }
 
+// constructLabel names the block a Go logical line opens, for the REPL's
+// continuation-prompt breadcrumb: `func greet(...) {` → "func greet",
+// `for i := range xs {` → "for", `f := func() {` → "func f",
+// `} else {` → "else", anything else → "{".
+func constructLabel(text string) string {
+	t := strings.TrimSpace(text)
+	tok := firstToken(t)
+	switch tok {
+	case "func":
+		if name := firstToken(strings.TrimSpace(t[len("func"):])); name != "" {
+			return "func " + name
+		}
+		return "func"
+	case "if", "for", "switch", "select":
+		return tok
+	}
+	if strings.HasPrefix(t, "}") {
+		// `} else {` / `} else if ... {` reopen a branch.
+		if strings.Contains(t, "else if") {
+			return "else if"
+		}
+		if strings.Contains(t, "else") {
+			return "else"
+		}
+	}
+	// Closure bound to a name: `handler := func(...) {`.
+	if strings.Contains(t, "func") && tok != "" {
+		return "func " + tok
+	}
+	return "{"
+}
+
 // predeclare records top-level-looking func/var/const/type names so
 // forward references classify correctly (pass 0). Over-approximation of
 // nesting is deliberate and harmless.
@@ -160,6 +192,13 @@ func (c *Classifier) predeclare(lines []string) {
 func (c *Classifier) trackGoLine(text string) {
 	toks := tokensOf(text)
 
+	// The first brace a line opens gets a label derived from its leading
+	// construct ("func greet", "for", ...); any further braces on the
+	// same logical line (composite literals inside a block header) are
+	// anonymous. Balanced lines push and pop in one pass, so only truly
+	// open blocks remain on the stack.
+	labeled := false
+
 	// Push/pop scopes as braces open/close. We fold declaration recording
 	// into the same pass so `for i := range` vars land in a live scope.
 	for k, t := range toks {
@@ -167,11 +206,20 @@ func (c *Classifier) trackGoLine(text string) {
 		case token.LBRACE:
 			c.depth++
 			c.scope = NewScope(c.scope)
+			label := "{"
+			if !labeled {
+				label = constructLabel(text)
+				labeled = true
+			}
+			c.blocks = append(c.blocks, label)
 		case token.RBRACE:
 			if c.depth > 0 {
 				c.depth--
 				if c.scope.parent != nil {
 					c.scope = c.scope.parent
+				}
+				if len(c.blocks) > 0 {
+					c.blocks = c.blocks[:len(c.blocks)-1]
 				}
 			}
 		case token.DEFINE:

@@ -25,12 +25,15 @@ func (in *Interp) runShellStmt(env *Env, call *ast.CallExpr) (control, error) {
 	if err != nil {
 		return control{}, err
 	}
-	status, err := shellexec.Run(in.sh, list, &wordEval{in: in, env: env}, in.stdio)
+	status, err := shellexec.Run(in.sh, list, &wordEval{in: in, env: env, node: call}, in.stdio)
 	if err != nil {
 		return control{}, err // ExitErr and internal errors pass through
 	}
-	if in.sh.ErrExit && status != 0 {
-		// bash `set -e` semantics: exit silently with the failing status.
+	// bash `set -e` semantics: exit silently with the failing status —
+	// but never at an interactive prompt, where exiting the whole shell
+	// on one failed command would be hostile (bash agrees: interactive
+	// `set -e` does not kill the session).
+	if in.sh.ErrExit && status != 0 && !in.sh.Interactive {
 		return control{}, shellexec.ExitErr{Code: status}
 	}
 	return control{}, nil
@@ -43,7 +46,7 @@ func (in *Interp) evalCapture(env *Env, call *ast.CallExpr) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, status, err := shellexec.Capture(in.sh, list, &wordEval{in: in, env: env})
+	out, status, err := shellexec.Capture(in.sh, list, &wordEval{in: in, env: env, node: call})
 	if err != nil {
 		return nil, err
 	}
@@ -71,17 +74,22 @@ func (in *Interp) tabEntry(call *ast.CallExpr) (*shellparse.CmdList, error) {
 }
 
 // wordEval lets shellexec evaluate {expr} interpolations in the
-// environment current at the moment the shell fragment runs.
+// environment current at the moment the shell fragment runs. node is the
+// enclosing __shell/__capture call, whose position anchors error messages
+// (the fragment source itself has no coordinates of its own).
 type wordEval struct {
-	in  *Interp
-	env *Env
+	in   *Interp
+	env  *Env
+	node ast.Node
 }
 
 func (w *wordEval) EvalGoExpr(src string) ([]string, error) {
-	e, err := goparser.ParseExpr(src)
+	e, err := w.in.parseFragment(src, w.node)
 	if err != nil {
-		return nil, serr.Wrap(err, "in", "{"+src+"}")
+		return nil, err
 	}
+	// Eval errors already carry a correct loc (the fragment was parsed
+	// into the interpreter's fileset); the caller adds the {expr} context.
 	v, err := w.in.eval1(w.env, e)
 	if err != nil {
 		return nil, err
@@ -94,6 +102,33 @@ func (w *wordEval) EvalGoExpr(src string) ([]string, error) {
 	default:
 		return []string{stringOf(v)}, nil
 	}
+}
+
+// parseFragment parses a {expr} interior into the interpreter's own
+// fileset so its nodes resolve to real positions everywhere errAt is used
+// (a private fileset here would make eval errors report bogus near-line-1
+// locations). The fragment file's line info is remapped to the enclosing
+// shell statement's script line, //line-directive style. Parsed fragments
+// are cached per (src, line) — a {expr} inside a loop body would otherwise
+// pay a full go/parser invocation, and grow the fileset, every iteration.
+func (in *Interp) parseFragment(src string, node ast.Node) (ast.Expr, error) {
+	p := in.fset.Position(node.Pos())
+	key := fmt.Sprintf("%s@%d", src, p.Line)
+	if e, ok := in.exprCache[key]; ok {
+		return e, nil
+	}
+	e, err := goparser.ParseExprFrom(in.fset, "{"+src+"}", src, 0)
+	if err != nil {
+		return nil, serr.Wrap(err, "in", "{"+src+"}", "loc", fmt.Sprintf("%s:%d", p.Filename, p.Line))
+	}
+	if tf := in.fset.File(e.Pos()); tf != nil {
+		tf.AddLineInfo(0, p.Filename, p.Line)
+	}
+	if in.exprCache == nil {
+		in.exprCache = map[string]ast.Expr{}
+	}
+	in.exprCache[key] = e
+	return e, nil
 }
 
 // ---- calls ----
@@ -463,6 +498,10 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 		if rv.Kind() != reflect.Map {
 			return nil, true, in.errAt(call, "delete target must be a map")
 		}
+		// Go's delete on a nil map is a no-op; reflect's SetMapIndex panics.
+		if rv.IsNil() {
+			return nil, true, nil
+		}
 		kv, cerr := convertTo(args[1], rv.Type().Key())
 		if cerr != nil {
 			return nil, true, in.wrapAt(call, cerr)
@@ -481,6 +520,10 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 		dst, src := reflect.ValueOf(args[0]), reflect.ValueOf(args[1])
 		if dst.Kind() != reflect.Slice || src.Kind() != reflect.Slice {
 			return nil, true, in.errAt(call, "copy arguments must be slices")
+		}
+		// reflect.Copy panics on mismatched element types; check up front.
+		if !src.Type().Elem().AssignableTo(dst.Type().Elem()) {
+			return nil, true, in.errAt(call, fmt.Sprintf("copy: cannot copy %s into %s", src.Type(), dst.Type()))
 		}
 		return []Value{reflect.Copy(dst, src)}, true, nil
 
@@ -540,13 +583,21 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 			}
 			n1 = int(i)
 		}
+		// reflect.MakeSlice panics on negative or inverted sizes; validate
+		// first so scripts get a positioned error instead of a crash.
+		if n0 < 0 {
+			return nil, true, in.errAt(call, "make: negative length")
+		}
+		if n1 < n0 {
+			return nil, true, in.errAt(call, "make: length larger than capacity")
+		}
 		switch t.Kind() {
 		case reflect.Slice:
 			return []Value{reflect.MakeSlice(t, n0, n1).Interface()}, true, nil
 		case reflect.Map:
 			return []Value{reflect.MakeMap(t).Interface()}, true, nil
 		}
-		return nil, true, in.errAt(call, "make supports slices and maps in grsh v1")
+		return nil, true, in.errAt(call, "make supports slices and maps (not yet channels)")
 	}
 	return nil, false, nil
 }
@@ -647,7 +698,7 @@ func (in *Interp) typeOf(e ast.Expr) (reflect.Type, error) {
 	case *ast.ParenExpr:
 		return in.typeOf(t.X)
 	}
-	return nil, in.errAt(e, fmt.Sprintf("unsupported type %T in grsh v1", e))
+	return nil, in.errAt(e, fmt.Sprintf("unsupported type %T yet", e))
 }
 
 func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
@@ -703,5 +754,5 @@ func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
 		}
 		return out.Interface(), nil
 	}
-	return nil, in.errAt(n, "unsupported composite literal type in grsh v1")
+	return nil, in.errAt(n, "unsupported composite literal type yet")
 }

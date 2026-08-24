@@ -41,12 +41,12 @@ func (sv *StructVal) String() string {
 func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 	st, ok := ts.Type.(*ast.StructType)
 	if !ok {
-		return in.errAt(ts, "only struct type declarations are supported in grsh v1")
+		return in.errAt(ts, "only struct type declarations are supported yet")
 	}
 	t := &StructType{Name: ts.Name.Name, Index: map[string]int{}}
 	for _, f := range st.Fields.List {
 		if len(f.Names) == 0 {
-			return in.errAt(f, "embedded fields are not supported in grsh v1")
+			return in.errAt(f, "embedded fields are not supported yet")
 		}
 		var zero Value
 		if rt, err := in.typeOf(f.Type); err == nil {

@@ -15,6 +15,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"runtime/debug"
 	"syscall"
 
 	"github.com/rohanthewiz/grsh/internal/builtins"
@@ -119,10 +120,32 @@ func (s *Session) LastStatus() int { return s.st.LastStatus }
 // keeps reading lines while this is true. Classifier state is not mutated.
 func (s *Session) NeedsMore(src string) bool { return s.cls.NeedsMore(src) }
 
+// Pending reports the full continuation state of src — incompleteness,
+// open-block depth, and the construct breadcrumb (["func greet", "for"]).
+// One call serves both the REPL's continue-reading decision and its
+// continuation prompt. Classifier state is not mutated.
+func (s *Session) Pending(src string) classify.PendingInfo { return s.cls.Pending(src) }
+
 // Idents lists every identifier the classifier currently knows — builtins,
 // registry packages were seeded at construction, plus anything the user has
 // declared since. The REPL completes on these.
 func (s *Session) Idents() []string { return s.cls.Names() }
+
+// Inspect pretty-prints a top-level Go variable's type and value (the
+// REPL's `?name` command).
+func (s *Session) Inspect(name string) (string, bool) { return s.in.Inspect(name) }
+
+// JobCount reports how many background jobs are still live (running or
+// stopped) — a prompt segment.
+func (s *Session) JobCount() int {
+	n := 0
+	for _, j := range s.st.Jobs.Snapshot() {
+		if j.State != shellexec.JobDone {
+			n++
+		}
+	}
+	return n
+}
 
 // Notifications drains "[1]  Done  cmd &" messages for finished background
 // jobs; the REPL prints them before each prompt.
@@ -155,8 +178,13 @@ func (s *Session) Eval(src string) error {
 	return s.RunSource("<eval>", src)
 }
 
-func (s *Session) RunSource(name, src string) error {
-	chunks, err := s.cls.File(src)
+func (s *Session) RunSource(name, src string) (err error) {
+	// Classify on a clone and commit only once the input has fully parsed:
+	// a chunk that opens a brace but then fails transform or go/parser
+	// would otherwise leave the live classifier's depth incremented,
+	// wedging the REPL into demanding phantom closing braces forever.
+	cls := s.cls.Clone()
+	chunks, err := cls.File(src)
 	if err != nil {
 		return ParseError{Err: serr.Wrap(err, "stage", "classify")}
 	}
@@ -181,8 +209,23 @@ func (s *Session) RunSource(name, src string) error {
 		return ParseError{Err: goParseErr(err)}
 	}
 
+	// The input is syntactically valid: commit the classifier state.
+	// Runtime failures below still commit — REPL units are depth-balanced
+	// by construction (NeedsMore), and shell side effects already ran.
+	s.cls = cls
+
 	s.tabLen += len(res.Tab)
 	s.in.AddTab(res.Tab)
+
+	// The interpreter must never take down the session: a REPL or an
+	// embedding host has to survive any evaluator bug. Root-cause fixes
+	// exist for the known panic vectors; this is the backstop.
+	defer func() {
+		if r := recover(); r != nil {
+			err = serr.New(fmt.Sprintf("grsh internal error: %v", r),
+				"script", name, "stack", string(debug.Stack()))
+		}
+	}()
 	if err := s.in.Run(fset, astf); err != nil {
 		if _, isExit := errors.AsType[shellexec.ExitErr](err); isExit {
 			return err

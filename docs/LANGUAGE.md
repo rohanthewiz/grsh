@@ -125,6 +125,27 @@ A trailing `{` behaves two ways, matching Go intuition:
 | `$(cmd)` in a shell word | Command substitution. Unquoted: trimmed output **is** field-split (`kill $(pgrep myapp)` works). Quoted: one word, whitespace preserved. |
 | `{expr}` | Go interpolation — see §4. |
 
+Notes:
+
+- `${VAR}` accepts only a plain name (or `@`, `#`, digits). Parameter
+  expansion operators — `${VAR:-default}`, `${VAR%.txt}`, `${#VAR}` —
+  are **rejected at parse time** with a hint (bash would compute them;
+  silently expanding empty would be worse). For defaults use
+  `iff(env("VAR") == "", "fallback", env("VAR"))`.
+- `$10` parses as `$1` followed by `0`, exactly as in bash; use `args()`
+  on the Go side for arbitrary indexing.
+
+### Per-command environment
+
+`FOO=bar cmd args...` runs `cmd` with `FOO` set in its environment only
+(`GOOS=linux go build` works). Multiple prefix assignments stack. A
+**bare** `FOO=bar` is an error, with a hint: grsh has one variable
+model — Go (`FOO := "bar"`) — plus the environment (`export FOO=bar`);
+a third, shell-local namespace would blur it. Prefix assignments before
+a shell builtin are accepted but have no effect. If `FOO` is a declared
+Go identifier, `FOO=bar cmd` classifies as Go (rule 6a) — rename the
+variable or use `env` explicitly.
+
 ### Operators and redirection
 
 Pipes `|`, sequencing `;`, short-circuit `&&` / `||`, background `&`, and:
@@ -294,13 +315,16 @@ captures buffer output.
 - Methods on **registry values** via reflection (e.g.
   `regexp.MustCompile(p).FindString(s)`, `time.Now().Year()`)
 
-### Not in v1
+### Not supported yet
 
 Goroutines/channels/`select`, struct embedding, method values, interfaces
 beyond `any`/`error`, generics, labels, type switches, `fallthrough`,
 spread calls (`xs...`), fixed-size arrays, pointers (beyond method
 receivers). Unsupported constructs fail with a positioned error naming
 the construct.
+
+All compound assignments work, including the bitwise set
+(`&= |= ^= <<= >>= &^=`), as do unary `^x` complement and `&^`.
 
 ### Semantics notes
 
@@ -442,29 +466,64 @@ grsh ~/projs> echo shell sees {x}
 shell sees 40
 ```
 
+- **Startup file** — `~/.grshrc` (or `$GRSH_RC`) is sourced before the
+  first prompt; it runs through the same classifier, so it can mix
+  shell (aliases, `export`s) and Go (helper funcs). `-norc` skips it.
+  `grsh init` generates a starter `~/.grshrc` from your zsh startup
+  files: safe lines (aliases, exports, PATH edits, plain commands)
+  come across active, zsh-specific lines are preserved as comments,
+  and functions get porting TODOs. An existing `~/.grshrc` is never
+  overwritten (`~/.grshrc.new` is written instead).
 - **Prompt** — `grsh <cwd>> `; after a failing command it shows the
-  status: `grsh <cwd> [1]> `.
+  status: `grsh <cwd> [1]> `. Set `$GRSH_PROMPT` to customize: `%d`
+  cwd, `%s` status, `%g` git branch (read from `.git/HEAD`, no fork),
+  `%t` time, `%j` job count, `%%` literal, plus `{red}`/`{cyan}`/
+  `{bold}`/`{reset}`-style color tags (dropped under `NO_COLOR`,
+  `TERM=dumb`, or a non-terminal).
 - **Continuation** — the `... ` prompt appears while the input unit is
   incomplete: an open `{` block or composite literal, a Go line ending
-  mid-expression, or a shell line ending in `\`, `|`, `&&`, `||`.
-- **History** — persisted to `~/.grsh_history`; arrow keys and Ctrl+R
-  search work as usual.
-- **Completion** — Tab completes command names from `$PATH`, declared
-  identifiers and builtins, registry package names, Go keywords, and file
-  paths (path-shaped words always complete as files).
+  mid-expression, a pending heredoc body, or a shell line ending in
+  `\`, `|`, `&&`, `||`. Open Go blocks show a **construct breadcrumb
+  and auto-indent**: `... func greet ▸ for ▸     ` — you always know
+  what you're inside of and how deep.
+- **History** — per-line recall in `~/.grsh_history` (arrow keys,
+  Ctrl+R); complete input units (a whole `func` block is one unit) are
+  additionally persisted to `~/.grsh_units`, which backs
+  `session save`.
+- **`?name`** — inspects a live Go variable: type plus pretty-printed
+  value (slices and maps as aligned tables, structs by field, closures
+  with their parameter list).
+- **`session save [N] file.grsh`** — writes this session's input units
+  (or the last N units) as a runnable script, shebang included.
+  Interactive work and scripts are the same language, so the
+  round-trip is exact.
+- **Completion** — Tab completes command names from `$PATH`, shell
+  builtins (from the live builtin table), declared identifiers,
+  registry package names **and their members** (`fmt.Pr<TAB>` →
+  `fmt.Println`), Go keywords, and file paths (path-shaped words
+  always complete as files).
 - **Ctrl+C** — at the prompt, discards the current line (and any pending
   continuation). While a command runs, interrupts the command; the shell
   survives.
 - **Ctrl+D** — on an empty line, exits with the last status.
   Mid-continuation, abandons the open block.
-- **`exit [n]`** — exits the shell. An `errexit(true)` failure also exits
-  (same `set -e` semantics as scripts).
+- **`exit [n]`** — exits the shell. `errexit(true)` at the prompt sets
+  the status on failures but never exits the interactive shell (bash
+  behaves the same interactively).
 - Single-line eval errors print without a location; multi-line inputs
-  keep their line number (`grsh: line 2: undefined: x`).
+  keep their line number, and when a column is known the offending
+  line is echoed with a caret:
+
+  ```
+  grsh: line 2: undefined: nope
+      y := x + nope
+               ^
+  ```
 
 | Exit code | Meaning |
 |-----------|---------|
 | `n` | The script called `exit n` (or errexit tripped on status n) |
+| last status | A script that runs to the end exits with its **last command's status**, like bash (`grsh -c 'false'` exits 1) |
 | 1 | Syntax error (shell or Go) |
 | 2 | Runtime error |
 
@@ -483,7 +542,9 @@ function call trail. `--explain` prints every line's classification.
 | `set -o pipefail` | `pipefail(true)` | same |
 | `` `cmd` `` backticks | not supported | `$(...)` only |
 | `$((math))` | Go expressions | a real language is right there |
-| brace expansion `{a,b}` | not in v1 | `{...}` is Go interpolation |
+| brace expansion `{a,b}` | not supported | `{...}` is Go interpolation |
+| `FOO=bar` shell variable | rejected with hint | one variable model: Go (`:=`) + environment (`export`) |
+| `${VAR:-default}` etc. | rejected with hint | silent empty expansion is the worst outcome; `iff(...)` covers it |
 | `cmd &` subshell (lazy expansion, builtins ok) | eager expansion at launch; external commands only | single-threaded interpreter; no fork |
 | `$!` | `wait %N` + `status()` | explicit, like `$?` → `status()` |
 | bg job shares tty stdin | stdin is `/dev/null` | jobs can't steal interactive input |

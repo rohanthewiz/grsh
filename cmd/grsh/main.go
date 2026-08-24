@@ -18,6 +18,7 @@ import (
 	"github.com/rohanthewiz/grsh/internal/repl"
 	"github.com/rohanthewiz/grsh/internal/runner"
 	"github.com/rohanthewiz/grsh/internal/shellexec"
+	"github.com/rohanthewiz/grsh/internal/zshimport"
 	"github.com/rohanthewiz/logger"
 	"golang.org/x/term"
 )
@@ -30,6 +31,7 @@ func main() {
 		flagVersion = flag.Bool("version", false, "print version and exit")
 		flagDebug   = flag.Bool("debug", false, "verbose error output")
 		flagExplain = flag.Bool("explain", false, "print each line's shell/Go classification and the rule that decided it")
+		flagNoRC    = flag.Bool("norc", false, "skip ~/.grshrc at interactive startup")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: grsh [flags] script.grsh [args...]\n   or: grsh -c \"commands\"\n   or: grsh                (interactive; reads stdin when piped)\n\nFlags:\n")
@@ -47,18 +49,24 @@ func main() {
 		explain = os.Stderr
 	}
 
+	// `grsh init` translates the user's zsh startup files into ~/.grshrc.
+	if flag.NArg() > 0 && flag.Arg(0) == "init" {
+		os.Exit(zshimport.Run(os.Stdout, os.Stderr))
+	}
+
 	var err error
+	var sess *runner.Session
 	switch {
 	case *flagC != "":
-		sess := runner.NewSession(runner.Options{ScriptName: "grsh", ScriptArgs: flag.Args(), Explain: explain})
+		sess = runner.NewSession(runner.Options{ScriptName: "grsh", ScriptArgs: flag.Args(), Explain: explain})
 		err = sess.Eval(*flagC)
 	case flag.NArg() > 0:
 		script := flag.Arg(0)
-		sess := runner.NewSession(runner.Options{ScriptName: script, ScriptArgs: flag.Args()[1:], Explain: explain})
+		sess = runner.NewSession(runner.Options{ScriptName: script, ScriptArgs: flag.Args()[1:], Explain: explain})
 		err = sess.RunFile(script)
 	case term.IsTerminal(int(os.Stdin.Fd())):
-		sess := runner.NewSession(runner.Options{ScriptName: "grsh", Explain: explain})
-		os.Exit(repl.Run(sess, version))
+		sess = runner.NewSession(runner.Options{ScriptName: "grsh", Explain: explain})
+		os.Exit(repl.Run(sess, version, *flagNoRC))
 	default:
 		// Piped stdin: run it as a script (echo "ls" | grsh).
 		src, rerr := io.ReadAll(os.Stdin)
@@ -66,12 +74,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "grsh: %v\n", rerr)
 			os.Exit(2)
 		}
-		sess := runner.NewSession(runner.Options{ScriptName: "<stdin>", Explain: explain})
+		sess = runner.NewSession(runner.Options{ScriptName: "<stdin>", Explain: explain})
 		err = sess.RunSource("<stdin>", string(src))
 	}
 
 	if err == nil {
-		return
+		// bash semantics: a script's exit status is its last command's
+		// status. `grsh -c 'false' && ...` must behave like `sh -c`.
+		os.Exit(sess.LastStatus())
 	}
 	if xe, ok := errors.AsType[shellexec.ExitErr](err); ok {
 		os.Exit(xe.Code)

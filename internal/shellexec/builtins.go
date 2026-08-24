@@ -19,6 +19,21 @@ var builtinNames = map[string]bool{
 
 func isBuiltin(name string) bool { return builtinNames[name] }
 
+// BuiltinNames returns the shell builtin names, sorted — the single
+// source of truth for the REPL completer (a separate hardcoded list
+// there had already drifted once). "command" and "kill" ride along:
+// they are dispatched specially in runSimple rather than via the map,
+// but complete like builtins at a prompt.
+func BuiltinNames() []string {
+	out := make([]string, 0, len(builtinNames)+2)
+	for n := range builtinNames {
+		out = append(out, n)
+	}
+	out = append(out, "command", "kill")
+	sort.Strings(out)
+	return out
+}
+
 func runBuiltin(st *State, name string, args []string, stdio Stdio) (int, error) {
 	switch name {
 	case "cd":

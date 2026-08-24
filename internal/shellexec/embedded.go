@@ -23,8 +23,11 @@ import (
 	"syscall"
 )
 
-// eofReader is the embedded stand-in for stdin: children see immediate
-// EOF instead of a chance to read the host's terminal.
+// EOFStdin is the embedded stand-in for stdin: children see immediate
+// EOF instead of a chance to read the host's terminal. Shared with the
+// root grsh package so both embedded seams use the same reader.
+var EOFStdin io.Reader = eofReader{}
+
 type eofReader struct{}
 
 func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }

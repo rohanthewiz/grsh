@@ -29,6 +29,20 @@ func waitStatusCode(ws syscall.WaitStatus) int {
 // adopted into the job table and the shell takes the terminal back.
 // closeAfterStart holds the parent's pipe fds.
 func runForegroundJobControl(st *State, execs []*exec.Cmd, names []string, tty *os.File, stdio Stdio, closeAfterStart []io.Closer) (int, error) {
+	// Invariant: this path reaps with Wait4 and never calls exec.Cmd.Wait,
+	// so no command may carry a non-file stdio leg — os/exec would spawn a
+	// copy goroutine that only Wait synchronizes, racing the reap. The
+	// interactiveTTY gate enforces this upstream; fail loudly if it ever
+	// regresses rather than corrupting output.
+	for _, c := range execs {
+		for _, s := range []any{c.Stdin, c.Stdout, c.Stderr} {
+			if _, ok := s.(*os.File); s != nil && !ok {
+				closeAll(closeAfterStart)
+				fmt.Fprintln(stdio.Err, "grsh: internal error: job control with non-file stdio")
+				return 1, nil
+			}
+		}
+	}
 	shellPgid := syscall.Getpgrp()
 	defer func() { _ = tcSetpgrp(tty, shellPgid) }()
 

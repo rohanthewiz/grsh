@@ -14,8 +14,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/rohanthewiz/grsh/internal/classify"
 	"github.com/rohanthewiz/grsh/internal/runner"
 	"github.com/rohanthewiz/grsh/internal/shellexec"
 )
@@ -27,9 +29,18 @@ type lineReader interface {
 }
 
 // Run drives the interactive session and returns the process exit code.
-func Run(sess *runner.Session, version string) int {
+func Run(sess *runner.Session, version string, noRC bool) int {
+	// Source the startup file first, before job control is enabled — like
+	// bash, ~/.grshrc runs as plain script code. It goes through the same
+	// classifier as everything else, so it can mix shell (aliases,
+	// exports) and Go (helper functions) freely.
+	if !noRC {
+		if code, exited := loadRC(sess, os.Stderr); exited {
+			return code
+		}
+	}
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          promptFor(sess, false),
+		Prompt:          promptFor(sess, false, classify.PendingInfo{}),
 		HistoryFile:     historyPath(),
 		AutoComplete:    newCompleter(sess.Idents),
 		InterruptPrompt: "^C",
@@ -69,26 +80,27 @@ func Run(sess *runner.Session, version string) int {
 	sess.SetInteractive(true)
 
 	fmt.Printf("grsh %s — type exit or Ctrl+D to quit\n", version)
-	return loop(sess, rl, os.Stdout, os.Stderr)
+	return loop(sess, rl, os.Stdout, os.Stderr, openHistory(unitHistoryPath()))
 }
 
-func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer) int {
+func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *historyStore) int {
 	var buf []string
+	var pend classify.PendingInfo // continuation state for the prompt
 	for {
 		if len(buf) == 0 {
 			for _, note := range sess.Notifications() {
 				fmt.Fprintln(outW, note)
 			}
 		}
-		rd.SetPrompt(promptFor(sess, len(buf) > 0))
+		rd.SetPrompt(promptFor(sess, len(buf) > 0, pend))
 		line, err := rd.Readline()
 		switch {
 		case errors.Is(err, readline.ErrInterrupt):
-			buf = buf[:0] // ^C drops any pending continuation
+			buf, pend = buf[:0], classify.PendingInfo{} // ^C drops any pending continuation
 			continue
 		case errors.Is(err, io.EOF):
 			if len(buf) > 0 {
-				buf = buf[:0] // ^D mid-continuation abandons the unit
+				buf, pend = buf[:0], classify.PendingInfo{} // ^D mid-continuation abandons the unit
 				continue
 			}
 			return sess.LastStatus()
@@ -103,10 +115,16 @@ func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer) int {
 			buf = buf[:0]
 			continue
 		}
-		if sess.NeedsMore(src) {
+		// One speculative classification serves both the continue-reading
+		// decision and the breadcrumb/indent in the continuation prompt.
+		if pend = sess.Pending(src); pend.NeedsMore {
 			continue
 		}
-		buf = buf[:0]
+		buf, pend = buf[:0], classify.PendingInfo{}
+		if replCommand(src, sess, hist, outW, errW) {
+			continue
+		}
+		hist.Append(src)
 		if err := sess.Eval(src); err != nil {
 			if xe, ok := errors.AsType[shellexec.ExitErr](err); ok {
 				return xe.Code // exit builtin, or errexit tripping (set -e exits the shell)
@@ -118,31 +136,83 @@ func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer) int {
 
 // evalLoc matches the "<eval>:line[:col]: " prefix RunSource stamps on
 // eval errors.
-var evalLoc = regexp.MustCompile(`^<eval>:(\d+)(?::\d+)?: `)
+var evalLoc = regexp.MustCompile(`^<eval>:(\d+)(?::(\d+))?: `)
 
-// userMsg renders an eval error for the prompt: single-line inputs drop the
-// pointless location, multi-line inputs keep just the line number.
+// userMsg renders an eval error for the prompt: single-line inputs drop
+// the pointless location, multi-line inputs keep just the line number.
+// When the error carries a column, the offending source line is echoed
+// with a caret under it, compiler-style:
+//
+//	grsh: line 2: undefined: nope
+//	    x := nope + 1
+//	         ^
 func userMsg(src string, err error) string {
 	msg := runner.UserMessage(err)
 	m := evalLoc.FindStringSubmatch(msg)
 	if m == nil {
 		return msg
 	}
+	head := msg[len(m[0]):]
 	if strings.Contains(src, "\n") {
-		return "line " + m[1] + ": " + msg[len(m[0]):]
+		head = "line " + m[1] + ": " + head
 	}
-	return msg[len(m[0]):]
+	return head + caretBlock(src, m[1], m[2])
+}
+
+// caretBlock returns "\n  <source line>\n  <caret>" when the position
+// resolves inside src, else "". Tabs are flattened to single spaces so
+// the caret column stays aligned (columns are byte-based).
+func caretBlock(src, lineStr, colStr string) string {
+	if colStr == "" {
+		return ""
+	}
+	lineNo, col := atoi(lineStr), atoi(colStr)
+	lines := strings.Split(src, "\n")
+	if lineNo < 1 || lineNo > len(lines) || col < 1 {
+		return ""
+	}
+	srcLine := strings.ReplaceAll(lines[lineNo-1], "\t", " ")
+	if col > len(srcLine)+1 {
+		return ""
+	}
+	return "\n    " + srcLine + "\n    " + strings.Repeat(" ", col-1) + "^"
+}
+
+func atoi(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		n = n*10 + int(s[i]-'0')
+	}
+	return n
 }
 
 // promptFor builds "grsh ~/dir> ", flagging a nonzero last status as
-// "grsh ~/dir [1]> ". Continuation lines get an ellipsis gutter.
-func promptFor(sess *runner.Session, continuation bool) string {
+// "grsh ~/dir [1]> ". Continuation lines get an ellipsis gutter carrying
+// the open-construct breadcrumb and depth-based indent:
+//
+//	grsh ~/p> func greet(name string) {
+//	  ... func greet ▸   if name == "" {
+//	  ... func greet ▸ if ▸     return
+//
+// The indent is part of the prompt string (purely visual), so history
+// entries and the evaluated source stay clean.
+func promptFor(sess *runner.Session, continuation bool, pend classify.PendingInfo) string {
 	if continuation {
-		return "  ... "
+		p := "  ... "
+		if len(pend.Constructs) > 0 {
+			p += strings.Join(pend.Constructs, " ▸ ") + " ▸ "
+		}
+		if pend.Depth > 0 {
+			p += strings.Repeat("  ", pend.Depth)
+		}
+		return p
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "?"
+	}
+	if tmpl := os.Getenv("GRSH_PROMPT"); tmpl != "" {
+		return renderPrompt(tmpl, sess, cwd, time.Now(), colorEnabled())
 	}
 	if st := sess.LastStatus(); st != 0 {
 		return fmt.Sprintf("grsh %s [%d]> ", abbrevHome(cwd), st)
@@ -162,6 +232,30 @@ func abbrevHome(path string) string {
 		return "~" + string(filepath.Separator) + rest
 	}
 	return path
+}
+
+// loadRC sources $GRSH_RC or ~/.grshrc. A missing file is silent; an
+// error is reported and startup continues (a broken rc must not lock the
+// user out of their shell). An explicit `exit` in the rc is honored.
+func loadRC(sess *runner.Session, errW io.Writer) (code int, exited bool) {
+	path := os.Getenv("GRSH_RC")
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return 0, false
+		}
+		path = filepath.Join(home, ".grshrc")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return 0, false
+	}
+	if err := sess.RunFile(path); err != nil {
+		if xe, ok := errors.AsType[shellexec.ExitErr](err); ok {
+			return xe.Code, true
+		}
+		fmt.Fprintf(errW, "grsh: %s: %s\n", path, runner.UserMessage(err))
+	}
+	return 0, false
 }
 
 // historyPath returns ~/.grsh_history, or "" (no persistence) when the

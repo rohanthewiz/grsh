@@ -68,6 +68,16 @@ func TestCLI(t *testing.T) {
 		}
 	})
 
+	t.Run("last command status propagates", func(t *testing.T) {
+		// bash semantics: a script exits with its last command's status.
+		if r := run(t, bin, dir, "-c", "false"); r.code != 1 {
+			t.Errorf("-c false exited %d, want 1", r.code)
+		}
+		if r := run(t, bin, dir, "-c", "false; true"); r.code != 0 {
+			t.Errorf("-c 'false; true' exited %d, want 0", r.code)
+		}
+	})
+
 	t.Run("version", func(t *testing.T) {
 		r := run(t, bin, dir, "-version")
 		if !strings.HasPrefix(r.stdout, "grsh ") {

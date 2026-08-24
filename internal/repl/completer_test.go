@@ -95,6 +95,32 @@ func TestCompleteKeywordsAndCommands(t *testing.T) {
 	}
 }
 
+// TestCompletePackageMembers: `fmt.Pr<TAB>` completes registry members.
+func TestCompletePackageMembers(t *testing.T) {
+	c := newCompleter(func() []string { return nil })
+	line := []rune("fmt.Pr")
+	out, _ := c.Do(line, len(line))
+	got := suffixes(out)
+	for _, want := range []string{"int ", "intf ", "intln "} {
+		if !hasSuffixCand(out, want) {
+			t.Errorf("candidates %q, want suffix %q (fmt.Pr → fmt.Pr%s)", got, want, want)
+		}
+	}
+	// Bound-only symbols (Println is stdio-bound) must appear too — covered
+	// above; also verify a non-registry prefix falls through untouched.
+	line = []rune("nosuchpkg.Fo")
+	out, _ = c.Do(line, len(line))
+	if len(out) != 0 {
+		t.Errorf("non-registry selector completed: %q", suffixes(out))
+	}
+	// Builtins come from the shellexec source of truth now.
+	line = []rune("expor")
+	out, _ = c.Do(line, len(line))
+	if !hasSuffixCand(out, "t ") {
+		t.Errorf("export not completed from BuiltinNames: %q", suffixes(out))
+	}
+}
+
 func TestCommandPosition(t *testing.T) {
 	cases := []struct {
 		before, word string

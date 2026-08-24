@@ -629,6 +629,15 @@ func (p *parser) parseDollar(quoted bool) (Segment, error) {
 		if inner == "" {
 			return nil, p.errf("empty ${}")
 		}
+		// Only plain names (or the special params) are supported inside
+		// ${...}. Anything else used to fall through to os.Getenv with the
+		// operators embedded in the "name" — a silent empty string. Reject
+		// loudly instead so ${VAR:-default} and friends fail at parse time.
+		if !validParamName(inner) {
+			return nil, p.errf("parameter expansion ${%s} is not supported (only ${NAME}); "+
+				`for defaults use iff(env("%s") == "", "fallback", env("%s"))`,
+				inner, paramBase(inner), paramBase(inner))
+		}
 		return EnvVar{Name: inner, Quoted: quoted}, nil
 	case c == '@' || c == '#':
 		p.i++
@@ -650,6 +659,50 @@ func (p *parser) parseDollar(quoted bool) (Segment, error) {
 	default:
 		return Lit{Text: "$", Quoted: quoted}, nil
 	}
+}
+
+// validParamName accepts what ${...} actually supports: a plain
+// identifier, a digit sequence ($1-style positionals), or the special
+// params @ and #. Operator forms (${VAR:-x}, ${VAR%.txt}, ${#VAR}, ...)
+// are parameter expansions grsh does not implement.
+func validParamName(s string) bool {
+	if s == "@" || s == "#" {
+		return true
+	}
+	digits := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			digits = false
+		}
+		ok := c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+		if !ok {
+			return false
+		}
+	}
+	if digits {
+		return true
+	}
+	c := s[0]
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+// paramBase extracts the leading identifier from a rejected ${...} body
+// (e.g. "VAR:-default" → "VAR") so the error hint can name it.
+func paramBase(s string) string {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || (i > 0 && c >= '0' && c <= '9') {
+			i++
+			continue
+		}
+		break
+	}
+	if i == 0 {
+		return "VAR"
+	}
+	return s[:i]
 }
 
 // parseBraceExpr parses {expr} Go interpolation. The '{' has not been

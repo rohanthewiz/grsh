@@ -21,6 +21,11 @@ type Interp struct {
 	globals *Env
 	depth   int // closure call depth, for runaway recursion
 	frames  []*frame
+
+	// exprCache holds parsed {expr} interpolation fragments keyed by
+	// (src, line). Entries carry positions in fset, so the cache is valid
+	// only for the current Run and is reset whenever fset is replaced.
+	exprCache map[string]ast.Expr
 }
 
 // frame holds per-function-call state (deferred calls).
@@ -110,6 +115,7 @@ func (in *Interp) AddTab(frags []*shellparse.CmdList) int {
 // forward references and mutual recursion work.
 func (in *Interp) Run(fset *token.FileSet, f *ast.File) error {
 	in.fset = fset
+	in.exprCache = nil // fragment positions belong to the previous fset
 	var body *ast.BlockStmt
 	for _, d := range f.Decls {
 		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "__main" {
@@ -246,7 +252,7 @@ func (in *Interp) evalStmt(env *Env, st ast.Stmt) (control, error) {
 		case token.CONTINUE:
 			return control{kind: ctlContinue}, nil
 		}
-		return control{}, in.errAt(n, n.Tok.String()+" is not supported in grsh v1")
+		return control{}, in.errAt(n, n.Tok.String()+" is not supported yet")
 
 	case *ast.ReturnStmt:
 		var vals []Value
@@ -292,7 +298,7 @@ func (in *Interp) evalStmt(env *Env, st ast.Stmt) (control, error) {
 		return control{}, nil
 
 	default:
-		return control{}, in.errAt(st, fmt.Sprintf("%T is not supported in grsh v1", st))
+		return control{}, in.errAt(st, fmt.Sprintf("%T is not supported yet", st))
 	}
 }
 

@@ -1,6 +1,7 @@
 package shellexec
 
 import (
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,8 +11,13 @@ import (
 )
 
 // interactiveTTY returns the terminal when job control applies to this
-// pipeline: the session is interactive and the statement's stdin is the
-// real terminal (captures and redirected stdins never job-control).
+// pipeline: the session is interactive, the statement's stdin is the real
+// terminal, and stdout/stderr are real files. The job-control path reaps
+// with Wait4 and never calls exec.Cmd.Wait, so it must be copier-free:
+// a non-*os.File writer would make os/exec spawn a copy goroutine that
+// only Wait synchronizes — racing the reap (truncated $() captures) and
+// leaking the parent pipe fd. Captures (bytes.Buffer stdout) and any
+// redirected session stdio therefore never job-control.
 func interactiveTTY(st *State, stdio Stdio) (*os.File, bool) {
 	if !st.Interactive {
 		return nil, false
@@ -20,7 +26,15 @@ func interactiveTTY(st *State, stdio Stdio) (*os.File, bool) {
 	if !ok || !term.IsTerminal(int(f.Fd())) {
 		return nil, false
 	}
+	if !isOSFile(stdio.Out) || !isOSFile(stdio.Err) {
+		return nil, false
+	}
 	return f, true
+}
+
+func isOSFile(w io.Writer) bool {
+	_, ok := w.(*os.File)
+	return ok
 }
 
 // tcSetpgrp makes pgid the terminal's foreground process group. SIGTTOU

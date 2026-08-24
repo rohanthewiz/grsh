@@ -77,17 +77,13 @@ type Session struct {
 	r  *runner.Session
 }
 
-// eofReader keeps embedded children away from the host's stdin.
-type eofReader struct{}
-
-func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
-
 // NewSession creates an embedded-mode session. It never fails: a
 // session is pure in-process state until the first Eval runs something.
 func NewSession(o Options) *Session {
 	in := o.Stdin
 	if in == nil {
-		in = eofReader{}
+		// Embedded children must never read the host's stdin.
+		in = shellexec.EOFStdin
 	}
 	name := o.ScriptName
 	if name == "" {

@@ -91,6 +91,10 @@ type Classifier struct {
 	scope *Scope
 	pkgs  map[string]bool
 	depth int
+	// blocks is the construct-label stack mirroring depth: one entry per
+	// open brace, e.g. ["func greet", "for"]. The REPL renders it in the
+	// continuation prompt so you always know what you are inside of.
+	blocks []string
 }
 
 func New(pkgNames []string) *Classifier {
@@ -205,7 +209,11 @@ func firstToken(t string) string {
 // preceding declared identifier as Go usage. A dot only counts when it is
 // selector-shaped (`x.field`), so `cd ..` and `cd ./dir` stay shell.
 func startsGoOp(rest string) bool {
-	for _, op := range []string{"++", "--", "+=", "-=", "*=", "/=", "%=", "=", ",", "(", "["} {
+	// The bitwise compound assignments matter beyond classification: a
+	// missed `x <<= 2` would fall to shell, where << reads as a heredoc
+	// operator and leaves the REPL waiting for a delimiter forever.
+	for _, op := range []string{"++", "--", "+=", "-=", "*=", "/=", "%=",
+		"&^=", "<<=", ">>=", "&=", "|=", "^=", "=", ",", "(", "["} {
 		if strings.HasPrefix(rest, op) {
 			return true
 		}

@@ -33,8 +33,21 @@ execution. v2 has begun with the interactive REPL.
 - **Interactive REPL** (new in v2) — run `grsh` with no arguments:
   full session state across inputs, multi-line continuation for Go
   blocks and shell pipes, history (`~/.grsh_history`), tab completion
-  (PATH commands, your identifiers, file paths), cwd-and-status prompt.
+  (PATH commands, shell builtins, your identifiers, `pkg.Member`
+  registry symbols, file paths), cwd-and-status prompt.
   Piped stdin runs as a script: `echo 'ls | wc -l' | grsh`.
+- **Interactive conveniences** (new) —
+  `~/.grshrc` startup file (mix shell and Go; `$GRSH_RC` overrides,
+  `-norc` skips); `grsh init` translates your `~/.zshrc` into a
+  starter `~/.grshrc`; continuation prompts show a **construct
+  breadcrumb with auto-indent** (`... func greet ▸ for ▸ `) so you
+  always know what block you're in; eval errors print the offending
+  line with a **caret** under the column; `?name` **inspects any live
+  Go variable** (type + pretty-printed value); `session save
+  file.grsh` writes this session's inputs as a runnable script;
+  `$GRSH_PROMPT` templates the prompt (`%d` cwd, `%s` status, `%g` git
+  branch, `%t` time, `%j` jobs, `{cyan}...{reset}` colors, `NO_COLOR`
+  respected); complete input units persist to `~/.grsh_units`.
 - **Background jobs & job control** (new in v2) — `make -j8 &`, `jobs`,
   `wait [%N]`, `fg`, `bg`, `kill %N`, and **Ctrl+Z** suspends the
   foreground command into the job table (full terminal handoff on
@@ -93,7 +106,12 @@ Run any script with `--explain` to see each line's decision and rule.
 - `{expr}` interpolation produces exactly one word for a string; use a
   `[]string` to splice multiple argv words.
 - `$?` is spelled `status()`; `set -e` is `errexit(true)`.
-- Background jobs (`&`), heredocs, and process substitution are not in v1.
+- `FOO=bar cmd` sets a per-command environment (like bash); bare
+  `FOO=bar` is rejected — variables are Go (`FOO := "bar"`) or
+  environment (`export FOO=bar`).
+- `${VAR:-default}`-style parameter expansion is rejected with a hint
+  rather than silently expanding empty; plain `${VAR}` works.
+- Process substitution `<(...)` is not supported yet.
 
 ## Build & test
 

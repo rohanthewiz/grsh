@@ -292,6 +292,7 @@ func doneLine(id, status int, cmdline string) string {
 // preparedCmd is a fully expanded command, ready to start asynchronously.
 type preparedCmd struct {
 	argv   []string
+	env    []string // NAME=value prefix assignments, per-command environment
 	redirs []resolvedRedir
 }
 
@@ -308,6 +309,7 @@ func launchJob(st *State, ao *shellparse.AndOr, ev WordEvaluator, stdio Stdio) (
 			if err != nil {
 				return userErr(stdio, err)
 			}
+			assigns, argv := splitAssignPrefix(argv)
 			argv = expandAlias(st, argv)
 			if len(argv) > 1 && argv[0] == "command" {
 				argv = argv[1:]
@@ -318,11 +320,15 @@ func launchJob(st *State, ao *shellparse.AndOr, ev WordEvaluator, stdio Stdio) (
 			if isBuiltin(argv[0]) {
 				return userErr(stdio, serr.New("builtin '"+argv[0]+"' cannot run in the background"))
 			}
+			var env []string
+			if len(assigns) > 0 {
+				env = append(os.Environ(), assigns...)
+			}
 			redirs, err := resolveRedirs(st, cmd.Redirs, ev)
 			if err != nil {
 				return userErr(stdio, err)
 			}
-			prepared = append(prepared, preparedCmd{argv: argv, redirs: redirs})
+			prepared = append(prepared, preparedCmd{argv: argv, env: env, redirs: redirs})
 			names = append(names, strings.Join(argv, " "))
 		}
 		pipes = append(pipes, prepared)
@@ -380,6 +386,7 @@ func runPreparedPipeline(jt *JobTable, job *Job, cmds []preparedCmd, stdio Stdio
 
 	for i, pc := range cmds {
 		execs[i] = exec.Command(pc.argv[0], pc.argv[1:]...)
+		execs[i].Env = pc.env // nil inherits the process environment
 		execs[i].Stderr = stdio.Err
 	}
 	execs[0].Stdin = devnull

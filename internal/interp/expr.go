@@ -68,7 +68,7 @@ func (in *Interp) evalExpr(env *Env, e ast.Expr) ([]Value, error) {
 
 	case *ast.TypeAssertExpr:
 		if n.Type == nil {
-			return nil, in.errAt(n, "type switches are not supported in grsh v1")
+			return nil, in.errAt(n, "type switches are not supported yet")
 		}
 		v, err := in.eval1(env, n.X)
 		if err != nil {
@@ -84,7 +84,7 @@ func (in *Interp) evalExpr(env *Env, e ast.Expr) ([]Value, error) {
 		return []Value{reflect.Zero(t).Interface(), false}, nil
 
 	default:
-		return nil, in.errAt(e, fmt.Sprintf("%T expression is not supported in grsh v1", e))
+		return nil, in.errAt(e, fmt.Sprintf("%T expression is not supported yet", e))
 	}
 }
 
@@ -192,6 +192,12 @@ func (in *Interp) unaryOp(n ast.Node, op token.Token, v Value) (Value, error) {
 		return nil, in.errAt(n, fmt.Sprintf("operator - requires a number, got %T", v))
 	case token.ADD:
 		return v, nil
+	case token.XOR:
+		// Bitwise complement: ^x on integers.
+		if i, ok := toI64(v); ok {
+			return int(^i), nil
+		}
+		return nil, in.errAt(n, fmt.Sprintf("operator ^ requires an integer, got %T", v))
 	}
 	return nil, in.errAt(n, "unary operator "+op.String()+" is not supported")
 }
@@ -293,9 +299,17 @@ func intOp(in *Interp, n ast.Node, op token.Token, x, y int64) (Value, error) {
 	case token.XOR:
 		return int(x ^ y), nil
 	case token.SHL:
+		if y < 0 {
+			return nil, in.errAt(n, "negative shift amount")
+		}
 		return int(x << uint(y)), nil
 	case token.SHR:
+		if y < 0 {
+			return nil, in.errAt(n, "negative shift amount")
+		}
 		return int(x >> uint(y)), nil
+	case token.AND_NOT:
+		return int(x &^ y), nil
 	}
 	return nil, in.errAt(n, "operator "+op.String()+" is not supported on integers")
 }
@@ -515,6 +529,18 @@ func assignOp(tok token.Token) (token.Token, bool) {
 		return token.QUO, true
 	case token.REM_ASSIGN:
 		return token.REM, true
+	case token.AND_ASSIGN:
+		return token.AND, true
+	case token.OR_ASSIGN:
+		return token.OR, true
+	case token.XOR_ASSIGN:
+		return token.XOR, true
+	case token.SHL_ASSIGN:
+		return token.SHL, true
+	case token.SHR_ASSIGN:
+		return token.SHR, true
+	case token.AND_NOT_ASSIGN:
+		return token.AND_NOT, true
 	}
 	return tok, false
 }
@@ -549,7 +575,7 @@ func (in *Interp) setLValue(env *Env, lhs ast.Expr, v Value) error {
 		}
 		return in.errAt(lhs, fmt.Sprintf("cannot assign to field of %T", recv))
 	default:
-		return in.errAt(lhs, fmt.Sprintf("cannot assign to %T in grsh v1", lhs))
+		return in.errAt(lhs, fmt.Sprintf("cannot assign to %T yet", lhs))
 	}
 }
 
@@ -557,6 +583,11 @@ func (in *Interp) setIndexed(n ast.Node, container, idx, v Value) error {
 	rv := reflect.ValueOf(container)
 	switch rv.Kind() {
 	case reflect.Map:
+		// SetMapIndex panics on a typed nil map (`var m map[string]int`);
+		// surface Go's runtime message as a positioned error instead.
+		if rv.IsNil() {
+			return in.errAt(n, "assignment to entry in nil map (use make or a literal first)")
+		}
 		kv, err := convertTo(idx, rv.Type().Key())
 		if err != nil {
 			return in.wrapAt(n, err)

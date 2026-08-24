@@ -46,6 +46,31 @@ func LookupBound(pkg, sym string, stdout, stderr io.Writer) (any, bool) {
 
 func Has(pkg string) bool { _, ok := packages[pkg]; return ok }
 
+// Members returns a package's symbol names (plain and bound), sorted —
+// the REPL completes `fmt.Pr<TAB>` from this.
+func Members(pkg string) []string {
+	p, ok := packages[pkg]
+	if !ok {
+		return nil
+	}
+	seen := make(map[string]bool, len(p.Symbols)+len(p.Bound))
+	out := make([]string, 0, len(p.Symbols)+len(p.Bound))
+	for s := range p.Symbols {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for s := range p.Bound {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Names returns registered package names (for the classifier's rule 6b).
 func Names() []string {
 	out := make([]string, 0, len(packages))
