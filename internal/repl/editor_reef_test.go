@@ -178,3 +178,122 @@ func TestReefElectricBrace(t *testing.T) {
 		})
 	}
 }
+
+// withGhost enables ghost text on a test reader. newReefReader only builds
+// the suggester when colorEnabled(), which is false under `go test` (stdout
+// is not a terminal), so the tests wire it up explicitly.
+func withGhost(rd *reefReader, units ...string) *reefReader {
+	store := openHistory("")
+	for _, u := range units {
+		store.Append(u)
+	}
+	rd.ghost = newSuggester(store)
+	return rd
+}
+
+// TestReefGhostText drives the hint provider — grsh's per-refresh hook — and
+// checks what lands in the display engine's inline-suggestion slot.
+func TestReefGhostText(t *testing.T) {
+	provide := func(rd *reefReader, buf string, pos int) {
+		setBuffer(rd, buf, pos)
+		rd.hintProvider([]rune(buf), pos)
+	}
+
+	t.Run("suggests at end of line", func(t *testing.T) {
+		rd := withGhost(newTestReefReader(t), "echo hello world")
+		provide(rd, "echo", 4)
+		if got := rd.rl.GetInlineSuggestion(); got != "echo hello world" {
+			t.Errorf("ghost = %q, want the matching unit", got)
+		}
+	})
+
+	t.Run("cleared away from the end", func(t *testing.T) {
+		rd := withGhost(newTestReefReader(t), "echo hello world")
+		provide(rd, "echo", 2)
+		if got := rd.rl.GetInlineSuggestion(); got != "" {
+			t.Errorf("ghost = %q, want none with the cursor mid-buffer", got)
+		}
+	})
+
+	t.Run("cleared once the match is gone", func(t *testing.T) {
+		rd := withGhost(newTestReefReader(t), "echo hello world")
+		provide(rd, "echo", 4)
+		provide(rd, "cargo", 5)
+		if got := rd.rl.GetInlineSuggestion(); got != "" {
+			t.Errorf("ghost = %q, want it cleared when nothing matches", got)
+		}
+	})
+
+	t.Run("held while the line is accepted", func(t *testing.T) {
+		rd := withGhost(newTestReefReader(t), "echo hello world")
+		provide(rd, "echo", 4)
+		// AcceptMultiline is the library's last step before the display
+		// engine walks past the accepted line: it must take the ghost down,
+		// or the engine measures (and leaves printed) the suggested line.
+		if !rd.rl.AcceptMultiline([]rune("echo")) {
+			t.Fatal("a complete shell line should be accepted")
+		}
+		provide(rd, "echo", 4)
+		if got := rd.rl.GetInlineSuggestion(); got != "" {
+			t.Errorf("ghost = %q, want none while accepting", got)
+		}
+		// A pending unit is not being accepted, so the hold lifts.
+		rd.rl.AcceptMultiline([]rune("func f() {"))
+		provide(rd, "echo", 4)
+		if got := rd.rl.GetInlineSuggestion(); got != "echo hello world" {
+			t.Errorf("ghost = %q, want it back after a continuation", got)
+		}
+	})
+
+	t.Run("disabled when color is off", func(t *testing.T) {
+		rd := newTestReefReader(t) // no ghost wired: the colorEnabled() gate
+		provide(rd, "echo", 4)
+		if got := rd.rl.GetInlineSuggestion(); got != "" {
+			t.Errorf("ghost = %q, want none without color", got)
+		}
+	})
+
+	t.Run("composes with the breadcrumb", func(t *testing.T) {
+		// The two features share one callback; neither may swallow the other.
+		rd := withGhost(newTestReefReader(t), "func hi() string {\n  return \"x\"\n}")
+		buf := "func hi() string {"
+		setBuffer(rd, buf, len(buf))
+		hint := string(rd.hintProvider([]rune(buf), len(buf)))
+		if hint == "" {
+			t.Error("breadcrumb lost: the ghost update must compose, not replace")
+		}
+		// ...and the multi-line unit is still refused as ghost text.
+		if got := rd.rl.GetInlineSuggestion(); got != "" {
+			t.Errorf("ghost = %q, want none for a multi-line unit", got)
+		}
+	})
+}
+
+// TestReefForwardWordAcceptsGhost: a forward-word key takes the next word of
+// the suggestion when one applies, and is a plain motion otherwise.
+func TestReefForwardWordAcceptsGhost(t *testing.T) {
+	rd := withGhost(newTestReefReader(t), "echo hello world")
+	setBuffer(rd, "echo", 4)
+	rd.rl.SetInlineSuggestion("echo hello world")
+
+	fwd := rd.rl.Keymap.Commands()["forward-word"]
+	fwd()
+	if got := string(*rd.rl.Line()); got != "echo hello" {
+		t.Errorf("buffer = %q, want one accepted word", got)
+	}
+	fwd()
+	if got := string(*rd.rl.Line()); got != "echo hello world" {
+		t.Errorf("buffer = %q, want the rest accepted", got)
+	}
+
+	// Nothing suggested: fall through to the stock motion, buffer untouched.
+	rd2 := withGhost(newTestReefReader(t))
+	setBuffer(rd2, "echo hi", 0)
+	rd2.rl.Keymap.Commands()["forward-word"]()
+	if got := string(*rd2.rl.Line()); got != "echo hi" {
+		t.Errorf("buffer = %q, want it unchanged by the motion", got)
+	}
+	if rd2.rl.Cursor().Pos() == 0 {
+		t.Error("with no suggestion, forward-word must still move the cursor")
+	}
+}

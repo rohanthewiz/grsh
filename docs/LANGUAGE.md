@@ -494,6 +494,15 @@ shell sees 40
   path) and red if it doesn't, plus flags, `$variables`, quoted
   strings, and comments. `{go interpolations}` inside shell lines stay
   plain. Disabled under `NO_COLOR`, `TERM=dumb`, or a non-terminal.
+- **Ghost text** — fish-style inline autosuggestion: the most recent
+  unit in `~/.grsh_units` that starts with what you've typed is shown
+  dimmed after the cursor. `→` or `Ctrl+F` (at the end of the line)
+  accepts the whole suggestion; a forward-word key (`Alt+F`, `Alt+→`,
+  `Ctrl+→`) accepts the next word. Nothing is inserted unless you
+  accept it. Multi-line units are never suggested (ghost text has to
+  fit on the current row), and the feature follows the same color gate
+  as highlighting — the suggestion is only distinguishable from typed
+  input by being dim.
 - **History** — per-line recall in `~/.grsh_history` (arrow keys,
   Ctrl+R); complete input units (a whole `func` block is one unit) are
   additionally persisted to `~/.grsh_units`, which backs

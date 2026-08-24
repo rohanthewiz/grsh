@@ -47,11 +47,21 @@ type reefReader struct {
 	// over the reader so the loop's per-iteration SetPrompt keeps working
 	// against reeflective's callback-based prompt engine.
 	prompt string
+	// sess backs the per-refresh callbacks (breadcrumb hint, auto-indent
+	// depth, electric brace): they all ask the classifier about the live
+	// buffer.
+	sess *runner.Session
+	// ghost is the inline-autosuggestion matcher, or nil when ghost text is
+	// disabled (see the colorEnabled gate in newReefReader).
+	ghost *suggester
+	// ghostHold suppresses the ghost while a line is being accepted; see
+	// AcceptMultiline for why that moment needs a clear screen.
+	ghostHold bool
 }
 
 func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *reefReader {
 	// WithApp lets users scope ~/.inputrc directives with `$if grsh`.
-	r := &reefReader{rl: reef.NewShell(inputrc.WithApp("grsh"))}
+	r := &reefReader{rl: reef.NewShell(inputrc.WithApp("grsh")), sess: sess}
 
 	r.rl.Prompt.Primary(func() string { return r.prompt })
 	// Continuation lines get a plain gutter: with real multiline editing
@@ -65,24 +75,30 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 	// delegated stock path — search modes and the like — where a bare
 	// newline without indent is the acceptable degraded behavior.)
 	r.rl.AcceptMultiline = func(line []rune) bool {
-		return !sess.Pending(string(line)).NeedsMore
+		accept := !sess.Pending(string(line)).NeedsMore
+		// Take the ghost down on the way out. This callback is the library's
+		// last step before Display.AcceptLine on every acceptance path, and
+		// AcceptLine's coordinate pass measures the line INCLUDING the inline
+		// suggestion: a ghost still set here makes the engine walk past it and
+		// leave it printed, as if the suggestion had been typed. The hold is
+		// lifted at the next Readline call.
+		r.ghostHold = accept
+		return accept
 	}
 
 	// Open-construct breadcrumb, recomputed from the live buffer on every
 	// refresh by the display engine. This is the Round 1 "where am I"
 	// feature relocated: `func hi() string {⏎` shows `… func hi` under
 	// the input until the brace closes.
-	r.rl.Hint.SetProvider(func(line []rune, _ int) []rune {
-		pend := sess.Pending(string(line))
-		if !pend.NeedsMore || len(pend.Constructs) == 0 {
-			return nil
-		}
-		trail := "… " + strings.Join(pend.Constructs, " ▸ ")
-		if colorEnabled() {
-			trail = "\x1b[2m" + trail + "\x1b[0m" // dim; the hint is ambient, not content
-		}
-		return []rune(trail)
-	})
+	//
+	// The provider doubles as grsh's per-refresh hook, because the display
+	// engine calls it from computeCoordinates -- after the effective buffer
+	// has been resolved and BEFORE the inline suggestion is measured and
+	// painted. Updating the ghost here is therefore consistent within one
+	// frame; doing it from the SyntaxHighlighter (which runs later, during
+	// the line render) would leave the coordinate math a frame stale and
+	// mis-place the cursor whenever the ghost wraps.
+	r.rl.Hint.SetProvider(r.hintProvider)
 
 	r.rl.Completer = comp.completeReef
 
@@ -90,6 +106,10 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 	// gate as the prompt: NO_COLOR, dumb terminals, non-terminals opt out).
 	if colorEnabled() {
 		r.rl.SyntaxHighlighter = newHighlighter(sess, comp).highlight
+		// Ghost text rides the same gate: the library paints the suggestion
+		// with a hardcoded dim/gray SGR run, so with color suppressed it
+		// would be indistinguishable from text the user actually typed.
+		r.ghost = newSuggester(hist)
 	}
 
 	// Recall is backed by the unit store: up-arrow restores a whole
@@ -128,6 +148,7 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 	//        pending keys and eats the next typed-ahead keystroke.
 	r.rl.Keymap.Register(map[string]func(){
 		"grsh-interrupt": func() {
+			r.ghostHold = true // same reason as in AcceptMultiline
 			r.rl.Display.AcceptLine()
 			r.rl.History.Accept(false, false, reef.ErrInterrupt)
 		},
@@ -205,7 +226,70 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 		},
 	})
 
+	// Partial ghost-text acceptance, fish style: a forward-word key takes the
+	// next word of the suggestion instead of moving into empty space. The
+	// whole-suggestion case needs no wiring — the library's forward-char
+	// already falls back to the inline suggestion when the cursor is at the
+	// end of the line, so → and ^F accept it out of the box.
+	//
+	// Overriding the COMMAND rather than binding keys means every sequence
+	// that already resolves to forward-word (\ef, \e[1;5C, ...) inherits the
+	// behavior, in whichever keymap the user has it. inline-suggest-accept-word
+	// is a no-op unless a suggestion applies at the cursor, so "did the buffer
+	// grow?" is a sufficient (and library-version-proof) test for whether to
+	// fall through to the plain motion.
+	acceptSuggestWord := r.rl.Keymap.Commands()["inline-suggest-accept-word"]
+	forwardWord := r.rl.Keymap.Commands()["forward-word"]
+	r.rl.Keymap.Register(map[string]func(){
+		"forward-word": func() {
+			before := r.rl.Line().Len()
+			acceptSuggestWord()
+			if r.rl.Line().Len() == before {
+				forwardWord()
+			}
+		},
+	})
+
 	return r
+}
+
+// hintProvider is the display engine's per-refresh callback. It returns the
+// open-construct breadcrumb for the hint lane and, on the way, refreshes the
+// ghost text — see newReefReader for why the two share this hook.
+func (r *reefReader) hintProvider(line []rune, pos int) []rune {
+	r.updateGhost(line, pos)
+
+	pend := r.sess.Pending(string(line))
+	if !pend.NeedsMore || len(pend.Constructs) == 0 {
+		return nil
+	}
+	trail := "… " + strings.Join(pend.Constructs, " ▸ ")
+	if colorEnabled() {
+		trail = "\x1b[2m" + trail + "\x1b[0m" // dim; the hint is ambient, not content
+	}
+	return []rune(trail)
+}
+
+// updateGhost recomputes the inline autosuggestion for the frame being
+// rendered. Called from the hint provider (see newReefReader for why that
+// is the right moment), so it runs on the editor's read loop only.
+func (r *reefReader) updateGhost(line []rune, pos int) {
+	if r.ghost == nil {
+		return
+	}
+	// Only offer ghost text in the plain editing state:
+	//   - ghostHold: the line is on its way out; the display engine must see
+	//     an unadorned buffer while it walks past it.
+	//   - a local keymap active means the buffer handed to us is a minibuffer
+	//     (incremental search) or carries a virtually inserted completion
+	//     candidate — extending either is nonsense.
+	//   - away from the end of the buffer the library refuses to paint or
+	//     accept a suggestion anyway, so skip the history scan entirely.
+	sug := ""
+	if !r.ghostHold && string(r.rl.Keymap.Local()) == "" && pos == len(line) {
+		sug = r.ghost.suggest(string(line))
+	}
+	r.rl.SetInlineSuggestion(sug) // "" clears any previous ghost
 }
 
 // Readline maps reeflective's sentinels onto the loop's editor-neutral
@@ -213,6 +297,7 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 // empty line (^D with content is delete-char, as in bash — so unlike the
 // legacy editor there is no ^D-mid-continuation case to handle).
 func (r *reefReader) Readline() (string, error) {
+	r.ghostHold = false // fresh prompt: the ghost is welcome again
 	line, err := r.rl.Readline()
 	if errors.Is(err, reef.ErrInterrupt) {
 		return line, errInterrupt

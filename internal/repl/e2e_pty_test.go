@@ -323,6 +323,54 @@ func TestReefHighlightAndIndentEndToEnd(t *testing.T) {
 	}
 }
 
+// TestReefGhostTextEndToEnd drives fish-style ghost text through a real
+// pty: a unit run at one prompt must be offered, dimmed, as an inline
+// suggestion when its prefix is retyped at the next one, and ^F must
+// accept it into the buffer so Enter runs the WHOLE command.
+//
+// The `%s` split in the seeded command is deliberate: keystroke echo and
+// the editor's full-buffer repaints replay the typed source constantly, so
+// only real evaluation can produce the contiguous string "ghost-seed".
+func TestReefGhostTextEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	p := startShell(t)
+	p.waitFor("Ctrl+D to quit")
+	p.waitFor("grsh ")
+
+	const seed = `printf 'gho%s\n' st-seed`
+	p.send(seed + "\r")
+	p.waitFor("ghost-seed") // ran, and the loop appended it to the unit store
+	p.waitFor("grsh ")
+
+	// Retype a prefix: the remainder is painted after the cursor in the
+	// library's suggestion color (dim + 256-color grey 242), unhighlighted.
+	const prefix = "printf 'gho"
+	p.send(prefix)
+	p.waitFor("\x1b[38;05;242m" + strings.TrimPrefix(seed, prefix))
+
+	// ^F (forward-char at the end of the line) accepts the whole ghost.
+	p.send("\x06\r")
+	p.waitFor("ghost-seed")
+	p.waitFor("grsh ")
+
+	p.send("\x04")
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("grsh exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		p.mu.Lock()
+		pending := p.out.String()
+		p.mu.Unlock()
+		t.Fatalf("grsh did not exit on ^D; pending output:\n%q", pending)
+	}
+}
+
 // TestReefEditorNonzeroExitStatus checks the ^D exit code carries the
 // last command's status, matching script semantics.
 func TestReefEditorNonzeroExitStatus(t *testing.T) {

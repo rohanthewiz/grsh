@@ -45,8 +45,10 @@ execution. v2 has begun with the interactive REPL.
   shell command names green when they resolve and red when they don't,
   fish-style, plus flags, `$vars`, and strings); **real auto-indent** —
   Enter inside an open block seeds the next line with its depth, and a
-  `}` typed on that fresh line dedents itself one level; eval errors
-  print the offending
+  `}` typed on that fresh line dedents itself one level; **ghost text**
+  — the most recent history unit starting with what you've typed shows
+  dimmed after the cursor, fish-style (→ or Ctrl+F accepts it, a
+  forward-word key takes one word); eval errors print the offending
   line with a **caret** under the column; `?name` **inspects any live
   Go variable** (type + pretty-printed value); `session save
   file.grsh` writes this session's inputs as a runnable script;
