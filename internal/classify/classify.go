@@ -15,6 +15,7 @@
 package classify
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -118,6 +119,12 @@ func (c *Classifier) Predeclare(names ...string) {
 }
 
 // File classifies a source chunk into contiguous classified chunks.
+//
+// On an ErrIncomplete failure (mid-statement Go, unterminated heredoc) the
+// chunks classified so far are still returned, capped with a best-effort
+// tail chunk covering the unfinished remainder — Preview highlights from
+// them while the user is mid-unit. Error-checking callers are unaffected:
+// they bail on err before touching chunks.
 func (c *Classifier) File(src string) ([]Chunk, error) {
 	lines := strings.Split(src, "\n")
 	c.predeclare(lines)
@@ -135,7 +142,8 @@ func (c *Classifier) File(src string) ([]Chunk, error) {
 		if kind == Shell {
 			text, end, err := joinShell(lines, i)
 			if err != nil {
-				return nil, err
+				chunks = append(chunks, tailChunk(Shell, lines, i, c.depth))
+				return chunks, err
 			}
 			if rule == "sh-prefix" {
 				text = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), "sh"))
@@ -146,7 +154,8 @@ func (c *Classifier) File(src string) ([]Chunk, error) {
 		}
 		text, end, err := consumeGo(lines, i)
 		if err != nil {
-			return nil, serr.Wrap(err, "line", strings.TrimSpace(lines[i]))
+			chunks = append(chunks, tailChunk(Go, lines, i, c.depth))
+			return chunks, serr.Wrap(err, "line", strings.TrimSpace(lines[i]))
 		}
 		startDepth := c.depth
 		c.trackGoLine(text)
@@ -154,6 +163,14 @@ func (c *Classifier) File(src string) ([]Chunk, error) {
 		i = end + 1
 	}
 	return chunks, nil
+}
+
+// tailChunk wraps the unconsumable remainder of the input (an unfinished
+// heredoc or Go statement) as one chunk of the kind that was being read,
+// so display code knows what the trailing lines are even mid-unit.
+func tailChunk(kind Kind, lines []string, i, depth int) Chunk {
+	return Chunk{Kind: kind, Text: strings.Join(lines[i:], "\n"),
+		StartLine: i + 1, EndLine: len(lines), Depth: depth, Rule: "incomplete"}
 }
 
 func (c *Classifier) classifyLine(t string) (Kind, string) {
@@ -275,7 +292,7 @@ func joinShell(lines []string, i int) (string, int, error) {
 	for _, hd := range scanHeredocs(text) {
 		for {
 			if i+1 >= len(lines) {
-				return "", 0, fmt.Errorf("unterminated heredoc <<%s: %w", hd.delim, ErrIncomplete)
+				return "", 0, fmt.Errorf("heredoc <<%s: %w", hd.delim, errors.Join(ErrHeredoc, ErrIncomplete))
 			}
 			i++
 			text += "\n" + lines[i]

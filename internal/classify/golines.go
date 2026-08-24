@@ -12,6 +12,13 @@ import (
 // as a parse error; the REPL treats it as "read another line".
 var ErrIncomplete = errors.New("incomplete Go statement at end of script")
 
+// ErrHeredoc marks the specific incompleteness of an unterminated heredoc.
+// It always travels together with ErrIncomplete (errors.Is matches both);
+// the distinction exists because the REPL's auto-indent must stay OFF while
+// a heredoc body is being read — seeded spaces would become literal body
+// content and an indented delimiter line would never match.
+var ErrHeredoc = errors.New("unterminated heredoc")
+
 type tokLit struct {
 	tok token.Token
 	lit string

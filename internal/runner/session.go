@@ -131,6 +131,18 @@ func (s *Session) Pending(src string) classify.PendingInfo { return s.cls.Pendin
 // declared since. The REPL completes on these.
 func (s *Session) Idents() []string { return s.cls.Names() }
 
+// Preview maps src into per-line Shell/Go/Blank chunks for display — the
+// REPL's syntax highlighter runs it per refresh. Clone-based: classifier
+// state is not mutated, and incomplete input still yields chunks.
+func (s *Session) Preview(src string) []classify.Chunk { return s.cls.Preview(src) }
+
+// IsAlias reports whether name is a defined shell alias (the highlighter
+// treats aliases as known commands).
+func (s *Session) IsAlias(name string) bool {
+	_, ok := s.st.Aliases[name]
+	return ok
+}
+
 // Inspect pretty-prints a top-level Go variable's type and value (the
 // REPL's `?name` command).
 func (s *Session) Inspect(name string) (string, bool) { return s.in.Inspect(name) }

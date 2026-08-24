@@ -39,9 +39,14 @@ execution. v2 has begun with the interactive REPL.
 - **Interactive conveniences** (new) —
   `~/.grshrc` startup file (mix shell and Go; `$GRSH_RC` overrides,
   `-norc` skips); `grsh init` translates your `~/.zshrc` into a
-  starter `~/.grshrc`; continuation prompts show a **construct
-  breadcrumb with auto-indent** (`... func greet ▸ for ▸ `) so you
-  always know what block you're in; eval errors print the offending
+  starter `~/.grshrc`; a **construct breadcrumb** (`… func greet ▸ for`)
+  below the input always shows what block you're in; **syntax
+  highlighting** as you type (Go keywords/strings/numbers/comments;
+  shell command names green when they resolve and red when they don't,
+  fish-style, plus flags, `$vars`, and strings); **real auto-indent** —
+  Enter inside an open block seeds the next line with its depth, and a
+  `}` typed on that fresh line dedents itself one level; eval errors
+  print the offending
   line with a **caret** under the column; `?name` **inspects any live
   Go variable** (type + pretty-printed value); `session save
   file.grsh` writes this session's inputs as a runnable script;

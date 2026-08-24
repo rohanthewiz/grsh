@@ -79,6 +79,7 @@ type ptyShell struct {
 	mu     sync.Mutex
 	out    bytes.Buffer
 	cmd    *exec.Cmd
+	home   string // the isolated $HOME (unit history lands in it)
 	// writeMu serializes test keystrokes with the DSR responder: both
 	// write to the master, and an unserialized reply could land BETWEEN
 	// the bytes of one UTF-8 rune, corrupting the key stream mid-char.
@@ -95,15 +96,16 @@ func startShell(t *testing.T, env ...string) *ptyShell {
 	// New session with the pty as controlling terminal — job control and
 	// raw-mode handling need the real thing, not just tty-shaped stdio.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	home := t.TempDir()
 	cmd.Env = append([]string{
-		"HOME=" + t.TempDir(), // isolate rc files and history
+		"HOME=" + home, // isolate rc files and history
 		"PATH=" + os.Getenv("PATH"),
 		"TERM=xterm-256color",
 	}, env...)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start grsh: %v", err)
 	}
-	p := &ptyShell{t: t, master: master, cmd: cmd}
+	p := &ptyShell{t: t, master: master, cmd: cmd, home: home}
 	go func() {
 		buf := make([]byte, 4096)
 		var tail []byte // carry partial DSR sequences across read boundaries
@@ -249,6 +251,75 @@ func TestReefEditorEndToEnd(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("grsh did not exit on ^D")
+	}
+}
+
+// TestReefHighlightAndIndentEndToEnd drives the Round 2 display features
+// through a real pty: syntax-highlight SGR sequences in the repaint
+// stream (color is live — the pty makes colorEnabled true), auto-indent
+// seeding real spaces into the buffer, and the electric } dedent. The
+// buffer-content assertions read the persisted unit store: what was
+// EVALUATED (indent included) is exactly what Append wrote.
+func TestReefHighlightAndIndentEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	p := startShell(t)
+	p.waitFor("Ctrl+D to quit")
+	p.waitFor("grsh ")
+
+	// A resolvable command paints green in the input line repaint.
+	p.send("true")
+	p.waitFor("\x1b[32mtrue")
+	p.send("\r")
+	p.waitFor("grsh ")
+
+	// An unresolvable one paints red; ^C drops it unrun.
+	p.send("qzqxjw")
+	p.waitFor("\x1b[31mqzqxjw")
+	p.send("\x03")
+	p.waitFor("grsh ")
+
+	// Go literals: the number takes the numeric color in the repaint.
+	p.send("n := 41")
+	p.waitFor("\x1b[36m41")
+	p.send("\r")
+	p.waitFor("grsh ")
+
+	// Auto-indent + electric brace, proven through evaluation and the
+	// persisted unit: Enter after { seeds two real spaces, the typed }
+	// dedents back to column 0, and the unit still evaluates.
+	p.send("func hi() string {\r")
+	p.waitFor("… func hi") // pending-unit breadcrumb: multiline mode is on
+	p.send("return \"in\" + \"dent\"\r")
+	p.send("}\r")
+	p.send("fmt.Println(hi())\r")
+	p.waitFor("indent")
+	p.waitFor("grsh ") // back at the prompt: raw mode owns the tty again, so ^D below reaches readline
+
+	// The unit store escapes newlines as literal \n, one unit per line.
+	units, err := os.ReadFile(filepath.Join(p.home, ".grsh_units"))
+	if err != nil {
+		t.Fatalf("read unit store: %v", err)
+	}
+	want := `func hi() string {\n  return "in" + "dent"\n}`
+	if !strings.Contains(string(units), want) {
+		t.Fatalf("persisted unit lacks seeded indent + dedented brace:\nwant %q in:\n%s", want, units)
+	}
+
+	p.send("\x04")
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("grsh exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		p.mu.Lock()
+		pending := p.out.String()
+		p.mu.Unlock()
+		t.Fatalf("grsh did not exit on ^D; pending output:\n%q", pending)
 	}
 }
 

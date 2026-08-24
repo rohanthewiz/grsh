@@ -483,9 +483,17 @@ shell sees 40
 - **Continuation** — the `... ` prompt appears while the input unit is
   incomplete: an open `{` block or composite literal, a Go line ending
   mid-expression, a pending heredoc body, or a shell line ending in
-  `\`, `|`, `&&`, `||`. Open Go blocks show a **construct breadcrumb
-  and auto-indent**: `... func greet ▸ for ▸     ` — you always know
-  what you're inside of and how deep.
+  `\`, `|`, `&&`, `||`. Open Go blocks show a **construct breadcrumb**
+  (`… func greet ▸ for`) below the input, and **auto-indent** seeds
+  each new line with two real spaces per open block; typing `}` as the
+  first character of such a line dedents it one level, gofmt-style.
+  Heredoc bodies are never auto-indented — their lines are literal.
+- **Syntax highlighting** — live, classifier-aware: Go lines color
+  keywords, strings, numbers, and comments; shell lines color the
+  command word green if it resolves (builtin, `$PATH`, alias, explicit
+  path) and red if it doesn't, plus flags, `$variables`, quoted
+  strings, and comments. `{go interpolations}` inside shell lines stay
+  plain. Disabled under `NO_COLOR`, `TERM=dumb`, or a non-terminal.
 - **History** — per-line recall in `~/.grsh_history` (arrow keys,
   Ctrl+R); complete input units (a whole `func` block is one unit) are
   additionally persisted to `~/.grsh_units`, which backs

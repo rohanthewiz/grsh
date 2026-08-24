@@ -37,6 +37,15 @@ func TestReefConfigGuards(t *testing.T) {
 			t.Errorf("%s ^Z bound to %q, want grsh-noop", km, got)
 		}
 	}
+	// } dedents where it self-inserts; vi-command keeps its paragraph motion.
+	for _, km := range []string{"emacs", "vi-insert"} {
+		if got := cfg.Binds[km]["}"].Action; got != "grsh-electric-brace" {
+			t.Errorf("%s } bound to %q, want grsh-electric-brace", km, got)
+		}
+	}
+	if got := cfg.Binds["vi-command"]["}"].Action; got == "grsh-electric-brace" {
+		t.Error("vi-command } must stay a motion, not the electric brace")
+	}
 }
 
 // TestUnitSource checks the history adapter contract: reads come from the
@@ -83,5 +92,89 @@ func TestReefAcceptMultiline(t *testing.T) {
 	}
 	if !rd.rl.AcceptMultiline([]rune("echo hi")) {
 		t.Error("plain shell line should be accepted")
+	}
+}
+
+// setBuffer loads the shell's real line buffer and puts the cursor at pos
+// — AcceptMultiline and the electric-brace command read both, not just
+// their argument.
+func setBuffer(rd *reefReader, text string, pos int) {
+	line, cur := rd.rl.Line(), rd.rl.Cursor()
+	if n := line.Len(); n > 0 {
+		line.Cut(0, n)
+	}
+	line.Insert(0, []rune(text)...)
+	cur.Set(pos)
+}
+
+// TestReefAutoIndent: Enter (the overridden accept-line command) inside
+// an open block must insert the newline plus depth×2 spaces as one buffer
+// edit — and must NOT indent inside a heredoc body, where seeded spaces
+// would become literal content and an indented delimiter line would never
+// terminate the unit.
+func TestReefAutoIndent(t *testing.T) {
+	cases := []struct {
+		name string
+		buf  string
+		want string // expected buffer after the override's own path
+	}{
+		{"depth 1", "func f() {", "func f() {\n  "},
+		{"depth 2", "func f() {\nif true {", "func f() {\nif true {\n    "},
+		{"heredoc: newline only", "cat <<EOF", "cat <<EOF\n"},
+		{"heredoc inside block: newline only", "func f() {\nsh cat <<EOF", "func f() {\nsh cat <<EOF\n"},
+		{"shell continuation: no depth", "echo a &&", "echo a &&\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rd := newTestReefReader(t)
+			setBuffer(rd, tc.buf, len([]rune(tc.buf)))
+			rd.rl.Keymap.Commands()["accept-line"]()
+			if got := string(*rd.rl.Line()); got != tc.want {
+				t.Errorf("buffer = %q, want %q", got, tc.want)
+			}
+			if pos, want := rd.rl.Cursor().Pos(), len([]rune(tc.want)); pos != want {
+				t.Errorf("cursor = %d, want %d (after the indent)", pos, want)
+			}
+		})
+	}
+
+	// Enter mid-buffer indents for the depth at the cursor, not the end.
+	rd := newTestReefReader(t)
+	buf := "func f() {\nif true {\n}"
+	setBuffer(rd, buf, len("func f() {")) // cursor right after the first {
+	rd.rl.Keymap.Commands()["accept-line"]()
+	want := "func f() {\n  \nif true {\n}"
+	if got := string(*rd.rl.Line()); got != want {
+		t.Errorf("mid-buffer = %q, want %q (depth-1 indent at the cursor)", got, want)
+	}
+}
+
+// TestReefElectricBrace: } typed on a line of pure indentation closes the
+// block one level back (gofmt style); anywhere else, and inside heredoc
+// bodies, it is a plain insert.
+func TestReefElectricBrace(t *testing.T) {
+	cases := []struct {
+		name     string
+		buf      string
+		wantLine string
+	}{
+		{"dedents seeded indent", "func f() {\n  ", "func f() {\n}"},
+		{"dedents one level only", "func f() {\nif true {\n    ", "func f() {\nif true {\n  }"},
+		{"plain insert mid-line", "x := map[string]int{", "x := map[string]int{}"},
+		{"plain insert at column 0", "func f() {\n", "func f() {\n}"},
+		{"heredoc body keeps its spaces", "cat <<EOF\n  ", "cat <<EOF\n  }"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rd := newTestReefReader(t)
+			setBuffer(rd, tc.buf, len([]rune(tc.buf)))
+			rd.rl.Keymap.Commands()["grsh-electric-brace"]()
+			if got := string(*rd.rl.Line()); got != tc.wantLine {
+				t.Errorf("line = %q, want %q", got, tc.wantLine)
+			}
+			if pos, want := rd.rl.Cursor().Pos(), len([]rune(tc.wantLine)); pos != want {
+				t.Errorf("cursor = %d, want %d (after the brace)", pos, want)
+			}
+		})
 	}
 }

@@ -36,6 +36,10 @@ type PendingInfo struct {
 	NeedsMore  bool
 	Depth      int
 	Constructs []string
+	// Heredoc marks incompleteness caused by an unterminated heredoc.
+	// Auto-indent must stay off in that state: seeded spaces would land in
+	// the literal body, and an indented delimiter line would never match.
+	Heredoc bool
 }
 
 // Pending speculatively classifies src on a clone (c is not mutated) and
@@ -50,6 +54,7 @@ func (c *Classifier) Pending(src string) PendingInfo {
 		// Mid-statement Go or an unterminated heredoc: incomplete. Any
 		// other classify error is "complete" — Eval will report it.
 		info.NeedsMore = errors.Is(err, ErrIncomplete)
+		info.Heredoc = errors.Is(err, ErrHeredoc)
 		return info
 	}
 	if cc.depth > 0 {
@@ -73,6 +78,15 @@ func (c *Classifier) Pending(src string) PendingInfo {
 // NeedsMore reports whether src is an incomplete REPL input unit.
 func (c *Classifier) NeedsMore(src string) bool {
 	return c.Pending(src).NeedsMore
+}
+
+// Preview chunk-maps src for display (syntax highlighting). It runs on a
+// clone — c is never mutated — and never fails: an incomplete trailing
+// unit (the norm while the user is typing) comes back as File's
+// best-effort tail chunk, so every physical line has a Kind to render.
+func (c *Classifier) Preview(src string) []Chunk {
+	chunks, _ := c.Clone().File(src)
+	return chunks
 }
 
 // Names lists every identifier visible in the current scope chain plus the

@@ -27,6 +27,10 @@ type completer struct {
 
 	pathOnce sync.Once
 	pathCmds []string
+	// cmdSet is the membership view of pathCmds plus shell builtins,
+	// built in the same $PATH scan — the syntax highlighter's known/
+	// unknown command check runs on every display refresh.
+	cmdSet map[string]bool
 }
 
 func newCompleter(idents func() []string) *completer {
@@ -194,6 +198,29 @@ func (c *completer) commands() []string {
 				c.pathCmds = append(c.pathCmds, name)
 			}
 		}
+		for _, b := range shellexec.BuiltinNames() {
+			seen[b] = true
+		}
+		c.cmdSet = seen
 	})
 	return c.pathCmds
+}
+
+// knownCommand reports whether name would resolve at a command position:
+// a shell builtin, a $PATH executable, or an explicit path (contains '/')
+// to an executable file. Aliases are the session's business — the caller
+// checks those separately.
+func (c *completer) knownCommand(name string) bool {
+	if strings.ContainsRune(name, '/') {
+		lookup := name
+		if strings.HasPrefix(name, "~") {
+			if home, err := os.UserHomeDir(); err == nil {
+				lookup = home + name[1:]
+			}
+		}
+		info, err := os.Stat(lookup)
+		return err == nil && !info.IsDir() && info.Mode()&0111 != 0
+	}
+	c.commands() // ensure the $PATH scan ran
+	return c.cmdSet[name]
 }

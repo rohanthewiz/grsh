@@ -35,6 +35,11 @@ import (
 	"github.com/rohanthewiz/grsh/internal/runner"
 )
 
+// indentUnit is one auto-indent level: two spaces per open block, the
+// same visual step the legacy continuation prompt used. Spaces, not tabs
+// — a fed tab rune would dispatch as the completion key.
+const indentUnit = "  "
+
 // reefReader adapts reeflective/readline to the loop's lineReader seam.
 type reefReader struct {
 	rl *reef.Shell
@@ -56,6 +61,9 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 
 	// The classifier decides when Enter submits: incomplete units insert a
 	// newline and keep editing in-buffer instead of returning fragments.
+	// (With the accept-line override below this is only consulted on the
+	// delegated stock path — search modes and the like — where a bare
+	// newline without indent is the acceptable degraded behavior.)
 	r.rl.AcceptMultiline = func(line []rune) bool {
 		return !sess.Pending(string(line)).NeedsMore
 	}
@@ -77,6 +85,12 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 	})
 
 	r.rl.Completer = comp.completeReef
+
+	// Syntax highlighting, only when the session is color-worthy (same
+	// gate as the prompt: NO_COLOR, dumb terminals, non-terminals opt out).
+	if colorEnabled() {
+		r.rl.SyntaxHighlighter = newHighlighter(sess, comp).highlight
+	}
 
 	// Recall is backed by the unit store: up-arrow restores a whole
 	// multi-line func as one editable buffer — the legacy editor could
@@ -118,11 +132,78 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 			r.rl.History.Accept(false, false, reef.ErrInterrupt)
 		},
 		"grsh-noop": func() {},
+		// Electric closing brace: when } is the first non-space character
+		// on its line, drop one indent level first — Enter's auto-indent
+		// seeds body depth, so the brace that CLOSES the block belongs one
+		// level back (gofmt style). Anywhere else it is a plain insert.
+		// Off inside heredoc bodies, where leading spaces are content.
+		"grsh-electric-brace": func() {
+			line, cur := r.rl.Line(), r.rl.Cursor()
+			pos := cur.Pos()
+			start := pos
+			for start > 0 && (*line)[start-1] != '\n' {
+				start--
+			}
+			prefix := string((*line)[start:pos])
+			if len(prefix) >= len(indentUnit) && strings.Trim(prefix, " ") == "" &&
+				!sess.Pending(string((*line)[:pos])).Heredoc {
+				line.Cut(pos-len(indentUnit), pos)
+				cur.Set(pos - len(indentUnit))
+			}
+			cur.InsertAt('}')
+		},
 	})
 	for _, km := range []string{"emacs", "vi-insert", "vi-command"} {
 		_ = r.rl.Config.Bind(km, "\x03", "grsh-interrupt", false)
 		_ = r.rl.Config.Bind(km, "\x1a", "grsh-noop", false)
 	}
+	// } dedents only where it would self-insert; in vi-command it stays a
+	// paragraph motion.
+	for _, km := range []string{"emacs", "vi-insert"} {
+		_ = r.rl.Config.Bind(km, "}", "grsh-electric-brace", false)
+	}
+
+	// Auto-indent, via an accept-line override rather than the tempting
+	// Keys.Feed of spaces: fed macro keys lose the race against type-ahead
+	// already sitting in the input buffer (the key stack serves buffered
+	// bytes before macro keys), so a fast `{`⏎`}`⏎ leaked the indent into
+	// a LATER prompt. Overriding the command makes the newline and its
+	// indent one synchronous buffer edit during the Enter dispatch — no
+	// ordering to lose, and it works in every keymap, vi-command included.
+	//
+	// The stock command (captured before the override lands in the same
+	// registry) still runs for everything this doesn't own: complete units,
+	// and any active local mode (isearch, completion menu), where the line
+	// buffer isn't plainly editable. On those delegated paths the
+	// AcceptMultiline callback above provides the stock bare-newline
+	// continuation. Known blind spot, accepted: non-incremental history
+	// search sets no local keymap and is invisible from the public API, so
+	// an Enter there on an incomplete buffer indents instead of accepting
+	// the search — obscure mode, recoverable outcome.
+	acceptLine := r.rl.Keymap.Commands()["accept-line"]
+	r.rl.Keymap.Register(map[string]func(){
+		"accept-line": func() {
+			if string(r.rl.Keymap.Local()) == "" {
+				line, cur := r.rl.Line(), r.rl.Cursor()
+				if pend := sess.Pending(string(*line)); pend.NeedsMore {
+					ind := pend
+					if pos := cur.Pos(); pos < line.Len() {
+						// Enter mid-buffer: indent for the depth at the
+						// cursor, not at the end of the buffer.
+						ind = sess.Pending(string((*line)[:pos]))
+					}
+					depth := 0
+					if !ind.Heredoc { // heredoc bodies are literal: never indent
+						depth = ind.Depth
+					}
+					cur.InsertAt(append([]rune{'\n'},
+						[]rune(strings.Repeat(indentUnit, depth))...)...)
+					return
+				}
+			}
+			acceptLine()
+		},
+	})
 
 	return r
 }
