@@ -46,7 +46,10 @@ func runBuiltin(st *State, name string, args []string, stdio Stdio) (int, error)
 		}
 		return 0, nil
 	case "exit":
-		code := 0
+		// Bare `exit` propagates the last command's status (bash's
+		// `exit` is defined as `exit $?`), so `false` then `exit`
+		// leaves the caller seeing 1.
+		code := st.LastStatus
 		if len(args) > 0 {
 			n, err := strconv.Atoi(args[0])
 			if err != nil {

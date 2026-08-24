@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chzyer/readline"
 	"github.com/rohanthewiz/grsh/internal/runner"
 	"github.com/rohanthewiz/serr"
 )
@@ -243,7 +242,7 @@ func TestLoopRuntimeErrorContinues(t *testing.T) {
 func TestLoopInterruptDropsContinuation(t *testing.T) {
 	stdout, _, code, _ := run(t,
 		step{line: "if true {"},
-		step{line: "", err: readline.ErrInterrupt},
+		step{line: "", err: errInterrupt},
 		step{line: `fmt.Println("fresh")`},
 	)
 	if code != 0 {

@@ -59,6 +59,9 @@ func (h *historyStore) Append(unit string) {
 // Units returns all stored units, oldest first.
 func (h *historyStore) Units() []string { return h.units }
 
+// LenUnits returns the number of stored units.
+func (h *historyStore) LenUnits() int { return len(h.units) }
+
 // SessionUnits returns only the units entered in this session.
 func (h *historyStore) SessionUnits() []string { return h.units[h.sessionStart:] }
 

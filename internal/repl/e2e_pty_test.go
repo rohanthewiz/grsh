@@ -1,0 +1,280 @@
+//go:build darwin
+
+package repl
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+// This file is the end-to-end verification for the reeflective editor
+// swap: it builds the real grsh binary, attaches it to a pty as its
+// controlling terminal, and drives an interactive session with paced
+// writes (each step waits for expected output before typing the next —
+// readline must never be fed input it hasn't painted a prompt for).
+
+// openPTYPair opens a master/slave pty pair via the BSD /dev/ptmx
+// protocol (same helper pattern as shellexec's tty_test.go).
+func openPTYPair(t *testing.T) (master, slave *os.File) {
+	t.Helper()
+	m, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("no pty available: %v", err)
+	}
+	fd := m.Fd()
+	if _, _, e := unix.Syscall(unix.SYS_IOCTL, fd, unix.TIOCPTYGRANT, 0); e != 0 {
+		m.Close()
+		t.Skipf("pty grant failed: %v", e)
+	}
+	if _, _, e := unix.Syscall(unix.SYS_IOCTL, fd, unix.TIOCPTYUNLK, 0); e != 0 {
+		m.Close()
+		t.Skipf("pty unlock failed: %v", e)
+	}
+	var buf [128]byte
+	if _, _, e := unix.Syscall(unix.SYS_IOCTL, fd, unix.TIOCPTYGNAME, uintptr(unsafe.Pointer(&buf[0]))); e != 0 {
+		m.Close()
+		t.Skipf("pty name failed: %v", e)
+	}
+	name := string(buf[:bytes.IndexByte(buf[:], 0)])
+	s, err := os.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		m.Close()
+		t.Skipf("open pty slave: %v", err)
+	}
+	// The display engine needs a real window size; a fresh pty reports
+	// 0x0, which breaks line-wrap math.
+	ws := unix.Winsize{Row: 40, Col: 120}
+	_ = unix.IoctlSetWinsize(int(fd), unix.TIOCSWINSZ, &ws)
+	t.Cleanup(func() { m.Close(); s.Close() })
+	return m, s
+}
+
+// buildGrsh compiles the grsh binary once per test run.
+func buildGrsh(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "grsh")
+	cmd := exec.Command("go", "build", "-o", bin, "../../cmd/grsh")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build grsh: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// ptyShell accumulates everything the shell writes to the pty and lets
+// steps block until an expected substring appears.
+type ptyShell struct {
+	t      *testing.T
+	master *os.File
+	mu     sync.Mutex
+	out    bytes.Buffer
+	cmd    *exec.Cmd
+	// writeMu serializes test keystrokes with the DSR responder: both
+	// write to the master, and an unserialized reply could land BETWEEN
+	// the bytes of one UTF-8 rune, corrupting the key stream mid-char.
+	writeMu sync.Mutex
+}
+
+func startShell(t *testing.T, env ...string) *ptyShell {
+	t.Helper()
+	bin := buildGrsh(t)
+	master, slave := openPTYPair(t)
+
+	cmd := exec.Command(bin)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+	// New session with the pty as controlling terminal — job control and
+	// raw-mode handling need the real thing, not just tty-shaped stdio.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	cmd.Env = append([]string{
+		"HOME=" + t.TempDir(), // isolate rc files and history
+		"PATH=" + os.Getenv("PATH"),
+		"TERM=xterm-256color",
+	}, env...)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start grsh: %v", err)
+	}
+	p := &ptyShell{t: t, master: master, cmd: cmd}
+	go func() {
+		buf := make([]byte, 4096)
+		var tail []byte // carry partial DSR sequences across read boundaries
+		for {
+			n, err := master.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				p.mu.Lock()
+				p.out.Write(chunk)
+				p.mu.Unlock()
+				// The editor probes the cursor position with DSR (ESC[6n)
+				// and blocks until the terminal answers. A real emulator
+				// replies automatically; this harness must play terminal.
+				// Scan tail+chunk so a request split across reads is
+				// still seen exactly once.
+				scan := append(tail, chunk...)
+				replies := strings.Count(string(scan), "\x1b[6n")
+				if keep := len(scan); keep > 3 {
+					tail = append(tail[:0], scan[keep-3:]...)
+				} else {
+					tail = append(tail[:0], scan...)
+				}
+				p.writeMu.Lock()
+				for range replies {
+					_, _ = master.WriteString("\x1b[1;1R")
+				}
+				p.writeMu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return p
+}
+
+func (p *ptyShell) send(s string) {
+	p.t.Helper()
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if _, err := p.master.WriteString(s); err != nil {
+		p.t.Fatalf("write %q: %v", s, err)
+	}
+}
+
+// waitFor blocks until want appears in output produced AFTER the previous
+// waitFor match (a moving offset — prompts repeat, so matching the whole
+// transcript would race earlier occurrences).
+func (p *ptyShell) waitFor(want string) {
+	p.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		if i := strings.Index(p.out.String(), want); i >= 0 {
+			// Consume through the match so the next waitFor starts after it.
+			p.out.Next(i + len(want))
+			p.mu.Unlock()
+			return
+		}
+		p.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+	p.mu.Lock()
+	got := p.out.String()
+	p.mu.Unlock()
+	p.t.Fatalf("timeout waiting for %q; pending output:\n%s", want, got)
+}
+
+// TestReefEditorEndToEnd drives the default (reeflective) editor through
+// the behaviors the editor swap must preserve: eval, multiline units with
+// classifier-driven acceptance, ^C recovery, ^Z inertness at the prompt,
+// and ^D exit with the last command's status.
+func TestReefEditorEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	p := startShell(t)
+
+	p.waitFor("Ctrl+D to quit") // banner
+	p.waitFor("grsh ")          // first prompt
+
+	// Go eval round-trip. (Bare `x + 1` is deliberately shell by the
+	// classifier's rules — Go usage needs a selector/assign/call shape.)
+	p.send("x := 41\r")
+	p.waitFor("grsh ")
+	p.send("fmt.Println(x + 1)\r")
+	p.waitFor("42")
+	p.waitFor("grsh ")
+
+	// NOTE on markers: every assertion below waits for output only EVAL
+	// can produce. Keystroke echo (and reeflective's full-buffer repaints)
+	// replay the typed source many times, so expected strings are built
+	// by concatenation — the contiguous result never appears in the echo.
+
+	// Multiline unit: Enter inside an open func must continue in-buffer.
+	// The construct-breadcrumb hint below the input proves AcceptMultiline
+	// consulted the classifier and the unit is pending.
+	p.send("func hi() string {\r")
+	p.waitFor("… func hi")
+	p.send("return \"yo-\" + \"ho\"\r")
+	p.send("}\r")
+	p.send("fmt.Println(hi())\r")
+	p.waitFor("yo-ho")
+
+	// Shell leg still works through the same editor (external command;
+	// %s formatting keeps the result out of the echo).
+	p.send("printf 'sh%s\\n' ell-ok\r")
+	p.waitFor("shell-ok")
+
+	// ^C mid-line drops the input; the shell must survive and keep
+	// evaluating — and the dropped text must NOT execute.
+	p.send("echo doomed")
+	p.send("\x03")
+	p.send("fmt.Println(\"al\" + \"ive\")\r")
+	p.waitFor("alive")
+
+	// ^Z at the prompt is inert (bound to abort): no parent SIGTSTP, no
+	// literal SUB byte in the buffer.
+	p.send("\x1a")
+	p.send("fmt.Println(\"after\" + \"-tstp\")\r")
+	p.waitFor("after-tstp")
+
+	// Unicode / wide runes through the editor and eval.
+	p.send("wide := \"héllo — 世\" + \"界\"\r")
+	p.send("fmt.Println(wide)\r")
+	p.waitFor("héllo — 世界")
+
+	// ^D on an empty line exits with the last status (0 here).
+	p.send("true\r")
+	p.waitFor("grsh ")
+	p.send("\x04")
+
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("grsh exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("grsh did not exit on ^D")
+	}
+}
+
+// TestReefEditorNonzeroExitStatus checks the ^D exit code carries the
+// last command's status, matching script semantics.
+func TestReefEditorNonzeroExitStatus(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	p := startShell(t)
+	p.waitFor("grsh ")
+	p.send("false\r")
+	p.waitFor("[1]") // prompt flags the failed status
+	p.send("exit\r")
+
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		var xe *exec.ExitError
+		if err == nil {
+			t.Fatal("expected nonzero exit status")
+		} else if !errors.As(err, &xe) || xe.ExitCode() != 1 {
+			t.Fatalf("want exit 1, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("grsh did not exit")
+	}
+}

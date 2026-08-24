@@ -33,11 +33,15 @@ func newCompleter(idents func() []string) *completer {
 	return &completer{idents: idents}
 }
 
-func (c *completer) Do(line []rune, pos int) ([][]rune, int) {
-	before := string(line[:pos])
-	word := currentWord(before)
+// matches returns the word being completed (the run of non-space
+// characters before the cursor) and the full-form candidates completing
+// it, deduped and sorted. Both editor adapters share this; only the
+// insertion shaping differs — chzyer wants the suffix after the typed
+// word (Do), reeflective wants whole candidates (completeReef).
+func (c *completer) matches(before string) (word string, out []string) {
+	word = currentWord(before)
 	if word == "" {
-		return nil, 0
+		return "", nil
 	}
 
 	var cands []string
@@ -57,19 +61,29 @@ func (c *completer) Do(line []rune, pos int) ([][]rune, int) {
 	}
 
 	seen := map[string]bool{}
-	var out [][]rune
 	for _, cand := range cands {
 		if !strings.HasPrefix(cand, word) || seen[cand] {
 			continue
 		}
 		seen[cand] = true
-		suffix := cand[len(word):]
-		if !strings.HasSuffix(cand, "/") {
-			suffix += " "
+		out = append(out, cand)
+	}
+	// All candidates share the word prefix, so full-string order equals
+	// the suffix order the chzyer path historically presented.
+	sort.Strings(out)
+	return word, out
+}
+
+func (c *completer) Do(line []rune, pos int) ([][]rune, int) {
+	word, matches := c.matches(string(line[:pos]))
+	var out [][]rune
+	for _, m := range matches {
+		suffix := m[len(word):]
+		if !strings.HasSuffix(m, "/") {
+			suffix += " " // completed words are terminal; directories chain
 		}
 		out = append(out, []rune(suffix))
 	}
-	sort.Slice(out, func(i, j int) bool { return string(out[i]) < string(out[j]) })
 	return out, len([]rune(word))
 }
 

@@ -22,10 +22,28 @@ import (
 	"github.com/rohanthewiz/grsh/internal/shellexec"
 )
 
-// lineReader abstracts chzyer/readline so the loop is testable.
+// lineReader abstracts the line editor so the loop is testable and the
+// editor is swappable (reeflective by default, chzyer as legacy).
 type lineReader interface {
 	Readline() (string, error)
 	SetPrompt(string)
+}
+
+// errInterrupt is the loop's editor-neutral Ctrl-C sentinel: each editor
+// adapter translates its library's interrupt error onto it so the loop
+// needn't know which readline is driving.
+var errInterrupt = errors.New("interrupt")
+
+// chzyerReader wraps the legacy chzyer editor, translating its interrupt
+// sentinel. Everything else (SetPrompt, EOF as io.EOF) passes through.
+type chzyerReader struct{ *readline.Instance }
+
+func (c chzyerReader) Readline() (string, error) {
+	line, err := c.Instance.Readline()
+	if errors.Is(err, readline.ErrInterrupt) {
+		return line, errInterrupt
+	}
+	return line, err
 }
 
 // Run drives the interactive session and returns the process exit code.
@@ -39,27 +57,40 @@ func Run(sess *runner.Session, version string, noRC bool) int {
 			return code
 		}
 	}
-	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          promptFor(sess, false, classify.PendingInfo{}),
-		HistoryFile:     historyPath(),
-		AutoComplete:    newCompleter(sess.Idents),
-		InterruptPrompt: "^C",
-		EOFPrompt:       "exit",
-		// Drop ^Z at the prompt: readline's default handler SIGTSTPs the
-		// PARENT process on macOS — suspending the user's outer shell.
-		// ^Z during a foreground command suspends that job instead.
-		FuncFilterInputRune: func(r rune) (rune, bool) {
-			if r == readline.CharCtrlZ {
-				return r, false
-			}
-			return r, true
-		},
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "grsh: %v\n", err)
-		return 2
+
+	hist := openHistory(unitHistoryPath())
+	comp := newCompleter(sess.Idents)
+
+	// Editor selection: reeflective is the default; GRSH_EDITOR=legacy
+	// keeps chzyer available as the escape hatch while the new editor
+	// proves itself as a daily driver.
+	var rd lineReader
+	if legacyEditor() {
+		rl, err := readline.NewEx(&readline.Config{
+			Prompt:          promptFor(sess, false, classify.PendingInfo{}),
+			HistoryFile:     historyPath(),
+			AutoComplete:    comp,
+			InterruptPrompt: "^C",
+			EOFPrompt:       "exit",
+			// Drop ^Z at the prompt: readline's default handler SIGTSTPs the
+			// PARENT process on macOS — suspending the user's outer shell.
+			// ^Z during a foreground command suspends that job instead.
+			FuncFilterInputRune: func(r rune) (rune, bool) {
+				if r == readline.CharCtrlZ {
+					return r, false
+				}
+				return r, true
+			},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "grsh: %v\n", err)
+			return 2
+		}
+		defer rl.Close()
+		rd = chzyerReader{rl}
+	} else {
+		rd = newReefReader(sess, comp, hist)
 	}
-	defer rl.Close()
 
 	// The terminal is in cooked mode while a command runs (readline is raw
 	// only inside Readline), so Ctrl+C sends SIGINT to the whole foreground
@@ -80,7 +111,16 @@ func Run(sess *runner.Session, version string, noRC bool) int {
 	sess.SetInteractive(true)
 
 	fmt.Printf("grsh %s — type exit or Ctrl+D to quit\n", version)
-	return loop(sess, rl, os.Stdout, os.Stderr, openHistory(unitHistoryPath()))
+	return loop(sess, rd, os.Stdout, os.Stderr, hist)
+}
+
+// legacyEditor reports whether the user asked for the chzyer editor.
+func legacyEditor() bool {
+	switch os.Getenv("GRSH_EDITOR") {
+	case "legacy", "chzyer":
+		return true
+	}
+	return false
 }
 
 func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *historyStore) int {
@@ -95,7 +135,7 @@ func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *histo
 		rd.SetPrompt(promptFor(sess, len(buf) > 0, pend))
 		line, err := rd.Readline()
 		switch {
-		case errors.Is(err, readline.ErrInterrupt):
+		case errors.Is(err, errInterrupt):
 			buf, pend = buf[:0], classify.PendingInfo{} // ^C drops any pending continuation
 			continue
 		case errors.Is(err, io.EOF):
