@@ -29,10 +29,16 @@ import (
 //  1. ns/op then reads directly as "how long the shell is busy after I press
 //     a key" — comparable against the ~16ms frame budget without arithmetic.
 //  2. The highlighter, hinter and suggester each memoize on the buffer
-//     string (highlight.go:66, hint.go:78, suggest.go:42). Re-rendering a
-//     fixed buffer would hit the memo every iteration and measure a map
-//     lookup. Typing is precisely what defeats those memos, so the
-//     benchmark must type.
+//     string (highlightSrc, hintSrc, suggest). Re-rendering a fixed buffer
+//     would hit the memo every iteration and measure a map lookup. Typing
+//     is precisely what defeats those memos, so the benchmark must type.
+//
+// Every buffer goes through a runeIntern first, because that is what the
+// reader does (editor_reef.go's hintProvider) -- one []rune->string
+// conversion per frame, shared by all three consumers. Calling the
+// rune-taking wrappers instead would measure a conversion per lane that
+// the display path does not pay, and would hide the memo-hit floor
+// entirely.
 //
 // Calling reset() to defeat the memo would be the other option and is
 // wrong: the editor never resets mid-line (only at a fresh prompt), so it
@@ -138,9 +144,10 @@ func BenchmarkKeystrokeHighlight(b *testing.B) {
 			sess := benchSession(b)
 			h := newHighlighter(sess, newCompleter(sess.Idents))
 			prefixes := keystrokePrefixes(sh.base, sh.typed)
+			var buf runeIntern
 			b.ReportAllocs()
 			for i := 0; b.Loop(); i++ {
-				h.highlight([]rune(prefixes[i%len(prefixes)]))
+				h.highlightSrc(buf.str([]rune(prefixes[i%len(prefixes)])))
 			}
 		})
 	}
@@ -159,10 +166,12 @@ func BenchmarkKeystrokeHint(b *testing.B) {
 		b.Run(sh.name, func(b *testing.B) {
 			h := newHinter(benchSession(b))
 			prefixes := keystrokePrefixes(sh.base, sh.typed)
+			var buf runeIntern
 			b.ReportAllocs()
 			for i := 0; b.Loop(); i++ {
 				line := []rune(prefixes[i%len(prefixes)])
-				h.hint(line, len(line)) // cursor at end: typing, not navigating
+				// Cursor at end: typing, not navigating.
+				h.hintSrc(buf.str(line), len(line))
 			}
 		})
 	}
@@ -209,13 +218,16 @@ func BenchmarkKeystrokeFrame(b *testing.B) {
 			sug := newSuggester(hist)
 
 			prefixes := keystrokePrefixes(sh.base, sh.typed)
+			var buf runeIntern
 			b.ReportAllocs()
 			for i := 0; b.Loop(); i++ {
-				src := prefixes[i%len(prefixes)]
-				line := []rune(src)
-				h.highlight(line)
-				hint.hint(line, len(line))
+				line := []rune(prefixes[i%len(prefixes)])
+				// The order the display engine runs them in, over one
+				// shared conversion of the buffer -- see hintProvider.
+				src := buf.str(line)
 				sug.suggest(src)
+				hint.hintSrc(src, len(line))
+				h.highlightSrc(src)
 			}
 		})
 	}
@@ -227,19 +239,26 @@ func BenchmarkKeystrokeFrame(b *testing.B) {
 // against. A large gap between this and the frame benchmark is the memo
 // earning its keep; a small one would mean the memo is not covering the
 // expensive path.
+//
+// This is also where the frame intern shows up. The floor used to be a
+// conversion of the whole buffer per consumer plus a memcmp per memo —
+// 2.6us and 1.2KB on this 20-line buffer, for an answer already in hand.
+// With one shared conversion the runes are compared once and the memo
+// compares are pointer-equal, so an unchanged buffer allocates nothing.
 func BenchmarkKeystrokeMemoHit(b *testing.B) {
 	sess := benchSession(b)
 	h := newHighlighter(sess, newCompleter(sess.Idents))
 	hint := newHinter(sess)
-	src := pendingBlockPrefix() + "\tfmt.Println(step0)"
-	line := []rune(src)
+	line := []rune(pendingBlockPrefix() + "\tfmt.Println(step0)")
+	var buf runeIntern
 
-	h.highlight(line) // prime both memos
-	hint.hint(line, len(line))
+	h.highlightSrc(buf.str(line)) // prime both memos
+	hint.hintSrc(buf.str(line), len(line))
 
 	b.ReportAllocs()
 	for b.Loop() {
-		h.highlight(line)
-		hint.hint(line, len(line))
+		src := buf.str(line)
+		hint.hintSrc(src, len(line))
+		h.highlightSrc(src)
 	}
 }

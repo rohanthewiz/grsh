@@ -330,6 +330,44 @@ func TestReefHintProvider(t *testing.T) {
 	}
 }
 
+// TestReefFrameIsFreeOnAnUnchangedBuffer pins the cursor-only refresh at
+// zero allocations. The display engine re-derives the whole frame on every
+// refresh, including the ones where nothing was typed — arrow keys, a
+// resize, a redraw — and every lane in it memoizes on the buffer. Before
+// the frame intern each lane still converted the []rune buffer to reach its
+// own memo, so the "nothing changed" path allocated the buffer several
+// times over.
+//
+// The guard is allocations rather than time because that is where the
+// defect lived, and because a wall-clock bound on a sub-microsecond path
+// would flake. A regression here means someone reintroduced a per-lane
+// string(line) — the frame still works, it just churns.
+func TestReefFrameIsFreeOnAnUnchangedBuffer(t *testing.T) {
+	sess := runner.NewSession(runner.Options{})
+	rd := withGhost(newReefReader(sess, newCompleter(sess.Idents), openHistory("")),
+		"echo something else entirely")
+	// Color is off under `go test`, so newReefReader never built the
+	// highlighter; wire it up to measure the full frame the editor runs.
+	rd.hl = newHighlighter(sess, newCompleter(sess.Idents))
+
+	// A plain complete line: no hint (the lane returns nil rather than a
+	// fresh []rune) and no ghost (nothing in history shares the prefix), so
+	// what remains to be measured is the derivation itself.
+	buf := "echo hi"
+	line := []rune(buf)
+	setBuffer(rd, buf, len(line))
+
+	frame := func() {
+		rd.hintProvider(line, len(line))
+		rd.highlight(line)
+	}
+	frame() // prime every memo in the lane
+
+	if n := testing.AllocsPerRun(50, frame); n != 0 {
+		t.Errorf("an unchanged frame allocated %v times, want 0", n)
+	}
+}
+
 // TestReefForwardWordAcceptsGhost: a forward-word key takes the next word of
 // the suggestion when one applies, and is a plain motion otherwise.
 func TestReefForwardWordAcceptsGhost(t *testing.T) {

@@ -58,6 +58,13 @@ type reefReader struct {
 	// hints builds the line under the buffer: signature help, alias
 	// expansion, and the open-construct breadcrumb (see hint.go).
 	hints *hinter
+	// hl paints the buffer, or nil when color is off (see newReefReader).
+	// Held on the reader rather than handed straight to the library so the
+	// highlight callback can go through buf first.
+	hl *highlighter
+	// buf converts the editor's []rune buffer to a string once per frame
+	// and shares that one string with every consumer (see intern.go).
+	buf runeIntern
 	// ghost is the inline-autosuggestion matcher, or nil when ghost text is
 	// disabled (see the colorEnabled gate in newReefReader).
 	ghost *suggester
@@ -98,7 +105,7 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 	// delegated stock path — search modes and the like — where a bare
 	// newline without indent is the acceptable degraded behavior.)
 	r.rl.AcceptMultiline = func(line []rune) bool {
-		accept := !sess.Pending(string(line)).NeedsMore
+		accept := !sess.Pending(r.buf.str(line)).NeedsMore
 		// Take the ghost down on the way out. This callback is the library's
 		// last step before Display.AcceptLine on every acceptance path, and
 		// AcceptLine's coordinate pass measures the line INCLUDING the inline
@@ -127,7 +134,8 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 	// Syntax highlighting, only when the session is color-worthy (same
 	// gate as the prompt: NO_COLOR, dumb terminals, non-terminals opt out).
 	if r.color {
-		r.rl.SyntaxHighlighter = newHighlighter(sess, comp).highlight
+		r.hl = newHighlighter(sess, comp)
+		r.rl.SyntaxHighlighter = r.highlight
 		// Ghost text rides the same gate: the library paints the suggestion
 		// with a hardcoded dim/gray SGR run, so with color suppressed it
 		// would be indistinguishable from text the user actually typed.
@@ -438,18 +446,31 @@ func promptCols(prompt string) int {
 // hint-lane text and, on the way, refreshes the ghost text — see
 // newReefReader for why the two share this hook.
 func (r *reefReader) hintProvider(line []rune, pos int) []rune {
-	r.updateGhost(line, pos)
+	// One conversion for both consumers below, and for the highlighter that
+	// runs later in the same frame off the same unchanged buffer.
+	src := r.buf.str(line)
+	r.updateGhost(src, len(line), pos)
 
-	if h := r.hints.hint(line, pos); h != "" {
+	if h := r.hints.hintSrc(src, pos); h != "" {
 		return []rune(h)
 	}
 	return nil // nil, not an empty slice: the lane collapses either way
 }
 
+// highlight is the library's SyntaxHighlighter hook. It runs during the
+// line render, after the hint provider has already interned this frame's
+// buffer, so the conversion here is normally a no-op.
+func (r *reefReader) highlight(line []rune) string {
+	return r.hl.highlightSrc(r.buf.str(line))
+}
+
 // updateGhost recomputes the inline autosuggestion for the frame being
 // rendered. Called from the hint provider (see newReefReader for why that
 // is the right moment), so it runs on the editor's read loop only.
-func (r *reefReader) updateGhost(line []rune, pos int) {
+//
+// src is the interned buffer and n its length in runes; the cursor is a
+// rune index, so end-of-buffer is pos == n.
+func (r *reefReader) updateGhost(src string, n, pos int) {
 	if r.ghost == nil {
 		return
 	}
@@ -462,8 +483,8 @@ func (r *reefReader) updateGhost(line []rune, pos int) {
 	//   - away from the end of the buffer the library refuses to paint or
 	//     accept a suggestion anyway, so skip the history scan entirely.
 	sug := ""
-	if !r.ghostHold && string(r.rl.Keymap.Local()) == "" && pos == len(line) {
-		sug = r.ghost.suggest(string(line))
+	if !r.ghostHold && string(r.rl.Keymap.Local()) == "" && pos == n {
+		sug = r.ghost.suggest(src)
 	}
 	r.rl.SetInlineSuggestion(sug) // "" clears any previous ghost
 }

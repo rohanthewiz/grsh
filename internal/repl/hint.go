@@ -75,21 +75,35 @@ func (h *hinter) reset() { h.memoed = false }
 
 // hint returns the hint-lane text for the frame being rendered, already
 // colored. Empty means "no hint" — the lane collapses.
+//
+// This is the rune-buffer shape the editor's callback signature has. The
+// display path calls hintSrc directly with the frame's already-converted
+// buffer (see runeIntern); this wrapper serves callers holding only runes.
 func (h *hinter) hint(line []rune, pos int) string {
-	src := string(line)
+	return h.hintSrc(string(line), pos)
+}
+
+// hintSrc is hint over the buffer as a string. pos stays a RUNE index --
+// it is the editor's cursor, and the hint lanes are described in terms of
+// where the cursor sits, not which byte it lands on.
+func (h *hinter) hintSrc(src string, pos int) string {
 	if h.memoed && pos == h.lastPos && src == h.lastSrc {
 		return h.lastOut
 	}
-	out := h.render(line, pos)
+	out := h.render(src, pos)
 	h.memoed, h.lastSrc, h.lastPos, h.lastOut = true, src, pos, out
 	return out
 }
 
-func (h *hinter) render(line []rune, pos int) string {
-	if pos < 0 || pos > len(line) {
-		pos = len(line) // defensive: a bad cursor must not panic the display
+func (h *hinter) render(src string, pos int) string {
+	// The cursor-local lanes read the text BEFORE the cursor. Slicing src
+	// rather than re-encoding line[:pos] keeps that free: the prefix shares
+	// src's backing array. A cursor outside the buffer is treated as
+	// end-of-line -- defensive: a bad cursor must not panic the display.
+	prefix := src
+	if pos >= 0 {
+		prefix = runePrefix(src, pos)
 	}
-	src, prefix := string(line), string(line[:pos])
 
 	var parts []string
 	if s := h.cursorHint(src, prefix); s != "" {
@@ -108,6 +122,23 @@ func (h *hinter) render(line []rune, pos int) string {
 		out = "\x1b[2m" + out + "\x1b[0m"
 	}
 	return out
+}
+
+// runePrefix returns src truncated at rune index pos, or all of src when
+// pos is past the end. The result is a slice of src, not a copy -- which is
+// the point: this runs on every frame the hint lane is not memoized for.
+func runePrefix(src string, pos int) string {
+	if pos <= 0 {
+		return ""
+	}
+	n := 0
+	for i := range src { // ranging a string steps by rune, i is the byte offset
+		if n == pos {
+			return src[:i]
+		}
+		n++
+	}
+	return src
 }
 
 // cursorHint is the cursor-local segment: Go signature help when a registry

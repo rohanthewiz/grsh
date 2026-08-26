@@ -61,10 +61,21 @@ func newHighlighter(sess *runner.Session, comp *completer) *highlighter {
 	return &highlighter{sess: sess, comp: comp}
 }
 
-// highlight is the reeflective SyntaxHighlighter hook. It runs on the
-// editor's single read loop, so the memo needs no locking.
+// highlight is the reeflective SyntaxHighlighter hook's shape: a buffer of
+// runes in, painted text out. The editor reaches highlightSrc directly
+// (through the frame's shared runeIntern, so the conversion below is not
+// paid per consumer) -- this wrapper is for callers that hold only runes.
 func (h *highlighter) highlight(line []rune) string {
-	src := string(line)
+	return h.highlightSrc(string(line))
+}
+
+// highlightSrc renders src, memoized: the display engine refreshes on
+// cursor-only movement too, and the buffer is unchanged for those. It runs
+// on the editor's single read loop, so the memo needs no locking.
+//
+// When src comes from the frame intern the compare below is pointer-equal
+// on a hit, so an unchanged buffer costs neither a conversion nor a memcmp.
+func (h *highlighter) highlightSrc(src string) string {
 	if src == h.lastSrc {
 		return h.lastOut
 	}
