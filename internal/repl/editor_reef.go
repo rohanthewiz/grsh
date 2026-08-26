@@ -248,20 +248,34 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 		},
 	})
 
-	// Partial ghost-text acceptance, fish style: a forward-word key takes the
-	// next word of the suggestion instead of moving into empty space. The
-	// whole-suggestion case needs no wiring — the library's forward-char
-	// already falls back to the inline suggestion when the cursor is at the
-	// end of the line, so → and ^F accept it out of the box.
+	// Ghost-text acceptance, fish style. Two of the four keys fish uses come
+	// for free: the library's forward-char already falls back to the inline
+	// suggestion when the cursor is at the end of the line, so → and ^F accept
+	// the whole suggestion out of the box. The other two are wired here —
+	// forward-word takes one word instead of moving into empty space, and
+	// end-of-line takes the whole suggestion instead of being a no-op at a
+	// cursor that is already at the end of the buffer.
 	//
 	// Overriding the COMMAND rather than binding keys means every sequence
-	// that already resolves to forward-word (\ef, \e[1;5C, ...) inherits the
-	// behavior, in whichever keymap the user has it. inline-suggest-accept-word
-	// is a no-op unless a suggestion applies at the cursor, so "did the buffer
-	// grow?" is a sufficient (and library-version-proof) test for whether to
-	// fall through to the plain motion.
+	// that already resolves to it (\ef, \e[1;5C for forward-word; ^E, \e[F and
+	// \eOF for end-of-line) inherits the behavior, in whichever keymap the user
+	// has put it. Both inline-suggest commands are no-ops unless a suggestion
+	// applies at the cursor, so "did the buffer grow?" is a sufficient (and
+	// library-version-proof) test for whether to fall through to the plain
+	// motion — no reaching into the display engine's acceptance gate to
+	// re-derive what it already decided.
+	//
+	// Deliberately NOT overridden: vi-end-of-line ($), which stays a pure
+	// motion in vi-command mode for the same reason grsh-electric-brace is
+	// bound only in the insert keymaps — a command-mode key should not insert
+	// text. (End in vi-command resolves to end-of-line and so reaches this
+	// override, but the engine's own gate requires the cursor to sit AT
+	// line.Len(), which vi-command's cursor never does, so it degrades to the
+	// plain motion on its own.)
+	acceptSuggest := r.rl.Keymap.Commands()["inline-suggest-accept"]
 	acceptSuggestWord := r.rl.Keymap.Commands()["inline-suggest-accept-word"]
 	forwardWord := r.rl.Keymap.Commands()["forward-word"]
+	endOfLine := r.rl.Keymap.Commands()["end-of-line"]
 	r.rl.Keymap.Register(map[string]func(){
 		"forward-word": func() {
 			before := r.rl.Line().Len()
@@ -269,6 +283,17 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 			if r.rl.Line().Len() == before {
 				forwardWord()
 			}
+		},
+		"end-of-line": func() {
+			before := r.rl.Line().Len()
+			acceptSuggest()
+			if r.rl.Line().Len() == before {
+				endOfLine()
+			}
+			// When the suggestion WAS accepted the cursor is already at
+			// line.Len() — end of buffer, hence end of line — so skipping the
+			// motion costs nothing and avoids the multiline surprise of
+			// "accept, then jump to the end of the row below".
 		},
 	})
 

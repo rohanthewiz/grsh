@@ -359,6 +359,51 @@ func TestReefForwardWordAcceptsGhost(t *testing.T) {
 	}
 }
 
+// TestReefEndOfLineAcceptsGhost: ^E / End take the WHOLE suggestion when one
+// applies at the cursor, and stay a plain motion otherwise — including on a
+// multiline buffer, where the engine's acceptance gate (cursor at the end of
+// the whole buffer) is what keeps a mid-buffer End from swallowing the ghost.
+func TestReefEndOfLineAcceptsGhost(t *testing.T) {
+	rd := withGhost(newTestReefReader(t), "echo hello world")
+	setBuffer(rd, "echo", 4)
+	rd.rl.SetInlineSuggestion("echo hello world")
+
+	rd.rl.Keymap.Commands()["end-of-line"]()
+	if got := string(*rd.rl.Line()); got != "echo hello world" {
+		t.Errorf("buffer = %q, want the whole suggestion accepted", got)
+	}
+	if got := rd.rl.Cursor().Pos(); got != rd.rl.Line().Len() {
+		t.Errorf("cursor = %d, want it at the end of the accepted line %d",
+			got, rd.rl.Line().Len())
+	}
+
+	// Nothing suggested: fall through to the stock motion.
+	rd2 := withGhost(newTestReefReader(t))
+	setBuffer(rd2, "echo hi", 0)
+	rd2.rl.Keymap.Commands()["end-of-line"]()
+	if got := string(*rd2.rl.Line()); got != "echo hi" {
+		t.Errorf("buffer = %q, want it unchanged by the motion", got)
+	}
+	if got := rd2.rl.Cursor().Pos(); got != len("echo hi") {
+		t.Errorf("cursor = %d, want the stock motion to reach the line end", got)
+	}
+
+	// Cursor on the FIRST row of a two-row buffer: the suggestion does not
+	// apply there, so End must move to the end of that row and leave the
+	// buffer alone rather than accept.
+	rd3 := withGhost(newTestReefReader(t), "echo one\necho two")
+	setBuffer(rd3, "echo one\necho", 4)
+	rd3.rl.SetInlineSuggestion("echo one\necho two")
+	rd3.rl.Keymap.Commands()["end-of-line"]()
+	if got := string(*rd3.rl.Line()); got != "echo one\necho" {
+		t.Errorf("buffer = %q, want no acceptance from mid-buffer", got)
+	}
+	if got := rd3.rl.Cursor().Pos(); got != len("echo one") {
+		t.Errorf("cursor = %d, want the end of the first row (%d)",
+			got, len("echo one"))
+	}
+}
+
 // TestPromptCols checks the width the gutter is sized against: SGR escapes
 // carry no width, and only the last line of a multi-line prompt shares the
 // row with the input.
