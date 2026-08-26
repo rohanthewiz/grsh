@@ -371,6 +371,59 @@ func TestReefGhostTextEndToEnd(t *testing.T) {
 	}
 }
 
+// TestReefHintLineEndToEnd drives the hint lane through a real pty: typing a
+// registry symbol must print its reflected signature under the input, and an
+// alias name must print its expansion — both dimmed, both without touching
+// the buffer (Enter still runs exactly what was typed).
+//
+// Going through a pty is what proves the lane is real: the hint is painted
+// BELOW the input line, so the display engine has to reserve a row for it and
+// walk back up, and a hint that broke that math would corrupt the prompt
+// rather than merely look wrong.
+func TestReefHintLineEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	p := startShell(t)
+	p.waitFor("Ctrl+D to quit")
+	p.waitFor("grsh ")
+
+	// Signature help: dim (\x1b[2m), reflected from the registry, appearing
+	// while the call is still open.
+	p.send("fmt.Println(strings.ToUpper(")
+	p.waitFor("\x1b[2mstrings.ToUpper(string) string")
+
+	// The hint is display-only: finishing the call runs it unchanged.
+	p.send(`"hi"))` + "\r")
+	p.waitFor("HI")
+	p.waitFor("grsh ")
+
+	// Alias expansion, on the shell side of the same lane.
+	p.send("alias gsay='printf'\r")
+	p.waitFor("grsh ")
+	p.send("gsay")
+	p.waitFor("\x1b[2mgsay → printf")
+
+	p.send(" 'ali%s\\n' as-ran\r")
+	p.waitFor("alias-ran")
+	p.waitFor("grsh ")
+
+	p.send("\x04")
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("grsh exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		p.mu.Lock()
+		pending := p.out.String()
+		p.mu.Unlock()
+		t.Fatalf("grsh did not exit on ^D; pending output:\n%q", pending)
+	}
+}
+
 // TestReefEditorNonzeroExitStatus checks the ^D exit code carries the
 // last command's status, matching script semantics.
 func TestReefEditorNonzeroExitStatus(t *testing.T) {

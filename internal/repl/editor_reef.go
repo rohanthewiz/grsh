@@ -51,6 +51,9 @@ type reefReader struct {
 	// depth, electric brace): they all ask the classifier about the live
 	// buffer.
 	sess *runner.Session
+	// hints builds the line under the buffer: signature help, alias
+	// expansion, and the open-construct breadcrumb (see hint.go).
+	hints *hinter
 	// ghost is the inline-autosuggestion matcher, or nil when ghost text is
 	// disabled (see the colorEnabled gate in newReefReader).
 	ghost *suggester
@@ -62,6 +65,7 @@ type reefReader struct {
 func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *reefReader {
 	// WithApp lets users scope ~/.inputrc directives with `$if grsh`.
 	r := &reefReader{rl: reef.NewShell(inputrc.WithApp("grsh")), sess: sess}
+	r.hints = newHinter(sess)
 
 	r.rl.Prompt.Primary(func() string { return r.prompt })
 	// Continuation lines get a plain gutter: with real multiline editing
@@ -86,10 +90,9 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 		return accept
 	}
 
-	// Open-construct breadcrumb, recomputed from the live buffer on every
-	// refresh by the display engine. This is the Round 1 "where am I"
-	// feature relocated: `func hi() string {⏎` shows `… func hi` under
-	// the input until the brace closes.
+	// The hint lane — signature help, alias expansion, and the
+	// open-construct breadcrumb — recomputed from the live buffer on every
+	// refresh by the display engine. See hint.go for what each lane shows.
 	//
 	// The provider doubles as grsh's per-refresh hook, because the display
 	// engine calls it from computeCoordinates -- after the effective buffer
@@ -254,20 +257,15 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 }
 
 // hintProvider is the display engine's per-refresh callback. It returns the
-// open-construct breadcrumb for the hint lane and, on the way, refreshes the
-// ghost text — see newReefReader for why the two share this hook.
+// hint-lane text and, on the way, refreshes the ghost text — see
+// newReefReader for why the two share this hook.
 func (r *reefReader) hintProvider(line []rune, pos int) []rune {
 	r.updateGhost(line, pos)
 
-	pend := r.sess.Pending(string(line))
-	if !pend.NeedsMore || len(pend.Constructs) == 0 {
-		return nil
+	if h := r.hints.hint(line, pos); h != "" {
+		return []rune(h)
 	}
-	trail := "… " + strings.Join(pend.Constructs, " ▸ ")
-	if colorEnabled() {
-		trail = "\x1b[2m" + trail + "\x1b[0m" // dim; the hint is ambient, not content
-	}
-	return []rune(trail)
+	return nil // nil, not an empty slice: the lane collapses either way
 }
 
 // updateGhost recomputes the inline autosuggestion for the frame being
@@ -298,6 +296,7 @@ func (r *reefReader) updateGhost(line []rune, pos int) {
 // legacy editor there is no ^D-mid-continuation case to handle).
 func (r *reefReader) Readline() (string, error) {
 	r.ghostHold = false // fresh prompt: the ghost is welcome again
+	r.hints.reset()     // ...and the hint memo may be stale (aliases, idents)
 	line, err := r.rl.Readline()
 	if errors.Is(err, reef.ErrInterrupt) {
 		return line, errInterrupt

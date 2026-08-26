@@ -48,7 +48,10 @@ execution. v2 has begun with the interactive REPL.
   `}` typed on that fresh line dedents itself one level; **ghost text**
   — the most recent history unit starting with what you've typed shows
   dimmed after the cursor, fish-style (→ or Ctrl+F accepts it, a
-  forward-word key takes one word); eval errors print the offending
+  forward-word key takes one word); a **hint line** under the input
+  showing signature help for registry symbols
+  (`strings.Split(string, string) []string`, reflected live) and what
+  an alias expands to (`ll → ls -la`); eval errors print the offending
   line with a **caret** under the column; `?name` **inspects any live
   Go variable** (type + pretty-printed value); `session save
   file.grsh` writes this session's inputs as a runnable script;

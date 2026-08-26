@@ -269,6 +269,60 @@ func TestReefGhostText(t *testing.T) {
 	})
 }
 
+// TestReefHintProvider checks the wiring: one callback feeds the hint lane
+// AND refreshes the ghost, and the hint lane carries all three of its
+// sources. (What each source renders is hint.go's business — hint_test.go
+// covers that; this is about the seam.)
+func TestReefHintProvider(t *testing.T) {
+	sess := runner.NewSession(runner.Options{})
+	if err := sess.Eval("alias ll='ls -la'"); err != nil {
+		t.Fatalf("defining the alias: %v", err)
+	}
+	rd := withGhost(newReefReader(sess, newCompleter(sess.Idents), openHistory("")),
+		"ll --color")
+
+	// Signature help from the registry.
+	buf := "strings.Split("
+	setBuffer(rd, buf, len(buf))
+	if got := string(rd.hintProvider([]rune(buf), len(buf))); got != "strings.Split(string, string) []string" {
+		t.Errorf("hint = %q, want the signature", got)
+	}
+
+	// Alias expansion — and the ghost still updated on the same call.
+	buf = "ll"
+	setBuffer(rd, buf, len(buf))
+	if got := string(rd.hintProvider([]rune(buf), len(buf))); got != "ll → ls -la" {
+		t.Errorf("hint = %q, want the alias expansion", got)
+	}
+	if got := rd.rl.GetInlineSuggestion(); got != "ll --color" {
+		t.Errorf("ghost = %q, want the hint provider to have refreshed it", got)
+	}
+
+	// Nothing to say: the lane collapses rather than reserving a row.
+	buf = "echo hi"
+	setBuffer(rd, buf, len(buf))
+	if got := rd.hintProvider([]rune(buf), len(buf)); got != nil {
+		t.Errorf("hint = %q, want nil for a plain complete line", string(got))
+	}
+
+	// The memo is keyed on the buffer alone, so it must not outlive the
+	// prompt: an alias defined by the command just run has to hint at the
+	// next one. Readline drops it; here that step is made explicit.
+	buf = "gs"
+	setBuffer(rd, buf, len(buf))
+	rd.hintProvider([]rune(buf), len(buf)) // memoizes "no hint" for this buffer
+	if err := sess.Eval("alias gs='git status'"); err != nil {
+		t.Fatalf("defining the second alias: %v", err)
+	}
+	if got := rd.hintProvider([]rune(buf), len(buf)); got != nil {
+		t.Errorf("hint = %q, want the memoized answer within the prompt", string(got))
+	}
+	rd.hints.reset() // what Readline does at a fresh prompt
+	if got := string(rd.hintProvider([]rune(buf), len(buf))); got != "gs → git status" {
+		t.Errorf("hint = %q, want the newly defined alias after the reset", got)
+	}
+}
+
 // TestReefForwardWordAcceptsGhost: a forward-word key takes the next word of
 // the suggestion when one applies, and is a plain motion otherwise.
 func TestReefForwardWordAcceptsGhost(t *testing.T) {

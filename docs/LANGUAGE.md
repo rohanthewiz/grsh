@@ -503,6 +503,24 @@ shell sees 40
   fit on the current row), and the feature follows the same color gate
   as highlighting — the suggestion is only distinguishable from typed
   input by being dim.
+- **Hint line** — the dim line under the input, composed left to
+  right from whatever applies:
+  - **Signature help** for registry symbols: with the cursor on
+    `strings.Split`, or anywhere inside its still-open call, the line
+    shows `strings.Split(string, string) []string`. Reflected from the
+    registry itself, so every symbol has one and nothing can go stale
+    — at the cost of parameter *names*, which reflection cannot
+    recover (`strings.Split(s, sep string)` reads back as
+    `(string, string)`). Non-function symbols show type and value:
+    `math.Pi float64 = 3.141592653589793`.
+  - **Alias expansion**: typing a command that is an alias shows
+    `ll → ls -la`, and it stays up while the arguments are typed. The
+    literal definition is shown, not the recursive resolution the
+    executor performs.
+  - The **construct breadcrumb** described under Continuation, last.
+
+  Everything on this line is display-only — nothing is inserted into
+  the buffer, and Enter runs exactly what you typed.
 - **History** — per-line recall in `~/.grsh_history` (arrow keys,
   Ctrl+R); complete input units (a whole `func` block is one unit) are
   additionally persisted to `~/.grsh_units`, which backs

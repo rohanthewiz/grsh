@@ -139,8 +139,17 @@ func (s *Session) Preview(src string) []classify.Chunk { return s.cls.Preview(sr
 // IsAlias reports whether name is a defined shell alias (the highlighter
 // treats aliases as known commands).
 func (s *Session) IsAlias(name string) bool {
-	_, ok := s.st.Aliases[name]
+	_, ok := s.Alias(name)
 	return ok
+}
+
+// Alias returns a shell alias's expansion — the literal right-hand side as
+// defined, NOT the recursive resolution the executor performs (see
+// shellexec.expandAlias): the REPL's hint lane shows what the user wrote,
+// which is what they are looking to confirm while typing the name.
+func (s *Session) Alias(name string) (string, bool) {
+	v, ok := s.st.Aliases[name]
+	return v, ok
 }
 
 // Inspect pretty-prints a top-level Go variable's type and value (the
