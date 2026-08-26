@@ -128,6 +128,10 @@ func (c *Classifier) Predeclare(names ...string) {
 func (c *Classifier) File(src string) ([]Chunk, error) {
 	lines := strings.Split(src, "\n")
 	c.predeclare(lines)
+	// Index the source by line once per File call. Every Go logical line
+	// then lexes directly out of these bytes; see goSrc for why sharing
+	// them is what keeps consumeGo linear.
+	gs := newGoSrc(src)
 
 	var chunks []Chunk
 	i := 0
@@ -152,7 +156,7 @@ func (c *Classifier) File(src string) ([]Chunk, error) {
 			i = end + 1
 			continue
 		}
-		text, end, err := consumeGo(lines, i)
+		text, end, err := gs.consumeGo(lines, i)
 		if err != nil {
 			chunks = append(chunks, tailChunk(Go, lines, i, c.depth))
 			return chunks, serr.Wrap(err, "line", strings.TrimSpace(lines[i]))

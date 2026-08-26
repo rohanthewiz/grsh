@@ -49,9 +49,10 @@ func newBenchClassifier() *Classifier {
 //	    ...
 //	}
 //
-// This is the shape consumeGo (golines.go:118) is quadratic on: it cannot
-// know the line is complete until the closing brace, so it re-joins and
-// re-lexes the entire accumulated fragment once per physical line.
+// This is the shape consumeGo used to be quadratic on: it cannot know the
+// line is complete until the closing brace, so the pre-optimization version
+// re-joined and re-lexed the entire accumulated fragment once per physical
+// line.
 func goCompositeSrc(n int) string {
 	var b strings.Builder
 	b.WriteString("xs := []int{\n")
@@ -64,8 +65,10 @@ func goCompositeSrc(n int) string {
 
 // goBlockSrc builds n statements inside a func — n SEPARATE logical lines,
 // each complete on its own. The contrast with goCompositeSrc isolates the
-// quadratic: same line count, but consumeGo returns after one iteration per
-// line here, so this one should stay flat in ns/line.
+// quadratic from a plain "more input costs more" curve: same line count,
+// but every line here completes on its own. It is also the shape that
+// catches the tempting wrong fix — joining lines[i:] per logical line would
+// leave the composite case linear while making THIS one quadratic.
 func goBlockSrc(n int) string {
 	var b strings.Builder
 	b.WriteString("func bench() {\n")
@@ -107,17 +110,24 @@ func reportPerLine(b *testing.B, lines int) {
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*lines), "ns/line")
 }
 
-// BenchmarkConsumeGo isolates the suspected O(n^2): it calls consumeGo
-// directly on one unbalanced logical line, with no classify or scope work
-// around it. If ns/line rises with n, the quadratic is here and nowhere
-// else.
+// BenchmarkConsumeGo isolates consumeGo on one unbalanced logical line,
+// with no classify or scope work around it. This is where the O(n^2) was
+// found, and the ns/line column is now the regression guard: it must stay
+// flat across the sweep. If it starts rising with n again, the incremental
+// lexer has been broken back into a re-lex-per-line loop.
+//
+// The goSrc is rebuilt inside the timed region on purpose. Indexing the
+// source is per-File work, and a future change could easily make it
+// per-logical-line instead; that mistake would show up here as exactly the
+// curve this benchmark exists to catch.
 func BenchmarkConsumeGo(b *testing.B) {
 	for _, n := range benchSizes {
-		lines := strings.Split(goCompositeSrc(n), "\n")
+		src := goCompositeSrc(n)
+		lines := strings.Split(src, "\n")
 		b.Run(fmt.Sprintf("composite/%d", n), func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, _, err := consumeGo(lines, 0); err != nil {
+				if _, _, err := newGoSrc(src).consumeGo(lines, 0); err != nil {
 					b.Fatal(err)
 				}
 			}

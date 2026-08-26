@@ -47,39 +47,6 @@ func tokensOf(frag string) []tokLit {
 	}
 }
 
-type goLineInfo struct {
-	parens, brackets, braceNet int
-	toks                       []tokLit
-}
-
-func analyzeGo(frag string) goLineInfo {
-	info := goLineInfo{toks: tokensOf(frag)}
-	for _, t := range info.toks {
-		switch t.tok {
-		case token.LPAREN:
-			info.parens++
-		case token.RPAREN:
-			info.parens--
-		case token.LBRACK:
-			info.brackets++
-		case token.RBRACK:
-			info.brackets--
-		case token.LBRACE:
-			info.braceNet++
-		case token.RBRACE:
-			info.braceNet--
-		}
-	}
-	return info
-}
-
-func (i goLineInfo) last() token.Token {
-	if len(i.toks) == 0 {
-		return token.ILLEGAL
-	}
-	return i.toks[len(i.toks)-1].tok
-}
-
 // semiInsertable implements Go's semicolon-insertion rule: a logical line
 // can end after these tokens.
 func semiInsertable(tok token.Token) bool {
@@ -93,55 +60,229 @@ func semiInsertable(tok token.Token) bool {
 	return false
 }
 
-// opensBlock reports whether a trailing '{' on this fragment starts a
-// statement block (classification continues per-line inside) rather than a
-// composite literal (which joins lines until braces balance).
-func opensBlock(frag string, info goLineInfo) bool {
-	t := strings.TrimSpace(frag)
-	if strings.HasPrefix(t, "}") || t == "{" {
-		return true
+// goSrc is the byte view of the source File is classifying, plus the byte
+// offset of each physical line, so a Go logical line can be lexed straight
+// out of the original bytes instead of from a freshly joined fragment.
+//
+// It exists because consumeGo used to be quadratic. The old shape was
+// "join lines[i:j+1], lex the whole thing, ask whether it is complete;
+// if not, j++ and do it all again" — so an n-line composite literal or a
+// pasted multi-line call cost n joins and n full lexes, O(n^2) in both
+// time and allocation. Measured before the change: 619 ns/line at 8
+// lines, 16,256 ns/line at 512, where one 512-line pass burned 8.4ms and
+// 22MB (ai_docs/perf/round3-baseline.txt).
+//
+// Sharing the bytes is what keeps the fix from moving the cost rather
+// than removing it. Sub-slicing gs.b is free, so lexing from line i is
+// O(1) to start and O(bytes actually consumed) to run; summed over every
+// logical line in the file that is O(n) total. Handing consumeGo a
+// `lines[i:]` join instead would have made the composite-literal case
+// linear while making a file of many short Go lines quadratic — the
+// go-block shape in BenchmarkFile exists to catch exactly that regression.
+//
+// Both fields are built on first use rather than up front: a buffer with
+// no Go in it — a pipeline, a heredoc, most of what gets typed at a shell
+// prompt — would otherwise pay a full copy of the source plus an int per
+// line for an index it never reads.
+type goSrc struct {
+	src  string
+	b    []byte // src as bytes, for scanner.Init
+	offs []int  // byte offset at which each line of b starts
+}
+
+// newGoSrc prepares to index src by line. lines must be
+// strings.Split(src, "\n"); nothing is allocated until the first Go
+// logical line asks for it.
+func newGoSrc(src string) *goSrc { return &goSrc{src: src} }
+
+// index materializes the byte view and the line table. The +1 per line
+// accounts for the separator Split removed, which is what makes offs[k] an
+// exact index into b.
+func (gs *goSrc) index(lines []string) {
+	if gs.offs != nil {
+		return
 	}
-	switch firstToken(t) {
-	case "if", "for", "switch", "select", "else", "func":
-		return true
+	gs.b = []byte(gs.src)
+	gs.offs = make([]int, len(lines))
+	off := 0
+	for k, ln := range lines {
+		gs.offs[k] = off
+		off += len(ln) + 1
 	}
-	// `f := func(...) {` — closure header: last two tokens are ') {'.
-	n := len(info.toks)
-	if n >= 2 && info.toks[n-1].tok == token.LBRACE && info.toks[n-2].tok == token.RPAREN {
-		return true
+}
+
+// goLineState is the running token state the completion rules need: the
+// three nesting counters, plus the last two significant tokens (comments
+// and auto-inserted semicolons never enter it, matching tokensOf).
+//
+// It replaces re-deriving a goLineInfo from a re-lex per candidate line —
+// every rule below reads only these fields, so carrying them forward
+// across lines gives the same answers for a fraction of the work.
+type goLineState struct {
+	parens, brackets, braceNet int
+	last, prev                 token.Token
+	n                          int // significant tokens seen
+}
+
+func (st *goLineState) add(tok token.Token) {
+	switch tok {
+	case token.LPAREN:
+		st.parens++
+	case token.RPAREN:
+		st.parens--
+	case token.LBRACK:
+		st.brackets++
+	case token.RBRACK:
+		st.brackets--
+	case token.LBRACE:
+		st.braceNet++
+	case token.RBRACE:
+		st.braceNet--
 	}
-	return false
+	st.prev, st.last = st.last, tok
+	st.n++
 }
 
 // consumeGo joins physical lines from index i until the Go logical line is
 // complete, returning the verbatim text and the last line index.
-func consumeGo(lines []string, i int) (string, int, error) {
-	for j := i; j < len(lines); j++ {
-		frag := strings.Join(lines[i:j+1], "\n")
-		info := analyzeGo(frag)
-		if info.parens > 0 || info.brackets > 0 {
+//
+// The source is lexed ONCE, forward, and completion is tested at each line
+// boundary against the state accumulated so far. The equivalence with the
+// original re-lex-per-prefix version is not argued, it is tested:
+// golines_ref_test.go keeps that version verbatim as an oracle and
+// TestConsumeGoMatchesRef / FuzzConsumeGoMatchesRef require identical
+// (text, end, err) on every input.
+//
+// # Why tokens are attributed to their START line
+//
+// Only two Go tokens can span physical lines: a raw string and a general
+// /*...*/ comment. Attributing by start line is what preserves the old
+// behavior for both.
+//
+// The old code lexed a TRUNCATED fragment, so a raw string opened on line
+// j came back as an (unterminated, error-ignored) STRING token belonging
+// to line j — and STRING is semicolon-insertable, so the logical line
+// ended there. Lexing the whole source instead yields one COMPLETE STRING
+// token, still starting on line j: same token kind, same line, same
+// verdict. A general comment is dropped by both. So the two disagree only
+// about the literal text of a token neither one reads.
+//
+// The upshot is that a multi-line raw string still terminates the logical
+// line at its opening line, exactly as before. That is arguably wrong Go,
+// but it is pre-existing behavior and this change is a performance change:
+// fixing it belongs in its own commit, with its own test.
+func (gs *goSrc) consumeGo(lines []string, i int) (string, int, error) {
+	gs.index(lines)
+
+	// Facts about the head of the fragment that the block-vs-composite rule
+	// needs. They are constant across every candidate end line, which is
+	// what lets the loop below never rebuild the joined fragment:
+	//
+	//   - File never calls consumeGo on a blank line, so the first
+	//     non-space character of the joined fragment is always the first
+	//     non-space character of lines[i].
+	//   - firstToken stops at the newline Join inserts, so it too can only
+	//     see lines[i].
+	head := strings.TrimSpace(lines[i])
+	headCloses := strings.HasPrefix(head, "}")
+	headTok := firstToken(head)
+	// bareBrace tracks the original's `t == "{"` test: true while the whole
+	// fragment still trims to a single open brace. It is cleared the moment
+	// a later line contributes anything — including a comment, which is why
+	// this is checked against the raw line rather than against tokens.
+	bareBrace := head == "{"
+
+	start := gs.offs[i]
+	fset := token.NewFileSet()
+	f := fset.AddFile("", -1, len(gs.b)-start)
+	var s scanner.Scanner
+	// Errors are ignored, as before: a fragment mid-statement is expected to
+	// be unlexable, and that is the signal to read another line.
+	s.Init(f, gs.b[start:], func(token.Position, string) {}, 0)
+
+	var st goLineState
+	st.last, st.prev = token.ILLEGAL, token.ILLEGAL
+
+	// opens mirrors opensBlock: does a trailing '{' start a statement block
+	// (keep classifying per line) or a composite literal (join until the
+	// braces balance)?
+	opens := func() bool {
+		if headCloses || bareBrace {
+			return true
+		}
+		switch headTok {
+		case "if", "for", "switch", "select", "else", "func":
+			return true
+		}
+		// `f := func(...) {` — closure header: last two tokens are ') {'.
+		return st.n >= 2 && st.last == token.LBRACE && st.prev == token.RPAREN
+	}
+
+	// complete applies the original rule chain to the state accumulated
+	// through some candidate end line. Order matters and is preserved.
+	complete := func() bool {
+		if st.parens > 0 || st.brackets > 0 {
+			return false
+		}
+		// `case x:` / `default:` end in a colon but are complete.
+		if st.last == token.COLON {
+			switch headTok {
+			case "case", "default":
+				return true
+			}
+		}
+		if st.last == token.LBRACE {
+			return opens() // otherwise a composite literal: keep joining
+		}
+		if st.braceNet > 0 && !opens() {
+			return false // inside a multi-line composite literal
+		}
+		return semiInsertable(st.last)
+	}
+
+	// cur is the line whose tokens are still being accumulated; it is only
+	// safe to test completion for a line once a token belonging to a LATER
+	// line has been seen (or the source has run out).
+	cur := i
+	advance := func(to int) (string, int, bool) {
+		for cur < to {
+			if complete() {
+				return strings.Join(lines[i:cur+1], "\n"), cur, true
+			}
+			cur++
+			if strings.TrimSpace(lines[cur]) != "" {
+				bareBrace = false
+			}
+		}
+		return "", 0, false
+	}
+
+	for {
+		pos, tok, lit := s.Scan()
+		if tok == token.EOF {
+			break
+		}
+		if tok == token.SEMICOLON && lit == "\n" {
+			continue // auto-inserted, never part of the token stream
+		}
+		if tok == token.COMMENT {
 			continue
 		}
-		last := info.last()
-		// `case x:` / `default:` end in a colon but are complete.
-		if last == token.COLON {
-			switch firstToken(strings.TrimSpace(frag)) {
-			case "case", "default":
-				return frag, j, nil
+		// f.Line is 1-based within the sub-source starting at line i.
+		if ln := i + f.Line(pos) - 1; ln > cur {
+			if text, end, ok := advance(ln); ok {
+				return text, end, nil
 			}
 		}
-		if last == token.LBRACE {
-			if opensBlock(frag, info) {
-				return frag, j, nil
-			}
-			continue // composite literal: join until braces balance
-		}
-		if info.braceNet > 0 && !opensBlock(frag, info) {
-			continue // inside a multi-line composite literal
-		}
-		if semiInsertable(last) {
-			return frag, j, nil
-		}
+		st.add(tok)
+	}
+	// Source exhausted: every remaining line is a candidate end line, and
+	// the state can no longer change.
+	if text, end, ok := advance(len(lines) - 1); ok {
+		return text, end, nil
+	}
+	if complete() {
+		return strings.Join(lines[i:], "\n"), len(lines) - 1, nil
 	}
 	return "", 0, ErrIncomplete
 }

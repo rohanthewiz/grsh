@@ -45,10 +45,14 @@ import (
 //           (completer.go:213) to an os.Stat instead of the cached $PATH
 //           set: one syscall per keystroke, worth seeing separately.
 // goline  — a single Go statement: the Go lexer lane.
-// pending — typing the 21st line of an already-open 20-line Go block. This
-//           is the case the classify benchmarks predict is quadratic, and
-//           the one where the display engine's several classify passes per
-//           frame compound.
+// pending — typing the 21st line of an already-open 20-line Go block, where
+//           every existing line is its own complete logical line. The
+//           display engine's several classify passes per frame compound
+//           here, but each pass is linear.
+// pending-literal — the same height of buffer, but all of it is one
+//           unfinished logical line (an open composite literal). This is
+//           the shape consumeGo was quadratic on, so it is the shape that
+//           says whether that fix reached the interactive path.
 
 // benchSession builds a session with $PATH pinned to a temp dir holding one
 // executable, so knownCommand's cached scan is small and deterministic
@@ -65,12 +69,32 @@ func benchSession(b *testing.B) *runner.Session {
 }
 
 // pendingBlockPrefix is 20 lines of an open Go func — the buffer already on
-// screen before the keystrokes being measured are typed.
+// screen before the keystrokes being measured are typed. Each line is a
+// COMPLETE logical line, so the classifier finishes every one of them in a
+// single pass.
 func pendingBlockPrefix() string {
 	var b strings.Builder
 	b.WriteString("func report(items []string) error {\n")
 	for i := range 19 {
 		fmt.Fprintf(&b, "\tstep%d := len(items) + %d\n", i, i)
+	}
+	return b.String()
+}
+
+// pendingLiteralPrefix is the other kind of open buffer, and the one that
+// matters for consumeGo: 20 lines that are all ONE unfinished logical line,
+// because the composite literal's braces have not balanced yet. Typing a
+// long slice or map literal at the prompt puts a user here.
+//
+// The distinction is the whole point of having both shapes. A block of
+// complete statements costs the same per keystroke however tall it gets;
+// an open literal used to cost more with every line added, because the
+// classifier re-lexed the whole thing per candidate end line.
+func pendingLiteralPrefix() string {
+	var b strings.Builder
+	b.WriteString("hosts := map[string]int{\n")
+	for i := range 19 {
+		fmt.Fprintf(&b, "\t\"host%02d\": %d,\n", i, i)
 	}
 	return b.String()
 }
@@ -87,6 +111,7 @@ var keystrokeShapes = []struct {
 	{"pathcmd", "", "./scripts/build.sh --verbose"},
 	{"goline", "", `msg := strings.Join(parts, ", ")`},
 	{"pending", pendingBlockPrefix(), "\tfmt.Println(step0, step1)"},
+	{"pending-literal", pendingLiteralPrefix(), "\t\"host19\": 19,"},
 }
 
 // keystrokePrefixes expands a shape into the successive buffer states a
