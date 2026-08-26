@@ -97,8 +97,22 @@ func startShell(t *testing.T, env ...string) *ptyShell {
 	// raw-mode handling need the real thing, not just tty-shaped stdio.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	home := t.TempDir()
+	// $INPUTRC isolates the editor from the developer's own ~/.inputrc (the
+	// library resolves that path from the user database, not from $HOME, so
+	// the temp HOME above does not cover it) and turns off the cursor-position
+	// probe. The probe matters: this harness answers every ESC[6n with a fixed
+	// "row 1, column 1", so the display engine would believe the input starts
+	// at column 0 no matter how wide the prompt actually is, and every
+	// column-sensitive assertion would be measured against a fiction. With the
+	// probe off the engine derives the start column from the printed prompt
+	// width, which is what a real terminal reports back anyway.
+	inputrc := filepath.Join(home, "inputrc")
+	if err := os.WriteFile(inputrc, []byte("set cursor-position-probe off\n"), 0o644); err != nil {
+		t.Fatalf("write inputrc: %v", err)
+	}
 	cmd.Env = append([]string{
 		"HOME=" + home, // isolate rc files and history
+		"INPUTRC=" + inputrc,
 		"PATH=" + os.Getenv("PATH"),
 		"TERM=xterm-256color",
 	}, env...)
@@ -290,9 +304,20 @@ func TestReefHighlightAndIndentEndToEnd(t *testing.T) {
 	// persisted unit: Enter after { seeds two real spaces, the typed }
 	// dedents back to column 0, and the unit still evaluates.
 	p.send("func hi() string {\r")
+	// The continuation gutter, dim, right-aligned into the prompt's width and
+	// painted in the blank indent the engine leaves before the code. Asserted
+	// BEFORE the breadcrumb because both live in the same frame, gutter first:
+	// waiting for the breadcrumb would consume past it (waitFor's offset only
+	// moves forward), and no further frame arrives until the next keystroke.
+	p.waitFor("\x1b[2m... \x1b[0m")
 	p.waitFor("… func hi") // pending-unit breadcrumb: multiline mode is on
 	p.send("return \"in\" + \"dent\"\r")
-	p.send("}\r")
+	p.send("}")
+	// Three rows deep, the mark is on EVERY continuation row: the engine
+	// paints its own column glyph above the last row, so the secondary
+	// callback repaints those rows — mark, CRLF, mark — over it.
+	p.waitFor("\x1b[2m... \x1b[0m\r\x1b[1B")
+	p.send("\r")
 	p.send("fmt.Println(hi())\r")
 	p.waitFor("indent")
 	p.waitFor("grsh ") // back at the prompt: raw mode owns the tty again, so ^D below reaches readline

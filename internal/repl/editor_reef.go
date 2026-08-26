@@ -27,12 +27,16 @@ package repl
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"strings"
+	"unicode/utf8"
 
 	reef "github.com/reeflective/readline"
 	"github.com/reeflective/readline/inputrc"
 	"github.com/rohanthewiz/grsh/internal/runner"
+	"golang.org/x/term"
 )
 
 // indentUnit is one auto-indent level: two spaces per open block, the
@@ -60,18 +64,33 @@ type reefReader struct {
 	// ghostHold suppresses the ghost while a line is being accepted; see
 	// AcceptMultiline for why that moment needs a clear screen.
 	ghostHold bool
+	// color caches colorEnabled() for the callbacks that run on every
+	// refresh (the gutter): the check stats the terminal, and a keystroke
+	// already pays for a classifier pass and a history scan.
+	color bool
 }
 
 func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *reefReader {
 	// WithApp lets users scope ~/.inputrc directives with `$if grsh`.
-	r := &reefReader{rl: reef.NewShell(inputrc.WithApp("grsh")), sess: sess}
+	r := &reefReader{rl: reef.NewShell(inputrc.WithApp("grsh")), sess: sess, color: colorEnabled()}
 	r.hints = newHinter(sess)
 
 	r.rl.Prompt.Primary(func() string { return r.prompt })
 	// Continuation lines get a plain gutter: with real multiline editing
 	// the code is visible above, so the legacy per-line breadcrumb moved
 	// to the hint lane below the buffer (see the hint provider).
-	r.rl.Prompt.Secondary(func() string { return "  ... " })
+	r.rl.Prompt.Secondary(r.secondary)
+
+	// ...and the gutter only gets painted at all when a multiline column is
+	// enabled. The display engine's indicator pass (renderMultilineIndicators)
+	// returns early unless one of the multiline-column* options is set OR the
+	// primary prompt is empty — the secondary prompt rides along with the
+	// column, it is not independent of it. The library means to default this
+	// to on (its own builtin option table says true), but the inputrc defaults
+	// it parses first already define the key as false, and builtin options are
+	// only applied to keys that are still unset — so the intended default
+	// never lands and continuation rows come up bare. Set it explicitly.
+	_ = r.rl.Config.Set("multiline-column", true)
 
 	// The classifier decides when Enter submits: incomplete units insert a
 	// newline and keep editing in-buffer instead of returning fragments.
@@ -107,7 +126,7 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 
 	// Syntax highlighting, only when the session is color-worthy (same
 	// gate as the prompt: NO_COLOR, dumb terminals, non-terminals opt out).
-	if colorEnabled() {
+	if r.color {
 		r.rl.SyntaxHighlighter = newHighlighter(sess, comp).highlight
 		// Ghost text rides the same gate: the library paints the suggestion
 		// with a hardcoded dim/gray SGR run, so with color suppressed it
@@ -254,6 +273,140 @@ func newReefReader(sess *runner.Session, comp *completer, hist *historyStore) *r
 	})
 
 	return r
+}
+
+// gutterMark is the continuation marker painted on every row of a pending
+// multiline unit — the same ellipsis the legacy editor uses for its
+// continuation prompt, so both editors read the same way.
+const gutterMark = "... "
+
+// secondary renders the continuation gutter for the whole input buffer.
+//
+// The display engine calls this once per refresh and only for the LAST
+// continuation row: its indicator pass walks the rows top-down painting
+// ui.DefaultMultilineColumn ("│ ") on each one, and substitutes the secondary
+// prompt on the final row. grsh wants one uniform gutter rather than that
+// two-glyph tree, and the engine exposes no hook for the other rows — so this
+// callback repaints them itself and then returns the mark for its own row.
+//
+// Reaching up the screen from a prompt callback is safe here because of where
+// in the frame it runs and what the engine does right afterwards:
+//
+//   - Only the ROW has to be preserved. The engine has just moved to column 0
+//     of the last row, and once the pass finishes it CRs and re-forwards to
+//     lineCol — the column we leave behind is discarded. So: up N-1, paint
+//     downwards, land back where we started.
+//   - Mistakes cannot accumulate. displayLine emits ClearLineBefore at the
+//     start of every continuation row, so the whole gutter area is wiped and
+//     repainted from scratch on each keystroke.
+//   - The mark cannot collide with the code: it is sized to the prompt width
+//     (see gutter), which is exactly where the code begins, and the rows above
+//     hold nothing but the engine's own indicator at column 0.
+func (r *reefReader) secondary() string {
+	mark := r.gutter()
+
+	// Continuation rows == newlines in the buffer, the same count the engine
+	// walked to get here (display.Engine uses core.Line.Lines()).
+	rows := strings.Count(string(*r.rl.Line()), "\n")
+	if rows < 2 || r.wrapped() {
+		return mark // nothing above to repaint, or not safe to try
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "\x1b[%dA", rows-1) // up to the first continuation row
+	for range rows - 1 {
+		b.WriteString(mark)
+		// Column 0, one row down — as cursor motion, not as a newline. The
+		// engine's own pass writes a bare "\n" here and so leans on the tty
+		// still doing ONLCR (raw mode leaves OPOST alone, but only just); a
+		// CUD cannot scroll the screen either, and every row we step down to
+		// is one we climbed up from a moment ago.
+		b.WriteString("\r\x1b[1B")
+	}
+	b.WriteString(mark)
+	return b.String()
+}
+
+// gutter builds one row of gutter: gutterMark right-aligned in a field as wide
+// as the primary prompt. Right-aligned, because the engine indents
+// continuation rows to the prompt width — a mark parked at column 0 would sit
+// stranded far to the left of the code under a wide prompt:
+//
+//	grsh ~/projs/go/grsh> func greet(name string) {
+//	                 ...    if name == "" {
+//	                 ...      return
+//
+// (The legacy editor prints the same mark at column 0 only because there the
+// gutter IS the prompt, with the code starting right after it.)
+//
+// A prompt too narrow to hold the mark truncates it rather than letting it
+// run into the buffer text.
+func (r *reefReader) gutter() string {
+	cols := promptCols(r.prompt)
+	if cols == 0 {
+		cols = 2 // empty prompt: the engine reserves its own 2-column indicator
+	}
+	mark := gutterMark
+	if cols < len(mark) {
+		mark = mark[:cols]
+	}
+	pad := strings.Repeat(" ", cols-len(mark))
+	if r.color {
+		mark = "\x1b[2m" + mark + "\x1b[0m" // dim, like the engine's own column
+	}
+	return pad + mark
+}
+
+// wrapped reports whether any buffer row is long enough to wrap at the
+// terminal width. It gates the multi-row repaint above: the engine's indicator
+// pass counts LOGICAL lines while it travels by VISUAL rows, so wrapped input
+// already lands its indicators on the wrong rows — and a gutter drawn against
+// those rows would smear the mark over code instead of over an indicator.
+// Wrapped buffers therefore keep the mark on the single row the engine
+// positioned us on, which is the stock behavior.
+func (r *reefReader) wrapped() bool {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width <= 0 {
+		width = 80 // the engine's own fallback when it cannot size the terminal
+	}
+	start := promptCols(r.prompt)
+	for _, ln := range strings.Split(string(*r.rl.Line()), "\n") {
+		if start+utf8.RuneCountInString(ln) >= width {
+			return true
+		}
+	}
+	return false
+}
+
+// promptCols is the printed width of the prompt: SGR escapes carry no width,
+// and only the last line of a multi-line prompt shares the input row. This
+// mirrors the start column the engine computes for the code (which measures
+// grapheme clusters — near enough for a gutter that only pads).
+func promptCols(prompt string) int {
+	if i := strings.LastIndexByte(prompt, '\n'); i >= 0 {
+		prompt = prompt[i+1:]
+	}
+	n := 0
+	for i := 0; i < len(prompt); {
+		if prompt[i] == '\x1b' {
+			// Skip the escape: CSI (ESC [ ... final byte in @..~) covers every
+			// sequence the prompt renderer and the color tags can emit.
+			j := i + 1
+			if j < len(prompt) && prompt[j] == '[' {
+				for j++; j < len(prompt) && (prompt[j] < '@' || prompt[j] > '~'); j++ {
+				}
+			}
+			if j < len(prompt) {
+				j++
+			}
+			i = j
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(prompt[i:])
+		n++
+		i += size
+	}
+	return n
 }
 
 // hintProvider is the display engine's per-refresh callback. It returns the

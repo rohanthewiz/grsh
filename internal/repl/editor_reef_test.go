@@ -1,6 +1,7 @@
 package repl
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rohanthewiz/grsh/internal/runner"
@@ -28,6 +29,12 @@ func TestReefConfigGuards(t *testing.T) {
 	}
 	if !cfg.GetBool("enable-bracketed-paste") {
 		t.Error("bracketed paste must be on for multiline paste-as-one-buffer")
+	}
+	// The display engine skips its whole indicator pass — secondary prompt
+	// included — unless a multiline column is enabled, which is how the
+	// continuation gutter went missing in the first place.
+	if !cfg.GetBool("multiline-column") {
+		t.Error("multiline-column must be on: continuation rows lose the gutter without it")
 	}
 	for _, km := range []string{"emacs", "vi-insert", "vi-command"} {
 		if got := cfg.Binds[km]["\x03"].Action; got != "grsh-interrupt" {
@@ -349,5 +356,86 @@ func TestReefForwardWordAcceptsGhost(t *testing.T) {
 	}
 	if rd2.rl.Cursor().Pos() == 0 {
 		t.Error("with no suggestion, forward-word must still move the cursor")
+	}
+}
+
+// TestPromptCols checks the width the gutter is sized against: SGR escapes
+// carry no width, and only the last line of a multi-line prompt shares the
+// row with the input.
+func TestPromptCols(t *testing.T) {
+	cases := []struct {
+		name   string
+		prompt string
+		want   int
+	}{
+		{"plain", "grsh ~/x> ", 10},
+		{"colored", "\x1b[32mgrsh\x1b[0m ~/x> ", 10},
+		{"multiline", "top line\ngrsh> ", 6},
+		{"unicode", "λ ~/x> ", 7},
+		{"empty", "", 0},
+	}
+	for _, tc := range cases {
+		if got := promptCols(tc.prompt); got != tc.want {
+			t.Errorf("%s: promptCols(%q) = %d, want %d", tc.name, tc.prompt, got, tc.want)
+		}
+	}
+}
+
+// TestGutter checks the single-row gutter: the mark is right-aligned into
+// exactly the prompt's width, so it ends where the code begins and never
+// spills into it.
+func TestGutter(t *testing.T) {
+	rd := newTestReefReader(t)
+
+	rd.prompt = "grsh ~/x> " // 10 columns
+	if got, want := rd.gutter(), "      ... "; got != want {
+		t.Errorf("gutter = %q, want %q (right-aligned in the prompt width)", got, want)
+	}
+
+	// Too narrow to hold the mark: truncate rather than run into the buffer.
+	rd.prompt = "> "
+	if got, want := rd.gutter(), ".."; got != want {
+		t.Errorf("narrow gutter = %q, want %q", got, want)
+	}
+
+	// With color on, the padding stays outside the SGR run so the printed
+	// width is unchanged.
+	rd.prompt, rd.color = "grsh ~/x> ", true
+	if got, want := rd.gutter(), "      \x1b[2m... \x1b[0m"; got != want {
+		t.Errorf("dim gutter = %q, want %q", got, want)
+	}
+	if got := promptCols(rd.gutter()); got != promptCols(rd.prompt) {
+		t.Errorf("dim gutter width = %d, want %d", got, promptCols(rd.prompt))
+	}
+}
+
+// TestSecondaryGutter checks the whole-buffer gutter: the display engine
+// paints its own column glyph on every continuation row but the last, so the
+// secondary callback repaints those rows itself to keep one uniform mark.
+func TestSecondaryGutter(t *testing.T) {
+	rd := newTestReefReader(t)
+	rd.prompt = "grsh> " // 6 columns: the mark plus two pad columns
+	mark := "  ... "
+
+	// One continuation row: the engine already has us on it, nothing to repaint.
+	rd.rl.Line().Set([]rune("func f() {\n")...)
+	if got := rd.secondary(); got != mark {
+		t.Errorf("one continuation row: secondary = %q, want %q", got, mark)
+	}
+
+	// Three continuation rows: climb two rows, paint downwards, land back on
+	// the row the engine positioned us on.
+	rd.rl.Line().Set([]rune("func f() {\n  a()\n  b()\n")...)
+	step := "\r\x1b[1B" // column 0, one row down
+	want := "\x1b[2A" + mark + step + mark + step + mark
+	if got := rd.secondary(); got != want {
+		t.Errorf("three continuation rows: secondary = %q, want %q", got, want)
+	}
+
+	// A buffer wide enough to wrap: the engine's own indicator rows are
+	// already misplaced, so the gutter stays on the one row it can trust.
+	rd.rl.Line().Set([]rune("x := \"" + strings.Repeat("y", 200) + "\"\nz()\n")...)
+	if got := rd.secondary(); got != mark {
+		t.Errorf("wrapped buffer: secondary = %q, want the bare mark %q", got, mark)
 	}
 }
