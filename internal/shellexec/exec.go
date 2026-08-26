@@ -31,7 +31,7 @@ func Run(st *State, list *shellparse.CmdList, ev WordEvaluator, stdio Stdio) (in
 		if err != nil {
 			return status, err
 		}
-		st.LastStatus = status
+		st.SetStatus(status)
 	}
 	return status, nil
 }
@@ -62,7 +62,7 @@ func runAndOr(st *State, ao *shellparse.AndOr, ev WordEvaluator, stdio Stdio) (i
 		return status, err
 	}
 	for i, op := range ao.Ops {
-		st.LastStatus = status
+		st.SetStatus(status)
 		if op == shellparse.AndOp && status != 0 {
 			continue
 		}

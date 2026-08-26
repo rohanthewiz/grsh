@@ -200,6 +200,40 @@ func (s *Session) Eval(src string) error {
 }
 
 func (s *Session) RunSource(name, src string) (err error) {
+	// Give the Go leg a status of its own.
+	//
+	// LastStatus is written only by shellexec, so before this a unit with no
+	// shell command in it left whatever the last shell pipeline had set —
+	// `false` followed by a perfectly good `fmt.Println(...)` kept reporting
+	// [1] in the prompt, and status()/ok() in internal/builtins reported the
+	// same stale value to Go code.
+	//
+	// The reconciliation runs deferred, and registered FIRST so it executes
+	// LAST: the recover() below is registered after it and therefore runs
+	// before it, meaning a panic has already been folded into err by the time
+	// the status is decided. Registering here also covers the early parse
+	// error returns above the interpreter call.
+	//
+	// The seq check is what keeps this from clobbering the shell leg. Only an
+	// untouched counter licenses a write, so `false` still reports [1], and a
+	// mixed unit keeps its last shell pipeline's status — including the case
+	// where the shell ran from INSIDE Go (a {expr} interpolation, a $()
+	// capture), which no inspection of the chunk kinds would have caught.
+	seq := s.st.StatusSeq
+	defer func() {
+		if s.st.StatusSeq != seq {
+			return // the shell leg spoke; its status is the unit's status
+		}
+		if _, isExit := errors.AsType[shellexec.ExitErr](err); isExit {
+			return // `exit` carries its own code; the caller reads it from the error
+		}
+		if err != nil {
+			s.st.SetStatus(1) // general error, the shell convention
+			return
+		}
+		s.st.SetStatus(0)
+	}()
+
 	// Classify on a clone and commit only once the input has fully parsed:
 	// a chunk that opens a brace but then fails transform or go/parser
 	// would otherwise leave the live classifier's depth incremented,

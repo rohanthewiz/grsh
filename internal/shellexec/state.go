@@ -17,7 +17,20 @@ import (
 
 // State is the mutable shell state threaded through execution.
 type State struct {
-	LastStatus  int
+	LastStatus int
+	// StatusSeq counts writes to LastStatus. It exists so a caller that
+	// spans both legs of the language can ask "did a shell command actually
+	// run in this unit?" without inspecting the AST: snapshot the counter
+	// before evaluating and compare after. An unchanged counter means
+	// LastStatus is left over from some earlier unit and the caller owns
+	// what the status should be. See Session.RunSource, which uses it to
+	// give a Go-only unit a status of its own instead of letting a stale
+	// shell failure stand.
+	//
+	// A counter rather than a bool because there is no natural place to
+	// clear a flag: the shell leg has many entry points (pipelines, $()
+	// capture, && / || chaining) and no single "unit finished" hook.
+	StatusSeq   uint64
 	ErrExit     bool // abort script when a statement-position command fails
 	PipeFail    bool // pipeline status = rightmost nonzero, not just the last
 	Interactive bool // REPL session: enables job control (own pgroups, ^Z)
@@ -94,4 +107,13 @@ func (e ExitErr) Error() string { return fmt.Sprintf("exit %d", e.Code) }
 // It is nil until the Go engine milestone wires the interpreter in.
 type WordEvaluator interface {
 	EvalGoExpr(src string) (fields []string, err error)
+}
+
+// SetStatus records the status of an executed pipeline. Every write to
+// LastStatus goes through here so StatusSeq cannot drift from it — the
+// counter's whole value is the guarantee that it ticks exactly when the
+// shell leg has spoken.
+func (s *State) SetStatus(status int) {
+	s.LastStatus = status
+	s.StatusSeq++
 }
