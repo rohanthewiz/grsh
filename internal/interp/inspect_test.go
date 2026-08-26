@@ -208,20 +208,139 @@ func TestInspectLongValuesAreTruncated(t *testing.T) {
 	}
 }
 
-// KNOWN GAP, pinned as it stands.
+// A long string in a ROW is cut like any other value. This was the gap
+// the item cap left open: oneLine quoted strings and returned before the
+// width bound, so twenty rows could still be twenty megabytes.
 //
-// oneLine quotes strings and returns before the 60-char truncation, so a
-// string is never shortened -- only non-string values are. The item cap
-// therefore bounds how many rows print but not how wide one row gets,
-// which undercuts the "never dump megabytes" intent stated on
-// inspectMaxItems: one long string field prints in full.
-func TestInspectDoesNotTruncateLongStrings(t *testing.T) {
+// The cut lands in the content and the result is re-quoted, so the row
+// still reads as a closed string with more after it.
+func TestInspectTruncatesLongStringsInRows(t *testing.T) {
 	long := strings.Repeat("a", 200)
 	got := inspect(t, "xs := []string{\""+long+"\"}", "xs")
-	if !strings.Contains(got, long) {
-		t.Fatalf("expected the whole string to print; got:\n%s", got)
+	if strings.Contains(got, long) {
+		t.Fatalf("the whole string printed; the row budget did not apply:\n%s", got)
 	}
-	if strings.Contains(got, "...") {
-		t.Errorf("strings are truncated after all -- update this test and the note above it")
+	if !strings.Contains(got, `"aaa`) || !strings.Contains(got, `"...`) {
+		t.Errorf("want a closed quote followed by an ellipsis; got:\n%s", got)
+	}
+	assertRowsWithinBudget(t, got)
+}
+
+// Every rendering path is bounded, not just the string one: a struct's
+// String form, a closure's, and a nested container's all go through the
+// same budget.
+func TestInspectBoundsEveryRowKind(t *testing.T) {
+	long := strings.Repeat("z", 200)
+	cases := []struct{ name, body, target string }{
+		{"struct", "type P struct {\n\tS string\n}\nxs := []any{P{\"" + long + "\"}}", "xs"},
+		{"closure field", "type P struct {\n\tS string\n}\np := P{\"" + long + "\"}", "p"},
+		{"nested slice", "xs := []any{make([]int, 200)}", "xs"},
+		{"map value", "m := map[string]string{\"k\": \"" + long + "\"}", "m"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assertRowsWithinBudget(t, inspect(t, c.body, c.target))
+		})
+	}
+}
+
+// A cut never lands mid-rune. A byte-slice truncation of a multi-byte
+// string produces U+FFFD, which reads as corrupted data rather than as
+// elision -- the inspector misdescribing the value it exists to describe.
+//
+// Both cutters are exercised, because they cut differently and only one
+// of them is reachable with a string: a bare string row goes through
+// quoteBounded (which cuts a []rune), while a struct's String form --
+// where %v prints the field RAW, unquoted -- goes through truncated
+// (which walks rune starts). Testing only the first leaves the second
+// free to cut bytes.
+func TestInspectTruncationIsRuneAligned(t *testing.T) {
+	// 200 three-byte runes: any byte-indexed cut at 57 lands inside one.
+	wide := strings.Repeat("世", 200)
+	for _, c := range []struct{ name, body, target string }{
+		{"quoted string row", `xs := []any{"` + wide + `"}`, "xs"},
+		{"struct String form", "type P struct {\n\tS string\n}\nxs := []any{P{\"" + wide + "\"}}", "xs"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := inspect(t, c.body, c.target)
+			if strings.ContainsRune(got, '\uFFFD') {
+				t.Errorf("the cut split a rune:\n%s", got)
+			}
+			assertRowsWithinBudget(t, got)
+		})
+	}
+}
+
+// The top-level `?s` view keeps a much wider budget -- seeing the content
+// is the point of asking -- but it is still a budget, and the (len N)
+// beside it tells the reader what was withheld.
+func TestInspectTopLevelStringIsWidelyButFinitelyBounded(t *testing.T) {
+	short := strings.Repeat("a", 500)
+	got := inspect(t, "s := \""+short+"\"", "s")
+	if !strings.Contains(got, short) {
+		t.Errorf("500 chars should print in full at top level; got:\n%s", got)
+	}
+
+	huge := strings.Repeat("a", inspectMaxString*2)
+	got = inspect(t, "s := \""+huge+"\"", "s")
+	if strings.Contains(got, huge) {
+		t.Fatalf("an unbounded string printed in full (%d chars)", len(got))
+	}
+	if !strings.Contains(got, "(len 4096)") {
+		t.Errorf("the true length must still be reported; got the prefix:\n%.80s", got)
+	}
+	if n := len([]rune(got)); n > inspectMaxString+64 { // + the name/type preamble
+		t.Errorf("top-level rendering is %d runes, past its budget", n)
+	}
+}
+
+// Column padding is measured in runes because fmt's `%-*s` pads in runes.
+//
+// The symptom of counting bytes is NOT misalignment -- fmt pads every row
+// to the same width whatever number it is handed, so the rows still line
+// up. It is a column wider than any key in it: two extra spaces per
+// three-byte rune, a gap with nothing in it. So the assertion is that the
+// padding is MINIMAL, not merely equal.
+func TestInspectMapPaddingIsMinimal(t *testing.T) {
+	// Rendered keys are `"a"` and `"世"` -- 3 runes each, but 3 and 5
+	// bytes. A byte count therefore pads both to 5, two too far.
+	got := inspect(t, `m := map[string]int{"a": 1, "世": 2}`, "m")
+	widest := 0
+	var cols []int
+	for _, line := range strings.Split(got, "\n") {
+		i := strings.Index(line, ": ")
+		if !strings.HasPrefix(line, "  ") || i < 0 {
+			continue
+		}
+		key := line[2:i]
+		cols = append(cols, len([]rune(key)))
+		if n := len([]rune(strings.TrimRight(key, " "))); n > widest {
+			widest = n
+		}
+	}
+	if len(cols) != 2 {
+		t.Fatalf("expected two entry rows, got %d:\n%s", len(cols), got)
+	}
+	for _, c := range cols {
+		if c != widest {
+			t.Errorf("key column is %d runes wide for a widest key of %d:\n%s", c, widest, got)
+		}
+	}
+}
+
+// assertRowsWithinBudget checks every indented row against the width
+// budget. Header and closer are exempt: they carry the variable's name
+// and type, which the user asked for by name and cannot be surprised by.
+func assertRowsWithinBudget(t *testing.T, got string) {
+	t.Helper()
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			continue
+		}
+		// The row is the padded label plus the rendered value; only the
+		// value carries the budget, so allow the label its width.
+		if n := len([]rune(line)); n > inspectMaxWidth+32 {
+			t.Errorf("row is %d runes, past the budget: %q", n, line)
+		}
 	}
 }

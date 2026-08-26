@@ -6,11 +6,29 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // inspectMaxItems bounds how many slice/map entries the inspector prints
 // before eliding — a REPL convenience must never dump megabytes.
 const inspectMaxItems = 20
+
+// inspectMaxWidth bounds how WIDE one printed row gets.
+//
+// The item cap alone bounds only the row COUNT, which is half a budget:
+// twenty rows of a megabyte each is still twenty megabytes. Both bounds
+// are needed for the "never dump megabytes" intent above to hold, and
+// every rendering path below goes through one of the two helpers that
+// enforce this one.
+const inspectMaxWidth = 60
+
+// inspectMaxString is the wider budget for a string inspected AS the
+// top-level value (`?s`), where seeing the content is the whole point of
+// asking. It is not unbounded, because a variable holding a fetched page
+// or a read file is exactly the case that would scroll the terminal into
+// oblivion. The `(len N)` already printed alongside makes the elision
+// unambiguous: the reader can tell how much was withheld.
+const inspectMaxString = 2048
 
 // Inspect pretty-prints a top-level variable's type and value for the
 // REPL's `?name` command. Only the interpreter has typed Go values at a
@@ -39,7 +57,7 @@ func inspectValue(name string, v Value) string {
 		b.WriteString("}")
 		return b.String()
 	case string:
-		return fmt.Sprintf("%s: string (len %d) = %q", name, len(t), t)
+		return fmt.Sprintf("%s: string (len %d) = %s", name, len(t), quoteBounded(t, inspectMaxString))
 	case error:
 		return fmt.Sprintf("%s: error = %v", name, t)
 	}
@@ -103,30 +121,87 @@ func signatureOf(c *Closure) string {
 	return "(" + strings.Join(parts, ", ") + ")"
 }
 
-// oneLine renders a value compactly for table rows.
+// oneLine renders a value compactly for table rows. Every branch ends in
+// a width bound: strings through quoteBounded, everything else through
+// truncated.
 func oneLine(v Value) string {
 	switch t := v.(type) {
 	case nil:
 		return "nil"
 	case string:
-		return strconv.Quote(t)
+		return quoteBounded(t, inspectMaxWidth)
 	case *StructVal:
-		return t.String()
+		return truncated(t.String(), inspectMaxWidth)
 	case *Closure:
-		return t.String()
+		return truncated(t.String(), inspectMaxWidth)
 	}
-	s := fmt.Sprint(v)
-	if len(s) > 60 {
-		s = s[:57] + "..."
+	return truncated(fmt.Sprint(v), inspectMaxWidth)
+}
+
+// truncated bounds an already-rendered value to max runes, spending
+// three of them on the "..." that marks the cut.
+//
+// Rune-aware, not byte-aware: a cut landing mid-rune renders as U+FFFD,
+// which reads as corrupted data rather than as elision — the inspector
+// would be lying about the value in the one place it is meant to be
+// describing it.
+func truncated(s string, max int) string {
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	n := 0
+	for i := range s { // ranging a string yields rune START offsets
+		if n == max-3 {
+			return s[:i] + "..."
+		}
+		n++
 	}
 	return s
 }
 
+// quoteBounded renders s quoted and no wider than max runes.
+//
+// The cut is taken in the CONTENT and the result re-quoted, so the
+// closing quote always survives:
+//
+//	"abcdef"...    the string starts like this, and there is more
+//	"abcd\x        what cutting the QUOTED form can leave: a split
+//	               escape and an open quote, unreadable either way
+//
+// Where the content has to be cut is measured rather than computed,
+// because quoting expands by a factor that depends on the bytes (one
+// byte can become the four of \xff). The starting prefix is already
+// bounded by max, so this shrinks at most max times over a string of at
+// most max runes — microseconds, once per row, at a prompt.
+func quoteBounded(s string, max int) string {
+	q := strconv.Quote(s)
+	if utf8.RuneCountInString(q) <= max {
+		return q
+	}
+	rs := []rune(s)
+	if len(rs) > max {
+		rs = rs[:max]
+	}
+	for len(rs) > 0 {
+		q = strconv.Quote(string(rs))
+		if utf8.RuneCountInString(q)+len("...") <= max {
+			break
+		}
+		rs = rs[:len(rs)-1]
+	}
+	return q + "..."
+}
+
+// maxWidth is the padding width for a column of rendered strings.
+//
+// Counted in RUNES because that is what fmt's `%-*s` pads in; measuring
+// in bytes over-pads any row whose key is not pure ASCII, which is the
+// alignment the map rendering exists to guarantee.
 func maxWidth(ss []string) int {
 	w := 0
 	for _, s := range ss {
-		if len(s) > w {
-			w = len(s)
+		if n := utf8.RuneCountInString(s); n > w {
+			w = n
 		}
 	}
 	return w
