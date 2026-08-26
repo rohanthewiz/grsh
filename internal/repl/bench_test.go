@@ -177,26 +177,39 @@ func BenchmarkKeystrokeHint(b *testing.B) {
 	}
 }
 
-// BenchmarkKeystrokeGhost measures the fish-style suggestion scan. It walks
-// history newest-first (suggest.go:51) with no index, so its cost is in the
-// history size rather than the buffer — hence the size sweep instead of the
-// shape sweep the others use.
+// BenchmarkKeystrokeGhost measures the fish-style suggestion scan. Its cost
+// is in the history size rather than the buffer, so it sweeps history sizes
+// instead of the buffer shapes the others use.
+//
+// Two prefixes per size, because the index (suggest.go) makes them different
+// problems where the original linear scan made them the same one:
+//
+//	miss — matches nothing. Every keystroke that is not retracing a
+//	       remembered command lands here, and it is the case the binary
+//	       search answers without touching the store.
+//	hit  — matches EVERY unit, which is the index's worst case: the prefix
+//	       run it has to walk for the newest entry is the whole store. Typing
+//	       the first rune of a command you run constantly is this shape.
 func BenchmarkKeystrokeGhost(b *testing.B) {
 	for _, units := range []int{100, 1000, 10000} {
-		b.Run(fmt.Sprintf("history/%d", units), func(b *testing.B) {
-			hist := openHistory("") // empty path: in-memory, no file I/O
-			for i := range units {
-				hist.Append(fmt.Sprintf("okcmd run --job %d", i))
-			}
-			// A prefix that matches nothing forces the full scan — the worst
-			// case, and the common one while the first few runes are typed.
-			s := newSuggester(hist)
-			prefixes := keystrokePrefixes("", "zzz-no-such-command")
-			b.ReportAllocs()
-			for i := 0; b.Loop(); i++ {
-				s.suggest(prefixes[i%len(prefixes)])
-			}
-		})
+		for _, pfx := range []struct{ name, typed string }{
+			{"miss", "zzz-no-such-command"},
+			{"hit", "okcmd run --job"},
+		} {
+			b.Run(fmt.Sprintf("history/%d/%s", units, pfx.name), func(b *testing.B) {
+				hist := openHistory("") // empty path: in-memory, no file I/O
+				for i := range units {
+					hist.Append(fmt.Sprintf("okcmd run --job %d", i))
+				}
+				s := newSuggester(hist)
+				prefixes := keystrokePrefixes("", pfx.typed)
+				s.suggest(prefixes[0]) // absorb the history outside the timer
+				b.ReportAllocs()
+				for i := 0; b.Loop(); i++ {
+					s.suggest(prefixes[i%len(prefixes)])
+				}
+			})
+		}
 	}
 }
 
@@ -260,5 +273,41 @@ func BenchmarkKeystrokeMemoHit(b *testing.B) {
 		src := buf.str(line)
 		hint.hintSrc(src, len(line))
 		h.highlightSrc(src)
+	}
+}
+
+// BenchmarkGhostAbsorb measures indexing itself, which is the cost the index
+// added to a path that previously had none. Two shapes, and they are paid at
+// different moments:
+//
+//	load   — the whole history file at the first prompt's first keystroke.
+//	         Once per session.
+//	append — one accepted command merged into an already-built index. This
+//	         one lands on a keystroke, so it is the one with a frame budget:
+//	         the merge rebuilds the slices, so it is linear in the history
+//	         even though only one unit arrived.
+func BenchmarkGhostAbsorb(b *testing.B) {
+	for _, n := range []int{1000, 10000} {
+		units := make([]string, 0, n+1)
+		for i := range n + 1 {
+			units = append(units, fmt.Sprintf("okcmd run --job %d", i))
+		}
+		b.Run(fmt.Sprintf("load/%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				var g ghostIndex
+				g.absorb(units[:n], 0)
+			}
+		})
+		b.Run(fmt.Sprintf("append/%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				b.StopTimer()
+				var g ghostIndex
+				g.absorb(units[:n], 0)
+				b.StartTimer()
+				g.absorb(units, n)
+			}
+		})
 	}
 }
