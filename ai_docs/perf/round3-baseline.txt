@@ -1,0 +1,101 @@
+# Round 3 baseline — captured before any optimization
+
+Machine: Apple M3 (darwin/arm64), go1.26.1, GOMAXPROCS=8
+Command:
+    go test -run xxx -bench . -benchtime 1s \
+        ./internal/classify/ ./internal/repl/ ./internal/runner/
+
+Compare a later run against this with benchstat:
+    go install golang.org/x/perf/cmd/benchstat@latest
+    benchstat ai_docs/perf/round3-baseline.txt new.txt
+
+Read the derived metrics, not ns/op alone:
+  - ns/line  rising with n  => super-linear in buffer size (classify)
+  - ns/iter  converging     => the true per-iteration interpreter cost
+  - allocs/op / n           => allocations per loop iteration
+
+goos: darwin
+goarch: arm64
+pkg: github.com/rohanthewiz/grsh/internal/classify
+cpu: Apple M3
+BenchmarkConsumeGo/composite/8-8         	  176868	      6146 ns/op	       614.6 ns/line	   14192 B/op	     156 allocs/op
+BenchmarkConsumeGo/composite/32-8        	   26139	     46057 ns/op	      1355 ns/line	  108784 B/op	     901 allocs/op
+BenchmarkConsumeGo/composite/128-8       	    2163	    565107 ns/op	      4347 ns/line	 1499964 B/op	    9991 allocs/op
+BenchmarkConsumeGo/composite/512-8       	     142	   8368653 ns/op	     16281 ns/line	22545157 B/op	  139988 allocs/op
+BenchmarkFile/shell/8-8                  	  583734	      2078 ns/op	       259.8 ns/line	    2784 B/op	      18 allocs/op
+BenchmarkFile/shell/32-8                 	  220804	      5400 ns/op	       168.7 ns/line	    6624 B/op	      20 allocs/op
+BenchmarkFile/shell/128-8                	   66590	     18269 ns/op	       142.7 ns/line	   23008 B/op	      22 allocs/op
+BenchmarkFile/shell/512-8                	   16772	     71462 ns/op	       139.6 ns/line	   91616 B/op	      24 allocs/op
+BenchmarkFile/go-block/8-8               	  152574	      7921 ns/op	       792.1 ns/line	   15584 B/op	     224 allocs/op
+BenchmarkFile/go-block/32-8              	   45297	     26623 ns/op	       783.0 ns/line	   50312 B/op	     804 allocs/op
+BenchmarkFile/go-block/128-8             	   10000	    101528 ns/op	       781.0 ns/line	  193576 B/op	    3114 allocs/op
+BenchmarkFile/go-block/512-8             	    2972	    402761 ns/op	       783.6 ns/line	  776171 B/op	   12336 allocs/op
+BenchmarkFile/go-composite/8-8           	  140306	      8598 ns/op	       859.8 ns/line	   18344 B/op	     191 allocs/op
+BenchmarkFile/go-composite/32-8          	   22918	     52297 ns/op	      1538 ns/line	  116089 B/op	     961 allocs/op
+BenchmarkFile/go-composite/128-8         	    2000	    592225 ns/op	      4556 ns/line	 1525110 B/op	   10151 allocs/op
+BenchmarkFile/go-composite/512-8         	     139	   8557753 ns/op	     16649 ns/line	22635602 B/op	  140536 allocs/op
+BenchmarkFile/heredoc/8-8                	  741925	      1601 ns/op	       160.1 ns/line	    3600 B/op	      26 allocs/op
+BenchmarkFile/heredoc/32-8               	  309961	      3842 ns/op	       113.0 ns/line	   23120 B/op	      50 allocs/op
+BenchmarkFile/heredoc/128-8              	   43881	     27475 ns/op	       211.3 ns/line	  321170 B/op	     146 allocs/op
+BenchmarkFile/heredoc/512-8              	    3518	    347413 ns/op	       675.9 ns/line	 4979623 B/op	     530 allocs/op
+BenchmarkPending/8-8                     	  152451	      7877 ns/op	       787.7 ns/line	   17216 B/op	     184 allocs/op
+BenchmarkPending/32-8                    	   23586	     51216 ns/op	      1506 ns/line	  114960 B/op	     954 allocs/op
+BenchmarkPending/128-8                   	    2038	    592189 ns/op	      4555 ns/line	 1523981 B/op	   10144 allocs/op
+BenchmarkPending/512-8                   	     139	   8592087 ns/op	     16716 ns/line	22634477 B/op	  140529 allocs/op
+BenchmarkPreview/8-8                     	  148696	      7993 ns/op	       799.3 ns/line	   17216 B/op	     184 allocs/op
+BenchmarkPreview/32-8                    	   23282	     51679 ns/op	      1520 ns/line	  114961 B/op	     954 allocs/op
+BenchmarkPreview/128-8                   	    2029	    590829 ns/op	      4545 ns/line	 1523982 B/op	   10144 allocs/op
+BenchmarkPreview/512-8                   	     135	   8793705 ns/op	     17108 ns/line	22634474 B/op	  140529 allocs/op
+BenchmarkClone-8                         	  592924	      1993 ns/op	    3608 B/op	       6 allocs/op
+PASS
+ok  	github.com/rohanthewiz/grsh/internal/classify	34.683s
+goos: darwin
+goarch: arm64
+pkg: github.com/rohanthewiz/grsh/internal/repl
+cpu: Apple M3
+BenchmarkKeystrokeHighlight/short-8         	 1210248	       991.8 ns/op	    1253 B/op	      13 allocs/op
+BenchmarkKeystrokeHighlight/pathcmd-8       	  865371	      1400 ns/op	    1482 B/op	      15 allocs/op
+BenchmarkKeystrokeHighlight/goline-8        	  518240	      2285 ns/op	    3426 B/op	      44 allocs/op
+BenchmarkKeystrokeHighlight/pending-8       	   38630	     31202 ns/op	   48386 B/op	     818 allocs/op
+BenchmarkKeystrokeHint/short-8              	 1000000	      1018 ns/op	    1229 B/op	      12 allocs/op
+BenchmarkKeystrokeHint/pathcmd-8            	 1200261	       997.9 ns/op	    1210 B/op	      12 allocs/op
+BenchmarkKeystrokeHint/goline-8             	  480274	      2583 ns/op	    3256 B/op	      38 allocs/op
+BenchmarkKeystrokeHint/pending-8            	   44050	     27216 ns/op	   40576 B/op	     563 allocs/op
+BenchmarkKeystrokeGhost/history/100-8       	 2692482	       453.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKeystrokeGhost/history/1000-8      	  262304	      4565 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKeystrokeGhost/history/10000-8     	   25114	     47532 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKeystrokeFrame/short-8             	  374726	      3132 ns/op	    2483 B/op	      25 allocs/op
+BenchmarkKeystrokeFrame/pathcmd-8           	  289473	      4068 ns/op	    2693 B/op	      27 allocs/op
+BenchmarkKeystrokeFrame/goline-8            	  188613	      6520 ns/op	    6683 B/op	      82 allocs/op
+BenchmarkKeystrokeFrame/pending-8           	   20601	     58358 ns/op	   86657 B/op	    1381 allocs/op
+BenchmarkKeystrokeMemoHit-8                 	  395089	      2949 ns/op	    1152 B/op	       2 allocs/op
+PASS
+ok  	github.com/rohanthewiz/grsh/internal/repl	19.248s
+goos: darwin
+goarch: arm64
+pkg: github.com/rohanthewiz/grsh/internal/runner
+cpu: Apple M3
+BenchmarkForLoopInt/10-8       	  178347	      6765 ns/op	       676.5 ns/iter	    8192 B/op	     206 allocs/op
+BenchmarkForLoopInt/100-8      	   34432	     34446 ns/op	       344.5 ns/iter	   30636 B/op	    1273 allocs/op
+BenchmarkForLoopInt/1000-8     	    3906	    309461 ns/op	       309.5 ns/iter	  261875 B/op	   12819 allocs/op
+BenchmarkForLoopInt/10000-8    	     396	   3039565 ns/op	       304.0 ns/iter	 2587350 B/op	  129827 allocs/op
+BenchmarkRangeLoop/10-8        	  192116	      6169 ns/op	       616.9 ns/iter	    9754 B/op	     191 allocs/op
+BenchmarkRangeLoop/100-8       	   42501	     27869 ns/op	       278.7 ns/iter	   46864 B/op	    1091 allocs/op
+BenchmarkRangeLoop/1000-8      	    4750	    244500 ns/op	       244.5 ns/iter	  423571 B/op	   10836 allocs/op
+BenchmarkRangeLoop/10000-8     	     496	   2408043 ns/op	       240.8 ns/iter	 4197006 B/op	  109847 allocs/op
+BenchmarkNestedBlocks/10-8     	  139352	      8635 ns/op	       863.5 ns/iter	   10468 B/op	     289 allocs/op
+BenchmarkNestedBlocks/100-8    	   22471	     53686 ns/op	       536.9 ns/iter	   54720 B/op	    2166 allocs/op
+BenchmarkNestedBlocks/1000-8   	    2294	    502842 ns/op	       502.8 ns/iter	  504438 B/op	   21814 allocs/op
+BenchmarkNestedBlocks/10000-8  	     242	   4939447 ns/op	       493.9 ns/iter	 4998495 B/op	  219826 allocs/op
+BenchmarkEvalTrivial/go-assign-8         	  382944	      3162 ns/op	    4719 B/op	      72 allocs/op
+BenchmarkEvalTrivial/go-call-8           	  356427	      3425 ns/op	    5176 B/op	      82 allocs/op
+BenchmarkEvalTrivial/comment-8           	  601405	      1999 ns/op	    3513 B/op	      40 allocs/op
+BenchmarkInterpolationLoop/10-8          	   84649	     13943 ns/op	      1394 ns/iter	   13278 B/op	     411 allocs/op
+BenchmarkInterpolationLoop/100-8         	   10000	    100311 ns/op	      1003 ns/iter	   73589 B/op	    3201 allocs/op
+BenchmarkInterpolationLoop/1000-8        	    1225	    980541 ns/op	       980.5 ns/iter	  690204 B/op	   32722 allocs/op
+BenchmarkREPLUnit/one-line/eval-8        	  400508	      3108 ns/op	    4714 B/op	      72 allocs/op
+BenchmarkREPLUnit/one-line/pending+eval-8         	  261418	      4541 ns/op	    7593 B/op	      98 allocs/op
+BenchmarkREPLUnit/multi-line/eval-8               	   13291	     90131 ns/op	  207092 B/op	    1655 allocs/op
+BenchmarkREPLUnit/multi-line/pending+eval-8       	    7080	    170125 ns/op	  401230 B/op	    3014 allocs/op
+PASS
+ok  	github.com/rohanthewiz/grsh/internal/runner	26.333s
