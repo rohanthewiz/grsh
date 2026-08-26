@@ -211,8 +211,12 @@ func (in *Interp) evalStmt(env *Env, st ast.Stmt) (control, error) {
 		return control{}, in.setLValue(env, n.X, nv)
 
 	case *ast.IfStmt:
-		scope := NewEnv(env)
+		// The extra scope exists solely to hold `if v := f(); ...`, so it
+		// is built only when there is an init to hold. A condition cannot
+		// declare anything, so with no init the enclosing scope serves.
+		scope := env
 		if n.Init != nil {
+			scope = NewEnv(env)
 			if _, err := in.evalStmt(scope, n.Init); err != nil {
 				return control{}, err
 			}
@@ -221,11 +225,16 @@ func (in *Interp) evalStmt(env *Env, st ast.Stmt) (control, error) {
 		if err != nil {
 			return control{}, err
 		}
+		// Body is always an *ast.BlockStmt and Else is always a block or
+		// another if -- go/parser admits nothing else -- and each opens a
+		// scope of its own on the way in. Wrapping here too added a link
+		// that every identifier lookup below had to walk past and that
+		// nothing was ever defined into.
 		if cond {
-			return in.evalStmt(NewEnv(scope), n.Body)
+			return in.evalStmt(scope, n.Body)
 		}
 		if n.Else != nil {
-			return in.evalStmt(NewEnv(scope), n.Else)
+			return in.evalStmt(scope, n.Else)
 		}
 		return control{}, nil
 
@@ -303,8 +312,14 @@ func (in *Interp) evalStmt(env *Env, st ast.Stmt) (control, error) {
 }
 
 func (in *Interp) evalFor(env *Env, n *ast.ForStmt) (control, error) {
-	scope := NewEnv(env)
+	// The clause scope holds the loop variable from `for i := 0; ...`. It
+	// is built once and lives for the whole loop, which is precisely why
+	// every closure created in the body observes the same i -- Go's
+	// pre-1.22 semantics, pinned in scope_test.go. A condition-only or
+	// bare for declares nothing, so it needs no scope of its own.
+	scope := env
 	if n.Init != nil {
+		scope = NewEnv(env)
 		if _, err := in.evalStmt(scope, n.Init); err != nil {
 			return control{}, err
 		}
@@ -322,7 +337,12 @@ func (in *Interp) evalFor(env *Env, n *ast.ForStmt) (control, error) {
 				break
 			}
 		}
-		ctl, err := in.evalStmt(NewEnv(scope), n.Body)
+		// n.Body is an *ast.BlockStmt, so evalStmt opens the fresh
+		// per-iteration scope itself. Wrapping here as well allocated a
+		// second Env -- and its map -- on EVERY iteration, for a scope no
+		// declaration could ever reach: a `:=` in the body lands in the
+		// block's scope, one level in.
+		ctl, err := in.evalStmt(scope, n.Body)
 		if err != nil {
 			return control{}, err
 		}
@@ -348,8 +368,23 @@ func (in *Interp) evalRange(env *Env, n *ast.RangeStmt) (control, error) {
 	}
 	// iterate runs one iteration body; the bool result means "keep going".
 	var ret control
+	// Whether the clause declares decides whether each iteration needs a
+	// scope, and it cannot change between iterations -- so decide once,
+	// outside the loop, rather than re-deriving it from the AST every
+	// time round.
+	declares := rangeVarsDeclare(n)
 	iterate := func(k, v Value) (bool, error) {
-		scope := NewEnv(env)
+		// A fresh scope per iteration is what gives `for _, v := range`
+		// closures a v of their own (Go 1.22 semantics, and the deliberate
+		// asymmetry with the for-clause case above; both are pinned in
+		// scope_test.go). It earns that allocation only when there is a
+		// binding to put in it: the `for i, v = range` form assigns to
+		// bindings that already exist further out, and `for range xs`
+		// binds nothing at all.
+		scope := env
+		if declares {
+			scope = NewEnv(env)
+		}
 		if err := in.bindRangeVar(scope, n.Key, n.Tok, k); err != nil {
 			return false, err
 		}
@@ -394,4 +429,21 @@ func (in *Interp) bindRangeVar(scope *Env, e ast.Expr, tok token.Token, v Value)
 		return in.errAt(e, "undefined: "+id.Name)
 	}
 	return nil
+}
+
+// rangeVarsDeclare reports whether a range clause introduces a binding:
+// `:=` with at least one variable that is not blank. The `=` form targets
+// existing bindings and `for range x` names nothing, and neither needs a
+// scope to put a name in.
+func rangeVarsDeclare(n *ast.RangeStmt) bool {
+	if n.Tok != token.DEFINE {
+		return false
+	}
+	return namesABinding(n.Key) || namesABinding(n.Value)
+}
+
+// namesABinding is true for a real identifier -- not nil, not blank.
+func namesABinding(e ast.Expr) bool {
+	id, ok := e.(*ast.Ident)
+	return ok && id.Name != "_"
 }

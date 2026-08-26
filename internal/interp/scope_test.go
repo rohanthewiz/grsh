@@ -350,3 +350,80 @@ for i := 0; i < 1; i++ {
 fmt.Println(x)`)
 	wantOut(t, b.String(), "0 1 2 3 2 1 0\n")
 }
+
+// ---- the conditionally-created scopes ----
+//
+// evalFor, evalRange, evalSwitch and the if handler now build their extra
+// scope only when something will be defined into it. That turns a
+// straight line into a branch, and these cover the side of each branch
+// the cases above do not reach: a loop with no clause to hold, a range
+// that declares nothing, a switch with no init.
+
+// A condition-only for has no clause scope at all now. Its body must
+// still isolate declarations -- that job belongs to the body block, which
+// is exactly why the clause scope was removable.
+func TestScopeConditionOnlyForStillIsolatesItsBody(t *testing.T) {
+	wantErr(t, `n := 0
+for n < 2 {
+	n++
+	inner := n
+	_ = inner
+}
+fmt.Println(inner)`, "undefined: inner")
+}
+
+// The same for a bare for, which likewise has no clause to hold.
+func TestScopeBareForStillIsolatesItsBody(t *testing.T) {
+	wantOut(t, `n := 0
+for {
+	acc := n * 10
+	n++
+	fmt.Print(acc, " ")
+	if n == 3 {
+		break
+	}
+}
+fmt.Println()`, "0 10 20 \n")
+}
+
+// `for range n` binds nothing, so there is no per-iteration range scope
+// -- the body block is the only scope, and it is still fresh each time.
+func TestScopeBareRangeStillIsolatesItsBody(t *testing.T) {
+	wantErr(t, `for range 2 {
+	inner := 1
+	_ = inner
+}
+fmt.Println(inner)`, "undefined: inner")
+}
+
+// The `=` range form assigns outward, so every iteration writes the SAME
+// cell and closures over it all observe the final value -- the for-clause
+// behavior, not the `:=` range behavior. The two range forms genuinely
+// differ here, and the difference is not new: Set always walked outward.
+// It is pinned now because the per-iteration scope that used to sit in
+// front of that walk is gone, and its absence must not be what changes
+// the answer.
+func TestScopeRangeAssignFormClosuresShareOneCell(t *testing.T) {
+	wantOut(t, `v := 0
+fns := []any{}
+for _, v = range []int{10, 20, 30} {
+	fns = append(fns, func() { fmt.Print(v, " ") })
+}
+for _, f := range fns {
+	f()
+}
+fmt.Println()`, "30 30 30 \n")
+}
+
+// A tagless switch has no init scope now. A case body still gets its own
+// scope from runCaseBody, which a CaseClause needs because its body is a
+// bare statement list that no block handler ever wraps.
+func TestScopeTaglessSwitchCaseBodyStillIsolates(t *testing.T) {
+	wantOut(t, `x := "outer"
+switch {
+case true:
+	x := "inner"
+	fmt.Println(x)
+}
+fmt.Println(x)`, "inner\nouter\n")
+}

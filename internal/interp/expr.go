@@ -841,8 +841,13 @@ func (in *Interp) evalDecl(env *Env, ds *ast.DeclStmt) error {
 }
 
 func (in *Interp) evalSwitch(env *Env, n *ast.SwitchStmt) (control, error) {
-	scope := NewEnv(env)
+	// As with if: this scope carries `switch x := f(); x` and nothing
+	// else, since a case expression cannot declare. The per-case body
+	// scope in runCaseBody is a separate matter and stays -- a CaseClause
+	// body is a bare statement list, so nothing else wraps it.
+	scope := env
 	if n.Init != nil {
+		scope = NewEnv(env)
 		if _, err := in.evalStmt(scope, n.Init); err != nil {
 			return control{}, err
 		}

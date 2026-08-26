@@ -64,39 +64,47 @@ var loopShapes = []struct {
 	allocs float64
 }{
 	{
-		// The floor case: one scope per iteration from evalFor, one more
-		// from the BlockStmt handler, plus the arithmetic's boxing.
+		// The floor case: one scope per iteration, opened by the
+		// BlockStmt handler, plus the arithmetic's boxing. It costs a
+		// single allocation because nothing is declared into it and the
+		// map is deferred.
 		name:   "plain",
 		body:   func(n int) string { return fmt.Sprintf("s := 0\nfor i := 0; i < %d; i++ {\n\ts = s + i\n}", n) },
-		allocs: 14,
+		allocs: 11,
 	},
 	{
-		// One nested if nearly doubles it: the if adds a scope for its
-		// (absent) init and another for its body, and the BlockStmt
-		// handler wraps that body a second time.
+		// A nested if now costs only its own body scope. Before the
+		// scopes were collapsed it added three -- an init scope with no
+		// init, a wrap around the body, and the body block itself -- and
+		// this shape was the one that showed it, at 23 against plain's 14.
 		name: "nested-if",
 		body: func(n int) string {
 			return fmt.Sprintf("s := 0\nfor i := 0; i < %d; i++ {\n\tif i > 0 {\n\t\ts = s + i\n\t}\n}", n)
 		},
-		allocs: 23,
+		allocs: 15,
 	},
 	{
-		// range builds its per-iteration scope in evalRange rather than in
-		// evalFor, but pays the same BlockStmt wrap on top.
+		// range keeps its per-iteration scope: `:= v` declares into it,
+		// and that scope is what gives each closure its own v. So this
+		// shape moved least -- one allocation, from the body block's
+		// deferred map.
 		name: "range",
 		body: func(n int) string {
 			return fmt.Sprintf("xs := make([]int, %d)\ns := 0\nfor _, v := range xs {\n\ts = s + v\n}", n)
 		},
-		allocs: 11,
+		allocs: 10,
 	},
 	{
-		// A closure call adds a call scope, a frame, and the argument
-		// slice on top of the loop's own scopes.
+		// A closure call adds a call scope for the parameters, a frame,
+		// and the argument slice on top of the loop's own scopes. The
+		// parameter scope is a real one -- it holds a binding -- so what
+		// came off here is the loop's redundant wrap and two deferred
+		// maps.
 		name: "closure-call",
 		body: func(n int) string {
 			return fmt.Sprintf("f := func(a int) int { return a + 1 }\ns := 0\nfor i := 0; i < %d; i++ {\n\ts = f(i)\n}", n)
 		},
-		allocs: 24,
+		allocs: 20,
 	},
 }
 
@@ -145,15 +153,16 @@ func perIterationAllocs(t *testing.T, body func(n int) string) float64 {
 //
 // The bound is TWO-SIDED on purpose, which is unusual and worth
 // explaining. The upper side is the ordinary regression guard. The lower
-// side exists because the next planned change to this package is exactly
-// the one that should push these numbers down -- collapsing the redundant
-// Env wraps in evalFor/evalRange/if. If that lands and the guard stays
-// silent, the win is invisible and unverified. Failing on an improvement
-// forces the new baseline to be written down in the same commit that
-// earns it, next to the cases in scope_test.go that say the semantics did
-// not move with it.
+// side is there so an improvement cannot land silently: it forces the new
+// baseline to be written down in the commit that earns it, next to the
+// cases in scope_test.go that say the semantics did not move with it.
 //
-// These counts are marginal, and are one higher than a naive
+// It has already done that job once. The counts below were 14 / 23 / 11 /
+// 24 before the redundant Env wraps came out of evalFor, evalRange, the
+// if handler and evalSwitch, and before Env deferred its map to the first
+// Define. All four floors tripped; scope_test.go passed unchanged.
+//
+// These counts are marginal, and are higher than a naive
 // allocs-per-run divided by the trip count reports: the first 256
 // iterations box their ints for free (see perIterationAllocs), which
 // drags the average down by about one allocation per iteration on a
