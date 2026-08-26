@@ -206,6 +206,66 @@ func BenchmarkLoop(b *testing.B) {
 	}
 }
 
+// BenchmarkStructCopy prices the shape copyOnStore is EXPENSIVE at, as
+// the loop shapes price the one it is free at.
+//
+// Value semantics are not free: every binding, parameter and slot that
+// receives a struct now allocates a fresh Vals slice, and a struct-typed
+// field allocates again one level down. The three shapes separate what
+// that costs:
+//
+//	flat    one field, so one copy per store -- the floor
+//	nested  a struct field, so the copy descends: two per store
+//	scalar  the same loop over an int, as the baseline for what the
+//	        loop itself costs before any copy
+//
+// The difference between scalar and flat is the price of correctness
+// here. It is paid only by scripts that actually pass structs around,
+// which is why the loop shapes above did not move at all.
+func BenchmarkStructCopy(b *testing.B) {
+	shapes := []struct{ name, body string }{
+		{"scalar", `x := 0
+for i := 0; i < %d; i++ {
+	y := x
+	x = y
+}
+_ = x`},
+		{"flat", `type P struct {
+	X int
+}
+p := P{1}
+for i := 0; i < %d; i++ {
+	q := p
+	p = q
+}
+_ = p`},
+		{"nested", `type In struct {
+	X int
+}
+type Out struct {
+	I In
+}
+p := Out{In{1}}
+for i := 0; i < %d; i++ {
+	q := p
+	p = q
+}
+_ = p`},
+	}
+	for _, s := range shapes {
+		b.Run(s.name, func(b *testing.B) {
+			in, fset, f := prepScript(b, fmt.Sprintf(s.body, benchIters))
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := in.Run(fset, f); err != nil {
+					b.Fatalf("run: %v", err)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*benchIters), "ns/iter")
+		})
+	}
+}
+
 // BenchmarkNewEnv isolates the cost the loop shapes pay repeatedly: an
 // Env plus its eagerly allocated map. If NewEnv ever grows a lazy map,
 // this is where the saving shows up first.

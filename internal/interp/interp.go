@@ -464,6 +464,12 @@ func (in *Interp) bindRangeVar(scope *Env, e ast.Expr, tok token.Token, v Value)
 	if id.Name == "_" {
 		return nil
 	}
+	// The range variable is a storage location too: `for _, v := range xs`
+	// over a slice of structs binds a COPY each iteration, so writing to
+	// v.Field does not reach back into xs -- which is what Go does, and
+	// the reason `for i := range xs { xs[i].F = 1 }` is the spelling that
+	// mutates.
+	v = copyOnStore(v)
 	if tok == token.DEFINE {
 		scope.Define(id.Name, v)
 		return nil

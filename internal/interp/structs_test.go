@@ -54,18 +54,145 @@ p.X += 3
 fmt.Println(p.X)`, "10\n")
 }
 
-// StructVal is a pointer, so a struct value assigned to a second name
-// shares storage -- a divergence from Go, where the assignment copies.
-// Pinned because it is a semantic difference a user can trip over, not
-// because it is right.
-func TestStructAssignmentSharesStorage(t *testing.T) {
+// A struct assigned to a second name is a second struct. StructVal is a
+// pointer, so this only holds because the value is copied on the way IN
+// to the new binding.
+func TestStructAssignmentCopies(t *testing.T) {
 	wantOut(t, `type P struct {
 	X int
 }
 a := P{1}
 b := a
 b.X = 99
-fmt.Println(a.X)`, "99\n")
+fmt.Println(a.X, b.X)`, "1 99\n")
+}
+
+// Every spelling that stores copies, not just `:=`. These are the sites
+// copyOnStore is wired into, one test apiece, because each is a separate
+// line that could be dropped without the others noticing.
+func TestStructCopiesAtEveryStoreSite(t *testing.T) {
+	decl := "type P struct {\n\tX int\n}\n"
+
+	t.Run("plain assignment", func(t *testing.T) {
+		wantOut(t, decl+`a := P{1}
+var b P
+b = a
+b.X = 99
+fmt.Println(a.X, b.X)`, "1 99\n")
+	})
+
+	t.Run("var declaration", func(t *testing.T) {
+		wantOut(t, decl+`a := P{1}
+var b = a
+b.X = 99
+fmt.Println(a.X, b.X)`, "1 99\n")
+	})
+
+	t.Run("function argument", func(t *testing.T) {
+		wantOut(t, decl+`f := func(p P) {
+	p.X = 99
+}
+a := P{1}
+f(a)
+fmt.Println(a.X)`, "1\n")
+	})
+
+	t.Run("slice element", func(t *testing.T) {
+		wantOut(t, decl+`a := P{1}
+xs := []any{a}
+a.X = 99
+fmt.Println(xs[0].X, a.X)`, "1 99\n")
+	})
+
+	t.Run("map value", func(t *testing.T) {
+		wantOut(t, decl+`a := P{1}
+m := map[string]any{"k": a}
+a.X = 99
+fmt.Println(m["k"].X, a.X)`, "1 99\n")
+	})
+
+	t.Run("container slot write", func(t *testing.T) {
+		wantOut(t, decl+`a := P{1}
+xs := []any{P{0}}
+xs[0] = a
+a.X = 99
+fmt.Println(xs[0].X, a.X)`, "1 99\n")
+	})
+
+	t.Run("append", func(t *testing.T) {
+		wantOut(t, decl+`a := P{1}
+xs := []any{}
+xs = append(xs, a)
+a.X = 99
+fmt.Println(xs[0].X, a.X)`, "1 99\n")
+	})
+
+	t.Run("struct field", func(t *testing.T) {
+		wantOut(t, "type In struct {\n\tX int\n}\ntype Out struct {\n\tI In\n}\n"+`i := In{1}
+o := Out{}
+o.I = i
+i.X = 99
+fmt.Println(o.I.X, i.X)`, "1 99\n")
+	})
+
+	t.Run("struct literal field", func(t *testing.T) {
+		wantOut(t, "type In struct {\n\tX int\n}\ntype Out struct {\n\tI In\n}\n"+`i := In{1}
+o := Out{I: i}
+i.X = 99
+fmt.Println(o.I.X, i.X)`, "1 99\n")
+	})
+
+	t.Run("range variable", func(t *testing.T) {
+		wantOut(t, decl+`xs := []any{P{1}, P{2}}
+for _, v := range xs {
+	v.X = 99
+}
+fmt.Println(xs[0].X, xs[1].X)`, "1 2\n")
+	})
+}
+
+// The other half of the range rule, and the reason it matters: indexing
+// still reaches the element itself, so `for i := range xs` is the
+// spelling that mutates. A copy on READ would break this.
+func TestStructIndexWriteStillMutatesInPlace(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+xs := []any{P{1}, P{2}}
+for i := range xs {
+	xs[i].X = 99
+}
+fmt.Println(xs[0].X, xs[1].X)`, "99 99\n")
+}
+
+// A struct-typed FIELD is part of the value, so it copies with it. This
+// is where a flat copy of the field slice is not enough: b.In would be
+// the SAME Inner as a.In, and writing through it would reach back.
+func TestStructCopyDescendsIntoStructFields(t *testing.T) {
+	wantOut(t, `type In struct {
+	X int
+}
+type Out struct {
+	I In
+}
+a := Out{In{1}}
+b := a
+b.I.X = 99
+fmt.Println(a.I.X, b.I.X)`, "1 99\n")
+}
+
+// ...but only into struct fields. A slice, map or closure field is a
+// reference, and a Go struct copy shares those too.
+func TestStructCopyDoesNotDescendIntoReferenceFields(t *testing.T) {
+	wantOut(t, `type P struct {
+	Xs []int
+	M  map[string]int
+}
+a := P{[]int{1}, map[string]int{"k": 1}}
+b := a
+b.Xs[0] = 99
+b.M["k"] = 99
+fmt.Println(a.Xs[0], a.M["k"])`, "99 99\n")
 }
 
 func TestStructUnknownFieldErrors(t *testing.T) {

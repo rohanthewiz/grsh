@@ -269,7 +269,14 @@ func (in *Interp) evalArgs(env *Env, call *ast.CallExpr) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, v)
+		// A parameter is a storage location: Go passes structs by value,
+		// so the callee must not be able to reach the caller's instance.
+		//
+		// The copy belongs HERE and not in callClosure, because a method
+		// with a pointer receiver has to share: callStructMethod prepends
+		// the receiver to this list afterwards, precisely so that it
+		// bypasses this.
+		args = append(args, copyOnStore(v))
 	}
 	return args, nil
 }
@@ -839,7 +846,7 @@ func (in *Interp) compositeOf(env *Env, t reflect.Type, n *ast.CompositeLit) (Va
 			if err != nil {
 				return nil, err
 			}
-			ev, cerr := convertTo(v, t.Elem())
+			ev, cerr := convertTo(copyOnStore(v), t.Elem())
 			if cerr != nil {
 				return nil, in.wrapAt(el, cerr)
 			}
@@ -870,7 +877,7 @@ func (in *Interp) compositeOf(env *Env, t reflect.Type, n *ast.CompositeLit) (Va
 			if cerr != nil {
 				return nil, in.wrapAt(kv.Key, cerr)
 			}
-			rv, cerr := convertTo(v, t.Elem())
+			rv, cerr := convertTo(copyOnStore(v), t.Elem())
 			if cerr != nil {
 				return nil, in.wrapAt(kv.Value, cerr)
 			}

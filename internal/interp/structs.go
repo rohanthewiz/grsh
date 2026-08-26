@@ -84,6 +84,16 @@ func (t *StructType) newZero() *StructVal {
 }
 
 // structComposite builds Point{X: 1} or Point{1, 2}.
+//
+// Field values are not copied on the way in, and that is safe for a
+// reason worth stating: the literal is a value, so it reaches a name, a
+// parameter or a slot through some store, and copyStruct DESCENDS into
+// struct fields -- so the store that isolates the literal isolates its
+// fields with it.
+//
+// A slice or map literal is the opposite case and does copy its elements:
+// storing a slice copies the reference and stops there, so nothing
+// downstream would ever isolate what the elements alias.
 func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) (Value, error) {
 	sv := t.newZero()
 	for i, el := range n.Elts {
@@ -115,11 +125,61 @@ func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) 
 	return sv, nil
 }
 
-// shallowCopy duplicates the instance for value-receiver method calls
-// (Go semantics: the method sees a copy; reference fields still share).
-func (sv *StructVal) shallowCopy() *StructVal {
+// copyOnStore applies Go's value semantics at the points where a value
+// ENTERS a storage location: a binding, a parameter, a container slot, a
+// struct field. A StructVal is a pointer, so without this a second name
+// for a struct is a second name for the SAME struct.
+//
+// Reads deliberately do not copy, and that asymmetry is the whole design:
+//
+//	b := a         store — b must be a separate struct
+//	xs[0].X = 1    read  — must reach the element in place, as Go does
+//	p.Move()       read  — a pointer receiver must see the instance
+//
+// Copying on read would break the last two, and copying on neither is
+// the bug this replaces. Only structs need it: everything else the
+// interpreter holds is either immutable (numbers, strings, bools) or a
+// reference type Go shares across a copy too, so the overwhelming
+// majority of calls are one type assertion and a return.
+func copyOnStore(v Value) Value {
+	sv, ok := v.(*StructVal)
+	if !ok {
+		return v
+	}
+	return sv.copyStruct()
+}
+
+// copyOnStoreAll copies a whole argument list in place.
+func copyOnStoreAll(vs []Value) {
+	for i, v := range vs {
+		vs[i] = copyOnStore(v)
+	}
+}
+
+// copyStruct duplicates the instance at Go's struct-copy depth: a
+// struct-typed FIELD is part of the value and copies with it, while a
+// slice, map or closure field is a reference that a Go copy shares too.
+//
+//	type Inner struct { Xs []int }
+//	type Outer struct { In Inner }
+//
+//	b := a     b.In is a fresh Inner, so b.In.N = 9 leaves a alone
+//	           b.In.Xs is still a.In.Xs — one slice, two names
+//
+// The recursion terminates because a struct value cannot contain itself.
+// Building one needs a finite literal, and `a.In = a` stores a copy taken
+// BEFORE the write — copy-on-store is itself what makes a cycle
+// unconstructible.
+//
+// This is also the copy a value receiver gets. It used to be a flat
+// `copy(vals, sv.Vals)`, which shared nested struct fields with the
+// caller: a method with a value receiver could reach through one and
+// mutate the instance it was supposed to be insulated from.
+func (sv *StructVal) copyStruct() *StructVal {
 	vals := make([]Value, len(sv.Vals))
-	copy(vals, sv.Vals)
+	for i, v := range sv.Vals {
+		vals[i] = copyOnStore(v)
+	}
 	return &StructVal{Type: sv.Type, Vals: vals}
 }
 
@@ -167,7 +227,7 @@ func (in *Interp) callStructMethod(env *Env, call *ast.CallExpr, sv *StructVal, 
 	}
 	self := sv
 	if !methodHasPtrRecv(cl) {
-		self = sv.shallowCopy()
+		self = sv.copyStruct()
 	}
 	args, err := in.evalArgs(env, call)
 	if err != nil {
@@ -190,6 +250,12 @@ func (in *Interp) structField(n ast.Node, sv *StructVal, field string) (Value, e
 }
 
 // setStructField writes sv.Field = v.
+//
+// It does NOT copy v. setLValue is its only caller and copies every value
+// it writes, whichever of the three target kinds it is writing to; a
+// second copy here would allocate a duplicate on every field write and no
+// test could tell the difference. The store site owns the copy, and there
+// is exactly one store site.
 func (in *Interp) setStructField(n ast.Node, sv *StructVal, field string, v Value) error {
 	idx, ok := sv.Type.Index[field]
 	if !ok {

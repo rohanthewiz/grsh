@@ -421,7 +421,9 @@ func (in *Interp) assign(env *Env, as *ast.AssignStmt) error {
 			if id.Name == "_" {
 				continue
 			}
-			env.Define(id.Name, vals[i])
+			// A struct RHS is copied into the new binding: `b := a` must
+			// give b a struct of its own (copyOnStore).
+			env.Define(id.Name, copyOnStore(vals[i]))
 			continue
 		}
 		if err := in.setLValue(env, lhs, vals[i]); err != nil {
@@ -545,7 +547,11 @@ func assignOp(tok token.Token) (token.Token, bool) {
 	return tok, false
 }
 
+// setLValue writes v to an assignable target. Every target here is a
+// storage location, so the value is copied on the way in for all three
+// of them -- a name, a container slot, and a struct field.
 func (in *Interp) setLValue(env *Env, lhs ast.Expr, v Value) error {
+	v = copyOnStore(v)
 	switch t := lhs.(type) {
 	case *ast.Ident:
 		if t.Name == "_" {
@@ -820,7 +826,10 @@ func (in *Interp) evalDecl(env *Env, ds *ast.DeclStmt) error {
 					return in.errAt(name, "declaration needs a type or a value")
 				}
 				if name.Name != "_" {
-					env.Define(name.Name, v)
+					// `var b = a` stores, exactly as `b := a` does. The
+					// zero-value branches above build a fresh value, so
+					// the copy only ever bites on the value branch.
+					env.Define(name.Name, copyOnStore(v))
 				}
 			}
 		}
