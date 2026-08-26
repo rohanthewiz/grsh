@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"reflect"
 	"strconv"
+	"strings"
 
 	"github.com/rohanthewiz/grsh/internal/shellexec"
 	"github.com/rohanthewiz/grsh/internal/shellparse"
@@ -267,11 +268,16 @@ func (in *Interp) callValue(env *Env, call *ast.CallExpr, fn Value, name string)
 }
 
 func (in *Interp) callClosure(call ast.Node, cl *Closure, args []Value) ([]Value, error) {
-	if in.depth >= maxCallDepth {
+	if len(in.callChain) >= maxCallDepth {
 		return nil, in.errAt(call, "call depth exceeded (runaway recursion?)")
 	}
-	in.depth++
-	defer func() { in.depth-- }()
+	// The chain doubles as the depth counter: pushing the name here is
+	// what lets a failing call report the path that reached it without
+	// every frame on the way out having to say so. nameOrFunc reads a
+	// field, and the backing array is reused across calls, so the happy
+	// path pays an append and nothing else.
+	in.callChain = append(in.callChain, nameOrFunc(cl))
+	defer func() { in.callChain = in.callChain[:len(in.callChain)-1] }()
 
 	scope := NewEnv(cl.Env)
 	params := flattenParams(cl.Fn.Type.Params)
@@ -297,9 +303,39 @@ func (in *Interp) callClosure(call ast.Node, cl *Closure, args []Value) ([]Value
 	in.pushFrame()
 	ctl, err := in.evalStmt(scope, cl.Fn.Body)
 	if err = in.popFrame(err); err != nil {
-		// Accumulate a script-level call chain in the error fields.
-		if _, isExit := err.(shellexec.ExitErr); !isExit {
-			err = serr.Wrap(err, "in_func", nameOrFunc(cl))
+		// Attach the script-level call chain ONCE, instead of having every
+		// frame wrap the error again on the way out.
+		//
+		// Per-frame wrapping was quadratic. serr.Wrap copies the whole
+		// accumulated field list into a fresh error on each call, so an
+		// error raised N calls deep did O(N^2) field copying while it
+		// unwound. At the 10,000-frame recursion limit that was over two
+		// seconds spent producing a forty-character message -- long enough
+		// at a prompt to read as a hung shell. Descending those same
+		// 10,000 frames takes about 14ms, so essentially all of it was the
+		// unwind.
+		//
+		// The two halves happen at different frames, and they have to:
+		//
+		//	depth   3  raised here      <- chain is complete, render it
+		//	        2  passes through
+		//	        1  outermost frame  <- exactly one serr.Wrap
+		//
+		// Only the innermost failing frame still has the full chain (each
+		// frame pops its own name as it returns), and only the outermost
+		// one can know no further frame will add to it. ExitErr carries a
+		// status rather than a diagnosis, so it is left alone -- but the
+		// reset at the bottom still runs, so nothing leaks into the next
+		// error.
+		_, isExit := err.(shellexec.ExitErr)
+		if !isExit && in.errChain == "" {
+			in.errChain = renderCallChain(in.callChain)
+		}
+		if len(in.callChain) == 1 {
+			if !isExit && in.errChain != "" {
+				err = serr.Wrap(err, "in_func", in.errChain)
+			}
+			in.errChain = ""
 		}
 		return nil, err
 	}
@@ -314,6 +350,47 @@ func nameOrFunc(cl *Closure) string {
 		return cl.Name
 	}
 	return "function"
+}
+
+// chainMaxEntries bounds the rendered call chain. A field nobody can read
+// is not worth the bytes, and the two ends are what identify a path.
+const chainMaxEntries = 32
+
+// renderCallChain formats a call stack, outermost first, for the
+// "in_func" error field.
+//
+// Consecutive repeats collapse to `name x N`, which is what makes a
+// runaway legible: `run > f x9999` rather than ten thousand copies of one
+// name. Recursion is precisely the case that produces a chain too long to
+// read, and precisely the case that collapses to nothing. What survives
+// the collapse is then capped at both ends, because a mutually recursive
+// chain alternates and so collapses not at all.
+func renderCallChain(chain []string) string {
+	if len(chain) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(chain))
+	for i := 0; i < len(chain); {
+		j := i + 1
+		for j < len(chain) && chain[j] == chain[i] {
+			j++
+		}
+		if j-i > 1 {
+			parts = append(parts, fmt.Sprintf("%s x%d", chain[i], j-i))
+		} else {
+			parts = append(parts, chain[i])
+		}
+		i = j
+	}
+	if len(parts) > chainMaxEntries {
+		half := chainMaxEntries / 2
+		kept := make([]string, 0, chainMaxEntries+1)
+		kept = append(kept, parts[:half]...)
+		kept = append(kept, fmt.Sprintf("... %d more ...", len(parts)-2*half))
+		kept = append(kept, parts[len(parts)-half:]...)
+		parts = kept
+	}
+	return strings.Join(parts, " > ")
 }
 
 type param struct {

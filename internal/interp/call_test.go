@@ -119,14 +119,14 @@ func TestNestedFunctionsAreNotHoisted(t *testing.T) {
 // Runaway recursion is caught by a depth counter rather than by blowing
 // the host's stack, which would take the whole session with it.
 //
-// This case is slow -- about two seconds -- and the time is NOT the
-// descent. Nine thousand levels of legal recursion run in ~14ms; the
-// cost is the unwind, where callClosure wraps the error with an
-// "in_func" field at every level and serr copies the accumulated field
-// list on each wrap, making the unwind quadratic in depth. A runaway
-// recursion typed at the prompt therefore freezes the shell for seconds
-// before reporting a 40-character message. Left as found; recorded here
-// because this is the test that pays for it.
+// This case used to take about two seconds, and the time was not the
+// descent: nine thousand levels of legal recursion run in ~14ms. The
+// cost was the unwind, where callClosure wrapped the error with an
+// "in_func" field at every level while serr copied the accumulated field
+// list on each wrap. A runaway typed at the prompt froze the shell for
+// seconds before reporting a 40-character message. The chain is now
+// rendered and attached once (see callchain_test.go), and this runs in
+// about 10ms.
 func TestRunawayRecursionIsCaught(t *testing.T) {
 	wantErr(t, `f := func(n int) int { return f(n + 1) }
 fmt.Println(f(0))`, "call depth exceeded")

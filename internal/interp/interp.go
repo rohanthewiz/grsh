@@ -19,8 +19,16 @@ type Interp struct {
 	stdio   shellexec.Stdio
 	tab     []*shellparse.CmdList
 	globals *Env
-	depth   int // closure call depth, for runaway recursion
 	frames  []*frame
+
+	// callChain is the live stack of script-level function names, one
+	// entry per active closure call -- so its length IS the call depth,
+	// which is what the runaway-recursion limit tests. errChain holds
+	// that stack rendered for an error already in flight; see
+	// callClosure for why it is captured and attached at different
+	// points.
+	callChain []string
+	errChain  string
 
 	// exprCache holds parsed {expr} interpolation fragments keyed by
 	// (src, line). Entries carry positions in fset, so the cache is valid
@@ -51,6 +59,13 @@ func (in *Interp) popFrame(bodyErr error) error {
 	f := in.frames[len(in.frames)-1]
 	in.frames = in.frames[:len(in.frames)-1]
 	err := bodyErr
+	// A deferred call that fails while the body has ALSO failed has its
+	// own error dropped below -- so it must not leave behind a call chain
+	// captured for an error nobody will ever see. Restoring what was in
+	// flight keeps the surviving error's chain its own.
+	if bodyErr != nil {
+		defer func(saved string) { in.errChain = saved }(in.errChain)
+	}
 	for i := len(f.defers) - 1; i >= 0; i-- {
 		d := f.defers[i]
 		var callErr error
@@ -116,6 +131,7 @@ func (in *Interp) AddTab(frags []*shellparse.CmdList) int {
 func (in *Interp) Run(fset *token.FileSet, f *ast.File) error {
 	in.fset = fset
 	in.exprCache = nil // fragment positions belong to the previous fset
+	in.errChain = ""   // nothing from a previous unit is in flight
 	var body *ast.BlockStmt
 	for _, d := range f.Decls {
 		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "__main" {
