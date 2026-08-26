@@ -23,6 +23,13 @@ import (
 // (more input, more work). ns/line rising with n is the signature of
 // super-linear behavior, and it reads straight off the benchmark output
 // without anyone having to divide two numbers in their head.
+//
+// One trap when adding to this file: Pending and Preview memoize on the
+// classifier, so driving either with a single fixed source measures the
+// memo, not the classify — see assertSpecMisses, which exists because both
+// benchmarks here had quietly become exactly that. A new benchmark of a
+// memoized path must either vary its input every iteration or say in its
+// name that the hit is the thing being priced.
 
 // benchSizes spans the range that matters interactively: a few lines is a
 // hand-typed block, 512 is a paste. Powers of four keep the output short
@@ -89,9 +96,12 @@ func shellSrc(n int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// heredocSrc builds a heredoc with an n-line body. joinShell accumulates
-// that body with `text += "\n" + lines[i]` (classify.go:298), reallocating
-// the whole chunk per line.
+// heredocSrc builds a heredoc with an n-line body — the shape that carried
+// the second quadratic: joinShell accumulated the body with
+// `text += "\n" + lines[i]`, reallocating the whole chunk per line (4.98MB
+// at 512 lines). It appends into a Builder now, and the ns/line column here
+// is the regression signal, with TestJoinShellHeredocLinear asserting the
+// same thing on bytes so a rise is a test failure, not just a number.
 func heredocSrc(n int) string {
 	var b strings.Builder
 	b.WriteString("cat <<EOF\n")
@@ -174,17 +184,88 @@ func BenchmarkFile(b *testing.B) {
 	}
 }
 
+// specVariants is how many distinct buffers BenchmarkPending and
+// BenchmarkPreview cycle through.
+//
+// Two would be enough to defeat today's one-entry specCache, and that is
+// exactly the trap this constant exists to avoid: a cycle sized to the
+// cache silently starts HITTING the moment someone grows the cache, and the
+// benchmark goes back to reporting a lookup as if it were a classify — the
+// failure being repaired here. Eight is comfortably past any cache size
+// anyone would plausibly choose for a per-frame memo, and
+// assertSpecMisses checks the assumption instead of trusting it.
+const specVariants = 8
+
+// goCompositeVariants builds k sources of the goCompositeSrc shape with an
+// identical line count, differing only in the LAST element's value.
+//
+// Varying the tail rather than the head is deliberate: it is where a typing
+// user's edits actually land, so a future prefix-reusing cache would be
+// exercised the way the editor would exercise it rather than being defeated
+// by an artificial change on line 1. The varied value is fixed-width so
+// every variant is byte-for-byte the same length and the sizes stay
+// comparable across the cycle.
+func goCompositeVariants(n, k int) []string {
+	out := make([]string, k)
+	for v := range k {
+		var b strings.Builder
+		b.WriteString("xs := []int{\n")
+		for i := range n {
+			val := i
+			if i == n-1 {
+				val = 1000 + v // 4 digits for every v < 1000
+			}
+			fmt.Fprintf(&b, "\t%d,\n", val)
+		}
+		b.WriteString("}")
+		out[v] = b.String()
+	}
+	return out
+}
+
+// assertSpecMisses fails the benchmark unless every call in the cycle is a
+// genuine classify.
+//
+// Pending and Preview memoize on the classifier (repl.go:52), so a
+// benchmark that calls them repeatedly with one fixed source measures a
+// string compare and reports 0 allocs — which is what BenchmarkPending and
+// BenchmarkPreview silently degenerated into when the memo landed. A
+// scaling benchmark that stops doing the work it claims to scale is worse
+// than no benchmark, so the property is asserted rather than assumed: prime
+// a full lap, then walk the cycle again checking the memo never already
+// holds the source about to be passed.
+func assertSpecMisses(b *testing.B, c *Classifier, srcs []string) {
+	b.Helper()
+	for _, src := range srcs {
+		c.Pending(src)
+	}
+	for i, src := range srcs {
+		if c.spec != nil && c.spec.src == src {
+			b.Fatalf("variant %d/%d would hit the memo — this benchmark is timing a "+
+				"cache lookup, not a classify; raise specVariants above the cache size",
+				i, len(srcs))
+		}
+		c.Pending(src)
+	}
+}
+
 // BenchmarkPending measures what the editor calls on Enter and on every
 // electric `}` — including the Clone, which copies the whole scope chain.
+//
+// Each iteration passes a different buffer, so each is a real Clone+File.
+// That models typing, where every keystroke produces a source the memo has
+// never seen; BenchmarkSpeculateMemoHit covers the other side.
 func BenchmarkPending(b *testing.B) {
 	c := newBenchClassifier()
 	for _, n := range benchSizes {
-		src := goCompositeSrc(n) // still open: the pending state the REPL sits in
-		lines := strings.Count(src, "\n") + 1
+		// Still-open literals: the pending state the REPL sits in.
+		srcs := goCompositeVariants(n, specVariants)
+		lines := strings.Count(srcs[0], "\n") + 1
 		b.Run(fmt.Sprintf("%d", n), func(b *testing.B) {
+			assertSpecMisses(b, c, srcs)
 			b.ReportAllocs()
-			for b.Loop() {
-				c.Pending(src)
+			for i := 0; b.Loop(); i++ {
+				c.Pending(srcs[i%len(srcs)])
 			}
 			reportPerLine(b, lines)
 		})
@@ -199,12 +280,43 @@ func BenchmarkPending(b *testing.B) {
 func BenchmarkPreview(b *testing.B) {
 	c := newBenchClassifier()
 	for _, n := range benchSizes {
+		srcs := goCompositeVariants(n, specVariants)
+		lines := strings.Count(srcs[0], "\n") + 1
+		b.Run(fmt.Sprintf("%d", n), func(b *testing.B) {
+			assertSpecMisses(b, c, srcs)
+			b.ReportAllocs()
+			for i := 0; b.Loop(); i++ {
+				c.Preview(srcs[i%len(srcs)])
+			}
+			reportPerLine(b, lines)
+		})
+	}
+}
+
+// BenchmarkSpeculateMemoHit prices the OTHER half of the frame: the second
+// and third derivation of a buffer the first one already classified, which
+// is what the specCache exists to make cheap. The gap between this and
+// BenchmarkPending is the cache earning its keep.
+//
+// The source handed in is a strings.Clone of the primed one — equal
+// content, different backing array. That is not a detail: the REPL reaches
+// the memo through `string(line)` conversions off the editor's []rune
+// buffer (repl/highlight.go, repl/hint.go), so the two strings never share
+// a pointer and the compare cannot take the pointer-equality fast path.
+// Priming with the same variable would report an O(1) hit for what is
+// really a full memcmp of the buffer — hence the ns/line column here, which
+// is what makes that per-byte cost visible across the sweep.
+func BenchmarkSpeculateMemoHit(b *testing.B) {
+	c := newBenchClassifier()
+	for _, n := range benchSizes {
 		src := goCompositeSrc(n)
+		hit := strings.Clone(src)
 		lines := strings.Count(src, "\n") + 1
 		b.Run(fmt.Sprintf("%d", n), func(b *testing.B) {
+			c.Pending(src) // prime
 			b.ReportAllocs()
 			for b.Loop() {
-				c.Preview(src)
+				c.Pending(hit)
 			}
 			reportPerLine(b, lines)
 		})
