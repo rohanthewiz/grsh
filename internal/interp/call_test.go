@@ -1,8 +1,10 @@
 package interp
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"strings"
 	"testing"
@@ -495,24 +497,29 @@ fmt.Println(strings.ToUpper("ab"))`, "unknown method ToUpper on string")
 // handed in plays the part of the enclosing __shell call: all it supplies
 // is a position to anchor the fragment's line info to.
 
-// fragmentHarness returns an interpreter with a live fset, plus a node
-// from it to anchor fragments against.
+// fragmentHarness returns an interpreter standing where a running script
+// stands, plus a node from its file to anchor fragments against.
 func fragmentHarness(t *testing.T) (*Interp, ast.Node) {
 	t.Helper()
-	in, _, err := evalKeep(t, "x := 1\n_ = x", nil)
+	var out bytes.Buffer
+	in := newTestInterp(&out, nil)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "t.grsh",
+		"package main\n\nfunc __main() {\n\tx := 1\n\t_ = x\n}\n", parser.SkipObjectResolution)
 	if err != nil {
+		t.Fatalf("harness: the test source is not valid Go: %v", err)
+	}
+	if err := in.Run(fset, f); err != nil {
 		t.Fatalf("harness run: %v", err)
 	}
-	// in.fset is the one Run installed; any position in it will do.
-	var node ast.Node
-	in.fset.Iterate(func(f *token.File) bool {
-		node = &ast.Ident{NamePos: f.Pos(0), Name: "anchor"}
-		return false
-	})
-	if node == nil {
-		t.Fatal("harness: the run left no file in the fileset")
-	}
-	return in, node
+	// parseFragment is a mid-run operation -- it resolves the enclosing
+	// node's position in in.fset and parses the fragment into it. Run
+	// restores that field on the way out, because it is re-entrant (a
+	// sourced file installs its own fset over the caller's), so the
+	// harness re-installs it here rather than borrowing what a finished
+	// run happened to leave behind.
+	in.fset = fset
+	return in, f.Decls[0].(*ast.FuncDecl).Body.List[0]
 }
 
 // The cache is what keeps a {expr} inside a loop from re-parsing per

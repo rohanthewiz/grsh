@@ -129,7 +129,33 @@ func (in *Interp) AddTab(frags []*shellparse.CmdList) int {
 // Run executes the __main body of a transformed file against the global
 // scope. Top-level `name := func(...)` statements are hoisted first so
 // forward references and mutual recursion work.
+//
+// Run is RE-ENTRANT. `source` inside a running script calls back into it
+// through the session (shellexec's SourceFn -> Session.RunFile), on this
+// same interpreter -- which is the point: the sourced file defines into
+// the same globals. What must not be shared is the state keyed to a
+// particular parse:
+//
+//	fset       positions in the outer file mean nothing in another fset
+//	exprCache  entries carry positions in fset, so it moves with it
+//	errChain   an error unwinding through the outer script is in flight
+//	           while a defer that sources runs
+//
+// Each is saved and restored around the nested run. Before that, a
+// sourced file left the caller pointing at the SUB-file's fileset for the
+// rest of the script, and every position reported after the source --
+// errAt, and the {expr} line remap -- resolved against a file the node
+// did not come from, printing `loc[:0:1]`.
+//
+// The frame stack and the call chain need no such care: both are pushed
+// and popped symmetrically, and the recursion limit counting across a
+// source is right -- those frames are genuinely on the stack.
 func (in *Interp) Run(fset *token.FileSet, f *ast.File) error {
+	outer, outerCache, outerChain := in.fset, in.exprCache, in.errChain
+	defer func() {
+		in.fset, in.exprCache, in.errChain = outer, outerCache, outerChain
+	}()
+
 	in.fset = fset
 	in.exprCache = nil // fragment positions belong to the previous fset
 	in.errChain = ""   // nothing from a previous unit is in flight
