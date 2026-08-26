@@ -1,6 +1,7 @@
 package repl
 
 import (
+	"io"
 	"strings"
 	"testing"
 
@@ -244,4 +245,70 @@ func TestHintBadCursor(t *testing.T) {
 	h.hint([]rune("ls"), 99)
 	h.reset()
 	h.hint([]rune("ls"), -1)
+}
+
+// TestHintExplain: the interactive half of --explain. The verdict shown is
+// the classifier's own — same Kind and rule name a script's --explain
+// prints — for the physical line the cursor is on, and it appears only when
+// the flag asked for it.
+func TestHintExplain(t *testing.T) {
+	sess := runner.NewSession(runner.Options{Explain: io.Discard})
+	h := newHinter(sess)
+	if err := sess.Eval("count := 0"); err != nil { // for the declared-ident rule
+		t.Fatalf("seeding an identifier: %v", err)
+	}
+
+	cases := []struct{ buf, want string }{
+		{"ls -la‸", "shell · rule=default"},
+		{"sh ls‸", "shell · rule=sh-prefix"},
+		{"x := 1‸", "go · rule=define"},
+		{"count++‸", "go · rule=declared-ident"},
+		{"# a comment‸", ""}, // no rule decided it: skipped, as in batch output
+		{"‸", ""},            // nothing typed yet
+	}
+	for _, c := range cases {
+		if got := hintAt(t, h, c.buf); got != c.want {
+			t.Errorf("hint(%q) = %q, want %q", c.buf, got, c.want)
+		}
+	}
+
+	// A Go logical line spanning physical lines reports its span — the one
+	// classifier decision the buffer itself does not show.
+	if got := hintAt(t, h, "hosts := map[string]int{\n\t\"a\": 1,\n}‸"); got != "go 1-3 · rule=define" {
+		t.Errorf("hint on a multi-line chunk = %q, want the span", got)
+	}
+	// A shell line continued with a backslash is likewise one chunk, and
+	// the span is the only place that shows.
+	if got := hintAt(t, h, "echo one \\\n  two‸"); got != "shell 1-2 · rule=default" {
+		t.Errorf("hint on a continued shell line = %q, want the span", got)
+	}
+	// An unfinished unit reports the best-effort tail chunk rather than
+	// nothing: mid-typing is when the question gets asked. An open BLOCK is
+	// not that case — it classified fine and is merely deep — so the two
+	// shapes report differently, which is the distinction worth seeing.
+	if got := hintAt(t, h, "hosts := map[string]int{‸"); got != "go · rule=incomplete" {
+		t.Errorf("hint on an open literal = %q, want the tail chunk's rule", got)
+	}
+	if got := hintAt(t, h, "func f() {‸"); got != "… func f"+hintSep+"go · rule=keyword" {
+		t.Errorf("hint on an open block = %q, want the rule that decided it", got)
+	}
+
+	// Composed last, after the lanes that were already there.
+	got := hintAt(t, h, "func f() {\n\tfmt.Println(‸")
+	want := "fmt.Println(...any) (int, error)" + hintSep + "… func f" + hintSep + "go · rule=incomplete"
+	if got != want {
+		t.Errorf("hint =\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+// TestHintExplainOffByDefault: a session that was not asked to explain shows
+// no verdict — the lane is a debugging aid, not ambient decoration.
+func TestHintExplainOffByDefault(t *testing.T) {
+	h := newTestHinter(t)
+	if got := hintAt(t, h, "ls -la‸"); got != "" {
+		t.Errorf("hint = %q, want none without --explain", got)
+	}
+	if h.sess.Explaining() {
+		t.Error("a session with no Explain writer reports Explaining()")
+	}
 }

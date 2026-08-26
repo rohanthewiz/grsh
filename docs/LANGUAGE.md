@@ -517,7 +517,16 @@ shell sees 40
     `ll → ls -la`, and it stays up while the arguments are typed. The
     literal definition is shown, not the recursive resolution the
     executor performs.
-  - The **construct breadcrumb** described under Continuation, last.
+  - The **construct breadcrumb** described under Continuation.
+  - **Classification**, under `--explain` only, last: how the
+    classifier is reading the line the cursor is on, in the same
+    Kind/rule terms the batch output uses — `shell · rule=default`,
+    `go · rule=declared-ident`. A chunk covering more than one
+    physical line also shows its span (`shell 1-2 · rule=default`),
+    which is how you see that a backslash continuation or an open
+    composite literal is being read as ONE line. Start an interactive
+    session with `grsh --explain` to turn it on; the batch output
+    still prints after each unit runs.
 
   Everything on this line is display-only — nothing is inserted into
   the buffer, and Enter runs exactly what you typed.
@@ -564,7 +573,9 @@ shell sees 40
 
 Errors print as `script.grsh:12: message`. `--debug` (or `GRSH_DEBUG=1`)
 prints the full structured error chain, including the script-level
-function call trail. `--explain` prints every line's classification.
+function call trail. `--explain` prints every line's classification; at an interactive
+prompt it also puts that verdict in the hint line for the line you are
+typing, before you press Enter.
 
 ## 8. Deliberate differences from bash — summary
 

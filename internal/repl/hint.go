@@ -3,7 +3,7 @@ package repl
 // Hint-lane content for the reeflective editor: the one dim line printed
 // under the input buffer on every display refresh.
 //
-// Three sources feed it, composed left to right, never clobbering one
+// Four sources feed it, composed left to right, never clobbering one
 // another:
 //
 //	signature   fmt.Printf(string, ...any) (int, error)
@@ -15,10 +15,15 @@ package repl
 //	breadcrumb  … func greet ▸ for
 //	            the open constructs above the cursor (Round 1's "where am I",
 //	            relocated here when the editor gained real multiline editing).
+//	explain     go · rule=declared-ident
+//	            how the classifier is reading the cursor's line. Only under
+//	            --explain, and last in the row precisely so that turning the
+//	            flag on adds a segment without moving the three that were
+//	            already there.
 //
 // Signature and alias are cursor-local and mutually exclusive (a word is
-// being read as one language or the other), so at most two segments show at
-// once: the cursor-local one, then the breadcrumb.
+// being read as one language or the other), so at most three segments show
+// at once: the cursor-local one, the breadcrumb, and the explain verdict.
 //
 // Cost matters here — this runs on every keystroke AND on every cursor-only
 // move, alongside the highlighter and the ghost-text scan. So the lanes are
@@ -31,8 +36,13 @@ package repl
 //	                                         after the name matched an alias
 //	Session.Pending (clone)             →  unconditional, but it is the same
 //	                                       call the breadcrumb has always made
+//	Session.Preview (clone)             →  unconditional under --explain, and
+//	                                       free: Pending above has already
+//	                                       speculated this exact source, and
+//	                                       Preview reads that same memo
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/rohanthewiz/grsh/internal/classify"
@@ -61,6 +71,9 @@ const (
 // prompts but never within one.
 type hinter struct {
 	sess *runner.Session
+	// explain caches Session.Explaining: it is fixed for the life of the
+	// session (a process flag), and this is a per-frame path.
+	explain bool
 
 	memoed  bool
 	lastSrc string
@@ -68,7 +81,9 @@ type hinter struct {
 	lastOut string
 }
 
-func newHinter(sess *runner.Session) *hinter { return &hinter{sess: sess} }
+func newHinter(sess *runner.Session) *hinter {
+	return &hinter{sess: sess, explain: sess.Explaining()}
+}
 
 // reset drops the memo. Called at each fresh prompt.
 func (h *hinter) reset() { h.memoed = false }
@@ -111,6 +126,11 @@ func (h *hinter) render(src string, pos int) string {
 	}
 	if b := h.breadcrumb(src); b != "" {
 		parts = append(parts, b)
+	}
+	if h.explain {
+		if e := h.explainHint(src, prefix); e != "" {
+			parts = append(parts, e)
+		}
 	}
 	if len(parts) == 0 {
 		return ""
@@ -234,16 +254,65 @@ func commandWord(linePrefix string) string {
 	return fields[0]
 }
 
-// shellLineAt reports whether the classifier reads the cursor's physical
-// line as shell.
-func (h *hinter) shellLineAt(src, prefix string) bool {
+// chunkAt returns the chunk covering the cursor's physical line. Missing
+// (ok == false) only for a cursor past the end of what the classifier
+// produced chunks for — an empty buffer, or a trailing position no chunk
+// claims.
+//
+// The Preview call behind it is memoized per source on the classifier
+// (classify.speculate), and the highlighter runs the same one later in the
+// frame off the same buffer, so the second and third readers of a frame's
+// classification pay for a slice header.
+func (h *hinter) chunkAt(src, prefix string) (classify.Chunk, bool) {
 	ln := strings.Count(prefix, "\n") + 1 // 1-based, like Chunk.StartLine
 	for _, ch := range h.sess.Preview(src) {
 		if ln >= ch.StartLine && ln <= ch.EndLine {
-			return ch.Kind == classify.Shell
+			return ch, true
 		}
 	}
-	return false
+	return classify.Chunk{}, false
+}
+
+// shellLineAt reports whether the classifier reads the cursor's physical
+// line as shell.
+func (h *hinter) shellLineAt(src, prefix string) bool {
+	ch, ok := h.chunkAt(src, prefix)
+	return ok && ch.Kind == classify.Shell
+}
+
+// explainHint is --explain for the prompt: the classifier's verdict on the
+// line under the cursor, shown while it is still being typed.
+//
+// The flag's batch form prints one row per chunk from runner.RunSource —
+// AFTER a unit has been evaluated. In a script that is the whole story; at
+// a prompt it answers the question too late, and answers it for a line that
+// has already scrolled away. Interactively the useful moment is before
+// Enter, so the same two fields go in the hint lane instead, under the same
+// names a session log uses:
+//
+//	go · rule=declared-ident     rule 6a — the line opens with a known ident
+//	shell · rule=default         rule 7 — nothing claimed it, so: a command
+//	go 3-5 · rule=keyword        one Go logical line spanning three physical
+//	                             ones; the span shows only when there is one
+//	go · rule=incomplete         the best-effort tail of an unfinished unit
+//
+// The line span is the half a script's --explain output gives away for free
+// (it prints `name:3-5`) and a prompt does not: that several rows of an open
+// composite literal are ONE chunk is a classifier decision worth seeing, and
+// it is invisible in the buffer.
+//
+// Blank and comment lines are skipped, as they are in the batch output —
+// they carry no rule, only a Kind.
+func (h *hinter) explainHint(src, prefix string) string {
+	ch, ok := h.chunkAt(src, prefix)
+	if !ok || ch.Kind == classify.Blank {
+		return ""
+	}
+	span := ""
+	if ch.EndLine > ch.StartLine {
+		span = fmt.Sprintf(" %d-%d", ch.StartLine, ch.EndLine)
+	}
+	return ch.Kind.String() + span + " · rule=" + ch.Rule
 }
 
 // breadcrumb names the constructs still open above the cursor.

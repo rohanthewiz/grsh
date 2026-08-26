@@ -88,10 +88,17 @@ type ptyShell struct {
 
 func startShell(t *testing.T, env ...string) *ptyShell {
 	t.Helper()
+	return startShellArgs(t, nil, env...)
+}
+
+// startShellArgs is startShell with command-line flags — for the behaviors
+// that only exist under one (see TestReefExplainHintEndToEnd).
+func startShellArgs(t *testing.T, args []string, env ...string) *ptyShell {
+	t.Helper()
 	bin := buildGrsh(t)
 	master, slave := openPTYPair(t)
 
-	cmd := exec.Command(bin)
+	cmd := exec.Command(bin, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
 	// New session with the pty as controlling terminal — job control and
 	// raw-mode handling need the real thing, not just tty-shaped stdio.
@@ -473,5 +480,35 @@ func TestReefEditorNonzeroExitStatus(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("grsh did not exit")
+	}
+}
+
+// TestReefExplainHintEndToEnd covers the wiring the unit tests cannot: that
+// --explain, parsed in main, reaches the hinter the display engine calls.
+// Everything in between — Options.Explain, Session.Explaining, newHinter —
+// is a chain of plumbing that each unit test sees only one link of.
+//
+// It types without pressing Enter, which is the whole point of the lane:
+// the verdict is there before the line runs.
+func TestReefExplainHintEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("pty end-to-end test")
+	}
+	p := startShellArgs(t, []string{"--explain"})
+	p.waitFor("type exit or Ctrl+D to quit")
+
+	p.send("ls -la")
+	p.waitFor("shell · rule=default")
+
+	// The same buffer, one keyword later, is read as Go — and the lane
+	// tracks it live rather than reporting the line that already ran.
+	p.send("\x03") // ^C: drop the line, reprompt
+	p.send("for i := range 3 {")
+	p.waitFor("go · rule=keyword")
+
+	p.send("\x03")
+	p.send("\x04") // ^D on an empty line: exit
+	if err := p.cmd.Wait(); err != nil {
+		t.Fatalf("exit: %v", err)
 	}
 }

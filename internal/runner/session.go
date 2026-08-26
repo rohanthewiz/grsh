@@ -136,6 +136,13 @@ func (s *Session) Idents() []string { return s.cls.Names() }
 // state is not mutated, and incomplete input still yields chunks.
 func (s *Session) Preview(src string) []classify.Chunk { return s.cls.Preview(src) }
 
+// Explaining reports whether the session was asked to explain its
+// classification decisions (--explain). The writer itself stays private:
+// the REPL does not print to it — a prompt has nowhere to put a stream of
+// lines — it puts the same verdict in the hint lane instead (see hint.go),
+// and this is how it knows the user asked for one.
+func (s *Session) Explaining() bool { return s.explain != nil }
+
 // IsAlias reports whether name is a defined shell alias (the highlighter
 // treats aliases as known commands).
 func (s *Session) IsAlias(name string) bool {

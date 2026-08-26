@@ -30,7 +30,7 @@ func main() {
 		flagC       = flag.String("c", "", "run this command string and exit")
 		flagVersion = flag.Bool("version", false, "print version and exit")
 		flagDebug   = flag.Bool("debug", false, "verbose error output")
-		flagExplain = flag.Bool("explain", false, "print each line's shell/Go classification and the rule that decided it")
+		flagExplain = flag.Bool("explain", false, "print each line's shell/Go classification and the rule that decided it (interactively: show it in the hint line)")
 		flagNoRC    = flag.Bool("norc", false, "skip ~/.grshrc at interactive startup")
 	)
 	flag.Usage = func() {

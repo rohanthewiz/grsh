@@ -50,8 +50,9 @@ execution. v2 has begun with the interactive REPL.
   dimmed after the cursor, fish-style (→ or Ctrl+F accepts it, a
   forward-word key takes one word); a **hint line** under the input
   showing signature help for registry symbols
-  (`strings.Split(string, string) []string`, reflected live) and what
-  an alias expands to (`ll → ls -la`); eval errors print the offending
+  (`strings.Split(string, string) []string`, reflected live), what
+  an alias expands to (`ll → ls -la`), and — under `--explain` — how
+  the classifier is reading the current line (`go · rule=define`); eval errors print the offending
   line with a **caret** under the column; `?name` **inspects any live
   Go variable** (type + pretty-printed value); `session save
   file.grsh` writes this session's inputs as a runnable script;
