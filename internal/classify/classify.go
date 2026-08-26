@@ -96,6 +96,9 @@ type Classifier struct {
 	// open brace, e.g. ["func greet", "for"]. The REPL renders it in the
 	// continuation prompt so you always know what you are inside of.
 	blocks []string
+	// spec memoizes the last speculative classify (see speculate). It is
+	// derived state: any mutation of the fields above must clear it.
+	spec *specCache
 }
 
 func New(pkgNames []string) *Classifier {
@@ -116,6 +119,7 @@ func (c *Classifier) Predeclare(names ...string) {
 	for _, n := range names {
 		root.Add(n)
 	}
+	c.spec = nil // scope changed: anything speculated against it is stale
 }
 
 // File classifies a source chunk into contiguous classified chunks.
@@ -126,6 +130,12 @@ func (c *Classifier) Predeclare(names ...string) {
 // them while the user is mid-unit. Error-checking callers are unaffected:
 // they bail on err before touching chunks.
 func (c *Classifier) File(src string) ([]Chunk, error) {
+	// File advances scope, depth and the block stack as it goes, so any
+	// memoized speculation about this classifier is stale the moment it is
+	// called. Clearing here rather than at each mutation site keeps the
+	// invariant local to the one function that can break it.
+	c.spec = nil
+
 	lines := strings.Split(src, "\n")
 	c.predeclare(lines)
 	// Index the source by line once per File call. Every Go logical line

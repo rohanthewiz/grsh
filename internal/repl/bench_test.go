@@ -146,10 +146,14 @@ func BenchmarkKeystrokeHighlight(b *testing.B) {
 	}
 }
 
-// BenchmarkKeystrokeHint measures the hint lane alone. It is the most
-// classify-hungry of the three: shellLineAt does a Preview (hint.go:210)
-// and breadcrumb does a Pending (hint.go:220), so one hint call is already
-// two full passes over the buffer.
+// BenchmarkKeystrokeHint measures the hint lane alone: shellLineAt does a
+// Preview (hint.go:210) and breadcrumb does a Pending (hint.go:220).
+//
+// In isolation this understates what the classifier cache does for the
+// hint lane, because the two calls share their result with the
+// highlighter's Preview rather than only with each other — and on a buffer
+// where signature help fires, cursorHint returns before shellLineAt runs at
+// all. BenchmarkKeystrokeFrame is where that sharing shows up.
 func BenchmarkKeystrokeHint(b *testing.B) {
 	for _, sh := range keystrokeShapes {
 		b.Run(sh.name, func(b *testing.B) {
