@@ -100,11 +100,31 @@ var loopShapes = []struct {
 		// parameter scope is a real one -- it holds a binding -- so what
 		// came off here is the loop's redundant wrap and two deferred
 		// maps.
+		//
+		// The literal sits OUTSIDE the loop, which is why this shape did
+		// not move when the clause variable became per-iteration: the
+		// capture scan looks inside the ForStmt and finds nothing there.
+		// The shape below is the one that pays.
 		name: "closure-call",
 		body: func(n int) string {
 			return fmt.Sprintf("f := func(a int) int { return a + 1 }\ns := 0\nfor i := 0; i < %d; i++ {\n\ts = f(i)\n}", n)
 		},
 		allocs: 20,
+	},
+	{
+		// The priced case for Go 1.22 clause variables: a func literal
+		// INSIDE the loop means a closure could outlive the iteration, so
+		// each iteration gets an Env of its own with the clause variable
+		// copied in and back out.
+		//
+		// That is the cost of the semantics, and it is charged only to the
+		// loops that could observe them -- which is the whole reason the
+		// four shapes above are unmoved.
+		name: "closure-in-body",
+		body: func(n int) string {
+			return fmt.Sprintf("s := 0\nfor i := 0; i < %d; i++ {\n\tf := func() int { return i + 1 }\n\ts = f()\n}", n)
+		},
+		allocs: 23,
 	},
 }
 

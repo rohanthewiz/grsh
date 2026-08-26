@@ -388,12 +388,58 @@ func (in *Interp) evalStmt(env *Env, st ast.Stmt) (control, error) {
 	}
 }
 
+// clauseVars returns the names `for i := 0; ...` DECLARES, or nil.
+//
+// Only `:=` declares. `for i = 0; ...` assigns to a binding that already
+// exists further out, and there is nothing per-iteration about a variable
+// the loop does not own -- Go treats that form the old way too.
+func clauseVars(n *ast.ForStmt) []string {
+	as, ok := n.Init.(*ast.AssignStmt)
+	if !ok || as.Tok != token.DEFINE {
+		return nil
+	}
+	var names []string
+	for _, lhs := range as.Lhs {
+		if id, ok := lhs.(*ast.Ident); ok && id.Name != "_" {
+			names = append(names, id.Name)
+		}
+	}
+	return names
+}
+
+// loopCaptures reports whether anything in the loop could still be
+// holding a clause variable's cell after its iteration ends.
+//
+// A *ast.FuncLit is the only way, and that is a property of this
+// interpreter rather than a guess: a value copied into a container is
+// copied (structs included, since Round 6), and the only thing that
+// retains an *Env is a Closure. grsh has no address-of operator, so
+// there is no `&i` to smuggle a cell out either -- see unaryOp.
+//
+// The whole ForStmt is scanned, not just the body, because a literal in
+// the cond or the post captures exactly as one in the body does.
+func loopCaptures(n *ast.ForStmt) bool {
+	found := false
+	ast.Inspect(n, func(node ast.Node) bool {
+		if found {
+			return false
+		}
+		if _, ok := node.(*ast.FuncLit); ok {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 func (in *Interp) evalFor(env *Env, n *ast.ForStmt) (control, error) {
-	// The clause scope holds the loop variable from `for i := 0; ...`. It
-	// is built once and lives for the whole loop, which is precisely why
-	// every closure created in the body observes the same i -- Go's
-	// pre-1.22 semantics, pinned in scope_test.go. A condition-only or
-	// bare for declares nothing, so it needs no scope of its own.
+	// The clause scope holds the loop variable from `for i := 0; ...`. A
+	// condition-only or bare for declares nothing, so it needs no scope.
+	//
+	// Under Go 1.22 semantics this scope is no longer where the body
+	// reads i from -- it is the HOLDER that carries i between iterations,
+	// each of which gets a cell of its own. See below.
 	scope := env
 	if n.Init != nil {
 		scope = NewEnv(env)
@@ -401,12 +447,65 @@ func (in *Interp) evalFor(env *Env, n *ast.ForStmt) (control, error) {
 			return control{}, err
 		}
 	}
+
+	// Go 1.22 made the clause variable per-iteration, so three closures
+	// made in three iterations observe three values. grsh used to declare
+	// it once and share it -- pre-1.22 semantics, and an asymmetry with
+	// range, which has always built a fresh scope per iteration.
+	//
+	// The copy is only taken when a closure could actually observe it.
+	// With no func literal anywhere in the loop, nothing can outlive the
+	// iteration that made it, so the shared cell is indistinguishable
+	// from per-iteration cells -- and skipping the copy keeps the plain
+	// loop at the allocation count TestLoopAllocationShape pins.
+	var vars []string
+	if n.Init != nil && loopCaptures(n) {
+		vars = clauseVars(n)
+	}
+
+	// first gates the post statement, which under this scheme runs at the
+	// TOP of every iteration but the first rather than at the bottom of
+	// each. That is not a stylistic rearrangement -- it is the whole
+	// point. Running `i++` at the bottom would advance the cell the
+	// iteration's own closures captured, and print 1 2 3 where Go prints
+	// 0 1 2. Each iteration must increment ITS OWN copy, before its
+	// condition is tested against it:
+	//
+	//	holder ─copy─> iter ─post─> ─cond─> ─body─> ─copy back─> holder
+	//	                 ^                     ^
+	//	                 the cell closures made here capture; it is
+	//	                 never touched again once the body returns
+	//
+	// On the shared-cell path the two orders are identical: the sequence
+	// is cond, body, post, cond, body, post either way.
+	first := true
 	for i := 0; ; i++ {
 		if i > 100_000_000 {
 			return control{}, in.errAt(n, "loop iteration limit exceeded")
 		}
+
+		// iter parents to env rather than to scope because it re-declares
+		// everything scope holds: scope is built fresh and only Init runs
+		// in it, and Init declares only through the `:=` clauseVars reads.
+		// So the lookup chain stays the depth it was.
+		iter := scope
+		if len(vars) > 0 {
+			iter = NewEnv(env)
+			for _, name := range vars {
+				v, _ := scope.Get(name)
+				iter.Define(name, v)
+			}
+		}
+
+		if !first && n.Post != nil {
+			if _, err := in.evalStmt(iter, n.Post); err != nil {
+				return control{}, err
+			}
+		}
+		first = false
+
 		if n.Cond != nil {
-			ok, err := in.evalBool(scope, n.Cond)
+			ok, err := in.evalBool(iter, n.Cond)
 			if err != nil {
 				return control{}, err
 			}
@@ -419,7 +518,7 @@ func (in *Interp) evalFor(env *Env, n *ast.ForStmt) (control, error) {
 		// second Env -- and its map -- on EVERY iteration, for a scope no
 		// declaration could ever reach: a `:=` in the body lands in the
 		// block's scope, one level in.
-		ctl, err := in.evalStmt(scope, n.Body)
+		ctl, err := in.evalStmt(iter, n.Body)
 		if err != nil {
 			return control{}, err
 		}
@@ -429,10 +528,15 @@ func (in *Interp) evalFor(env *Env, n *ast.ForStmt) (control, error) {
 		if ctl.kind == ctlReturn {
 			return ctl, nil
 		}
-		if n.Post != nil {
-			if _, err := in.evalStmt(scope, n.Post); err != nil {
-				return control{}, err
-			}
+
+		// The copy back is what carries the iteration's final value into
+		// the next one. It sits after the break and return checks because
+		// the clause variable does not outlive the loop, so a value copied
+		// back on the way out could never be read. `continue` DOES reach
+		// it -- a continued iteration still advances the loop.
+		for _, name := range vars {
+			v, _ := iter.Get(name)
+			scope.Set(name, v)
 		}
 	}
 	return control{}, nil
@@ -452,12 +556,19 @@ func (in *Interp) evalRange(env *Env, n *ast.RangeStmt) (control, error) {
 	declares := rangeVarsDeclare(n)
 	iterate := func(k, v Value) (bool, error) {
 		// A fresh scope per iteration is what gives `for _, v := range`
-		// closures a v of their own (Go 1.22 semantics, and the deliberate
-		// asymmetry with the for-clause case above; both are pinned in
-		// scope_test.go). It earns that allocation only when there is a
-		// binding to put in it: the `for i, v = range` form assigns to
-		// bindings that already exist further out, and `for range xs`
-		// binds nothing at all.
+		// closures a v of their own -- Go 1.22 semantics, which the
+		// for-clause above now matches too. Range got there first, and the
+		// two disagreeing was the pin that Round 6 settled; both are still
+		// pinned in scope_test.go, now for agreeing.
+		//
+		// It earns that allocation only when there is a binding to put in
+		// it: the `for i, v = range` form assigns to bindings that already
+		// exist further out, and `for range xs` binds nothing at all.
+		//
+		// Note the gate is NOT the for-clause's capture scan. Range always
+		// pays, because it declares into the scope on every iteration
+		// anyway -- there is no cheaper shared-cell path here to fall back
+		// to, which is why this side never had the question.
 		scope := env
 		if declares {
 			scope = NewEnv(env)

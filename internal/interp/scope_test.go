@@ -109,19 +109,73 @@ func TestScopeLoopBodyMayShadowClauseVar(t *testing.T) {
 fmt.Println()`, "0 100 200 \n")
 }
 
-// KNOWN DIVERGENCE FROM GO, pinned deliberately.
+// Go 1.22 semantics: the clause variable is per-iteration, so three
+// closures made in three iterations observe three values.
 //
-// Go 1.22 made the for-clause variable per-iteration, so real Go prints
-// "0 1 2" here. grsh declares it once in the clause scope, so all three
-// closures capture the SAME cell and observe its final value -- Go's
-// pre-1.22 semantics.
-//
-// This is not an endorsement; it is a tripwire. Whichever way it is
-// settled it should be settled on purpose, and an Env refactor that
-// flipped it as a side effect would otherwise ship silently.
-func TestScopeLoopClosuresShareTheClauseVar(t *testing.T) {
+// This used to print "3 3 3" -- one shared cell, Go's pre-1.22 rule --
+// and was pinned as a tripwire until it could be settled on purpose.
+func TestScopeLoopClosuresCaptureTheirOwnValue(t *testing.T) {
 	wantOut(t, `fns := []any{}
 for i := 0; i < 3; i++ {
+	fns = append(fns, func() { fmt.Print(i, " ") })
+}
+for _, f := range fns {
+	f()
+}
+fmt.Println()`, "0 1 2 \n")
+}
+
+// The post statement runs on the iteration's OWN copy, at the top of the
+// next one rather than the bottom of this one. Getting that wrong is the
+// near miss: an `i++` at the bottom advances the cell the iteration's
+// closures already captured, and this prints "1 2 3" instead.
+func TestScopeLoopPostDoesNotAdvanceACapturedCell(t *testing.T) {
+	wantOut(t, `fns := []any{}
+for i := 0; i < 3; i++ {
+	fns = append(fns, func() { fmt.Print(i, " ") })
+}
+for _, f := range fns {
+	f()
+}
+fmt.Println()`, "0 1 2 \n")
+}
+
+// Every clause variable is per-iteration, not just the first.
+func TestScopeLoopAllClauseVarsAreCopied(t *testing.T) {
+	wantOut(t, `fns := []any{}
+for i, j := 0, 10; i < 3; i, j = i+1, j+1 {
+	fns = append(fns, func() { fmt.Print(i, "/", j, " ") })
+}
+for _, f := range fns {
+	f()
+}
+fmt.Println()`, "0/10 1/11 2/12 \n")
+}
+
+// `continue` still advances the loop: the copy back into the holder sits
+// after the body, on the path a continued iteration takes.
+func TestScopeLoopContinueStillAdvances(t *testing.T) {
+	wantOut(t, `fns := []any{}
+for i := 0; i < 5; i++ {
+	if i == 2 {
+		continue
+	}
+	fns = append(fns, func() { fmt.Print(i, " ") })
+}
+for _, f := range fns {
+	f()
+}
+fmt.Println()`, "0 1 3 4 \n")
+}
+
+// KNOWN AND CORRECT DIVERGENCE, matching Go: only a `:=` clause gets
+// per-iteration variables. `for i = 0; ...` assigns to a binding the loop
+// does not own, so there is nothing to make a copy of and all three
+// closures share the outer i.
+func TestScopeLoopAssignFormKeepsOneCell(t *testing.T) {
+	wantOut(t, `fns := []any{}
+i := 0
+for i = 0; i < 3; i++ {
 	fns = append(fns, func() { fmt.Print(i, " ") })
 }
 for _, f := range fns {
@@ -130,11 +184,75 @@ for _, f := range fns {
 fmt.Println()`, "3 3 3 \n")
 }
 
-// Range is the other half of that divergence and lands on the modern
-// side: evalRange builds a fresh scope per iteration and defines the key
-// and value into it, so each closure captures its own cell. The asymmetry
-// with the for-clause case above is real, and pinning both is what makes
-// it visible.
+// The per-iteration copy is taken only when a closure could observe it.
+// With no func literal in the loop, the shared cell is indistinguishable
+// from per-iteration cells, and the loop keeps the cheap path -- so these
+// pin that the CHEAP path computes the same answers.
+func TestScopeLoopWithoutClosuresIsUnchanged(t *testing.T) {
+	// The clause variable survives the body, the post advances it, and
+	// break leaves it where it was.
+	wantOut(t, `s := 0
+for i := 0; i < 4; i++ {
+	s = s + i
+}
+fmt.Println(s)`, "6\n")
+	wantOut(t, `s := 0
+for i := 0; i < 10; i++ {
+	if i == 3 {
+		break
+	}
+	s = s + i
+}
+fmt.Println(s)`, "3\n")
+	wantOut(t, `s := 0
+for i := 0; i < 5; i++ {
+	if i == 2 {
+		continue
+	}
+	s = s + i
+}
+fmt.Println(s)`, "8\n")
+}
+
+// Nested loops each get their own per-iteration cell, and the inner one
+// closing over BOTH still sees the right pair.
+func TestScopeNestedLoopClosuresCaptureBothVars(t *testing.T) {
+	wantOut(t, `fns := []any{}
+for i := 0; i < 2; i++ {
+	for j := 0; j < 2; j++ {
+		fns = append(fns, func() { fmt.Print(i, "/", j, " ") })
+	}
+}
+for _, f := range fns {
+	f()
+}
+fmt.Println()`, "0/0 0/1 1/0 1/1 \n")
+}
+
+// The capture scan covers the WHOLE clause, not just the body: a closure
+// made in the condition captures the iteration's cell exactly as one made
+// in the body does.
+//
+// The shape is deliberately artificial -- every natural place to build a
+// closure is the body -- but the line that scans cond and post is load
+// bearing, and an unscanned cond would silently fall back to one shared
+// cell here. Four closures, because the condition also runs on the
+// iteration that ends the loop.
+func TestScopeLoopCaptureScanCoversTheCondition(t *testing.T) {
+	wantOut(t, `fns := []any{}
+for i := 0; func() bool { fns = append(fns, func() { fmt.Print(i, " ") }); return i < 3 }(); i++ {
+}
+for _, f := range fns {
+	f()
+}
+fmt.Println()`, "0 1 2 3 \n")
+}
+
+// Range has always been on the modern side: evalRange builds a fresh
+// scope per iteration and defines the key and value into it, so each
+// closure captures its own cell. It is pinned alongside the for-clause
+// case because the two used to DISAGREE, and that they now agree is the
+// property worth keeping.
 func TestScopeRangeClosuresCaptureTheirOwnValue(t *testing.T) {
 	wantOut(t, `fns := []any{}
 for _, v := range []int{10, 20, 30} {
