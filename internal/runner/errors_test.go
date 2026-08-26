@@ -49,6 +49,16 @@ func TestErrorPositions(t *testing.T) {
 			"echo hi\nx := ]bad\n",
 			"err.grsh:2", "",
 		},
+		{
+			// A call in statement position aborts on a non-nil error and
+			// reports the CALL's position, not the script's end. Checked
+			// here rather than in a golden script because the golden
+			// harness only tolerates an ExitErr, and this is an ordinary
+			// positioned error -- which is the part worth pinning.
+			"error from a statement-position call",
+			"echo one\nwriteFile(\"no-such-dir/f.txt\", \"x\")\nfmt.Println(\"never reached\")\n",
+			"err.grsh:2", "no such file or directory",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

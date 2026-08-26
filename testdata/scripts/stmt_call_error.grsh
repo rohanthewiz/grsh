@@ -1,0 +1,24 @@
+# A Go call in statement position aborts on a non-nil error, exactly as
+# `v := f()` does. Whether a failure is noticed must not depend on
+# whether the caller happened to want the value. This script pins the
+# shapes that CONTINUE; the abort itself is in errors_test.go, where the
+# reported position can be checked too.
+
+# Naming the error is the opt-out, in both spellings.
+_ = writeFile("no-such-dir/note.txt", "x")
+fmt.Println("discarded explicitly")
+err := writeFile("no-such-dir/note.txt", "x")
+fmt.Println("named:", err != nil)
+
+# A nil error is not an abort, and the results are still discarded.
+writeFile("note.txt", "hello\n")
+fmt.Println("wrote:", exists("note.txt"))
+
+# A failing $(...) is data, not a failure: the status is reported through
+# status(), and that holds in statement position too. This is the one
+# call shape the rule exempts, and reaching it takes some doing -- a bare
+# $(...) on its own line classifies as a SHELL line and never becomes a
+# __capture call at all, so the capture has to sit inside a line the
+# classifier has already called Go.
+for i := 0; i < 1; i++ { $(false) }
+fmt.Println("capture did not abort, status:", status())

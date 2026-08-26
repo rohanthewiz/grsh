@@ -227,13 +227,47 @@ func (in *Interp) evalStmt(env *Env, st ast.Stmt) (control, error) {
 		return control{}, nil
 
 	case *ast.ExprStmt:
-		if call, ok := n.X.(*ast.CallExpr); ok {
+		call, isCall := n.X.(*ast.CallExpr)
+		if isCall {
 			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "__shell" {
 				return in.runShellStmt(env, call)
 			}
 		}
-		_, err := in.evalExpr(env, n.X)
-		return control{}, err
+		vals, err := in.evalExpr(env, n.X)
+		if err != nil {
+			return control{}, err
+		}
+		// A call in statement position discards its results, and that used
+		// to include its error -- so `mayFail()` succeeded silently while
+		// `v := mayFail()` on the same function aborted the script.
+		//
+		// The inconsistency was with grsh's OWN rule, not with Go's. Go
+		// discards it here too, but Go also does not abort on the
+		// assignment form; grsh does, deliberately, because a shell that
+		// keeps going after a failure is the thing shells are criticised
+		// for. Adding a variable to a call should not be what decides
+		// whether a failure is noticed.
+		//
+		//	mayFail()          aborts
+		//	v := mayFail()     aborts
+		//	_ = mayFail()      ignored — naming it is the opt-out
+		//	err := mayFail()   binds err, script decides
+		//
+		// $(...) is exempt for the reason it always was: a non-zero exit
+		// is data there, reported through status().
+		//
+		// The cost of the rule is that a call whose PURPOSE is to build an
+		// error -- a bare `errors.New("x")`, which does nothing either way
+		// -- now aborts. There is no way to tell that apart from a call
+		// that failed, and the shape is meaningless code in both languages.
+		if isCall && !isCaptureCall(n.X) && len(vals) > 0 {
+			// Mirrors assignRHS: a nil error arrives as an untyped nil
+			// Value, so a successful assertion already means non-nil.
+			if last, ok := vals[len(vals)-1].(error); ok && last != nil {
+				return control{}, in.wrapAt(n.X, last)
+			}
+		}
+		return control{}, nil
 
 	case *ast.AssignStmt:
 		return control{}, in.assign(env, n)

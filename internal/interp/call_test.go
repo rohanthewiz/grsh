@@ -229,17 +229,80 @@ fmt.Println(v == "", err != nil)`, map[string]any{
 	}
 }
 
-// KNOWN BEHAVIOR, pinned. In statement position nothing inspects the
-// return values, so an error from a call written as a bare statement is
-// discarded -- unlike the assignment forms above. Scripts that care must
-// assign. (Go's vet would flag the same shape; grsh has no vet.)
-func TestErrorFromAStatementCallIsDiscarded(t *testing.T) {
-	out, err := eval(t, `mayFail()
+// A call written as a bare statement aborts on a non-nil error, exactly
+// as the single-target assignment above does.
+//
+// This is grsh's rule, not Go's. Go discards the error here -- but Go
+// also does not abort on `v := mayFail()`, and grsh does, deliberately.
+// Whether a failure is noticed must not depend on whether the caller
+// happened to want the value.
+func TestErrorFromAStatementCallAborts(t *testing.T) {
+	_, err := eval(t, `mayFail()
 fmt.Println("still here")`, map[string]any{
-		"mayFail": func() error { return errFor("ignored") },
+		"mayFail": func() error { return errFor("it failed") },
+	})
+	if err == nil {
+		t.Fatal("expected the error to abort the script")
+	}
+	if !strings.Contains(err.Error(), "it failed") {
+		t.Errorf("err = %v; want the callee's error", err)
+	}
+}
+
+// The (T, error) shape aborts on the same rule -- it is the LAST result
+// that is inspected, so both arities behave alike.
+func TestErrorFromAStatementCallAbortsWithAValueToo(t *testing.T) {
+	_, err := eval(t, `mayFail()`, map[string]any{
+		"mayFail": func() (string, error) { return "v", errFor("it failed") },
+	})
+	if err == nil || !strings.Contains(err.Error(), "it failed") {
+		t.Fatalf("err = %v; want the callee's error to abort", err)
+	}
+}
+
+// A nil error is not an abort, and the results are still discarded.
+func TestStatementCallWithNilErrorProceeds(t *testing.T) {
+	out, err := eval(t, `ok()
+fmt.Println("still here")`, map[string]any{
+		"ok": func() (string, error) { return "v", nil },
 	})
 	if err != nil {
-		t.Fatalf("run: %v; a statement-position error should not abort", err)
+		t.Fatalf("run: %v; a nil error must not abort", err)
+	}
+	if out != "still here\n" {
+		t.Errorf("got %q, want %q", out, "still here\n")
+	}
+}
+
+// Naming the error is the opt-out, in both spellings. `_ = f()` discards
+// it explicitly; `err := f()` hands the script control, as the two-target
+// assignment does.
+func TestStatementCallErrorCanBeOptedOutOf(t *testing.T) {
+	for _, body := range []string{
+		"_ = mayFail()\nfmt.Println(\"still here\")",
+		"err := mayFail()\n_ = err\nfmt.Println(\"still here\")",
+	} {
+		out, err := eval(t, body, map[string]any{
+			"mayFail": func() error { return errFor("ignored") },
+		})
+		if err != nil {
+			t.Fatalf("run: %v\nsource:\n%s", err, body)
+		}
+		if out != "still here\n" {
+			t.Errorf("got %q, want %q\nsource:\n%s", out, "still here\n", body)
+		}
+	}
+}
+
+// A call returning something that is not an error is untouched: only the
+// last result is inspected, and only when it is a non-nil error.
+func TestStatementCallWithNonErrorResultIsUnaffected(t *testing.T) {
+	out, err := eval(t, `count()
+fmt.Println("still here")`, map[string]any{
+		"count": func() int { return 3 },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
 	}
 	if out != "still here\n" {
 		t.Errorf("got %q, want %q", out, "still here\n")
