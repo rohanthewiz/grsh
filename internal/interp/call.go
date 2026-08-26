@@ -799,8 +799,18 @@ func (in *Interp) typeOf(e ast.Expr) (reflect.Type, error) {
 	return nil, in.errAt(e, fmt.Sprintf("unsupported type %T yet", e))
 }
 
+// evalComposite builds a composite literal that spells its own type.
+//
+// Go lets a NESTED literal elide that type -- the inner []int of
+// [][]int{{1, 2}} is implied by the outer element type -- so the actual
+// construction lives in compositeOf, which takes the type as a parameter
+// rather than reading it off the node. This function is the entry point
+// for the one literal that has to name a type: the outermost.
 func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
 	if n.Type == nil {
+		// Reachable only where nothing supplies a type from outside --
+		// a bare `{1, 2}` in expression position. Every nested position
+		// routes through elidedElem instead.
 		return nil, in.errAt(n, "composite literal needs an explicit type here")
 	}
 	if st, ok := lookupStructType(env, n.Type); ok {
@@ -810,11 +820,22 @@ func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	return in.compositeOf(env, t, n)
+}
+
+// compositeOf builds a literal of a type already resolved by the caller.
+//
+// Splitting this from evalComposite is what makes elision work at any
+// depth: each level hands its element type down, and a nested literal
+// with no type of its own is built against what it was handed. The
+// recursion needs no depth limit of its own -- it is bounded by the
+// nesting the parser already accepted.
+func (in *Interp) compositeOf(env *Env, t reflect.Type, n *ast.CompositeLit) (Value, error) {
 	switch t.Kind() {
 	case reflect.Slice:
 		out := reflect.MakeSlice(t, 0, len(n.Elts))
 		for _, el := range n.Elts {
-			v, err := in.eval1(env, el)
+			v, err := in.elidedElem(env, el, t.Elem())
 			if err != nil {
 				return nil, err
 			}
@@ -832,11 +853,16 @@ func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
 			if !ok {
 				return nil, in.errAt(el, "map literal elements need key: value")
 			}
-			k, err := in.eval1(env, kv.Key)
+			// The key routes through elidedElem for symmetry with the
+			// value, but no composite type can currently BE a map key
+			// here: arrays are unsupported by typeOf, and slices and maps
+			// are not comparable. So this is uniform rather than useful,
+			// and it becomes useful the day arrays land.
+			k, err := in.elidedElem(env, kv.Key, t.Key())
 			if err != nil {
 				return nil, err
 			}
-			v, err := in.eval1(env, kv.Value)
+			v, err := in.elidedElem(env, kv.Value, t.Elem())
 			if err != nil {
 				return nil, err
 			}
@@ -853,4 +879,30 @@ func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
 		return out.Interface(), nil
 	}
 	return nil, in.errAt(n, "unsupported composite literal type yet")
+}
+
+// elidedElem evaluates one element of a composite literal, supplying the
+// type when the element is itself a literal that left its own out.
+//
+//	[][]int{{1, 2}}          want = []int      -- built here
+//	[][]int{[]int{1, 2}}     want ignored      -- the node names its type
+//	[]int{1, 2}              not a literal     -- ordinary evaluation
+//
+// Anything that is not an untyped literal takes the ordinary path, so
+// this costs one type switch per element and changes nothing else.
+func (in *Interp) elidedElem(env *Env, e ast.Expr, want reflect.Type) (Value, error) {
+	lit, ok := e.(*ast.CompositeLit)
+	if !ok || lit.Type != nil {
+		return in.eval1(env, e)
+	}
+	if want == nil {
+		return nil, in.errAt(e, "composite literal needs an explicit type here")
+	}
+	// `[]any{{1}}` lands here: an interface element type says nothing
+	// about what to build, and Go rejects it for the same reason. Naming
+	// the type is the fix in both languages, so say so.
+	if k := want.Kind(); k != reflect.Slice && k != reflect.Map && k != reflect.Array {
+		return nil, in.errAt(e, fmt.Sprintf("composite literal needs an explicit type here: %s is not a composite type", want))
+	}
+	return in.compositeOf(env, want, lit)
 }

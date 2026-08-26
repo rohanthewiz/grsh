@@ -299,21 +299,74 @@ fmt.Println(m["a"][1])`, "2\n")
 fmt.Println(len(xs), xs[0][1], xs[1][0])`, "2 2 3\n")
 }
 
+// A nested composite literal may elide its type, as in Go: the inner
+// []int of [][]int{{1, 2}} is implied by the outer element type. The
+// elided and explicit spellings must build the same value.
+func TestElidedNestedCompositeTypes(t *testing.T) {
+	wantOut(t, `xs := [][]int{{1, 2}, {3}}
+fmt.Println(len(xs), xs[0][1], xs[1][0])`, "2 2 3\n")
+	wantOut(t, `m := map[string][]int{"a": {1, 2}}
+fmt.Println(len(m["a"]), m["a"][1])`, "2 2\n")
+	wantOut(t, `m := map[string]map[string]int{"a": {"b": 3}}
+fmt.Println(m["a"]["b"])`, "3\n")
+}
+
+// Elision goes all the way down: each level hands its element type to
+// the next, so depth is not a special case.
+func TestElidedNestedCompositesRecurse(t *testing.T) {
+	wantOut(t, `xs := [][][]int{{{1, 2}, {3}}, {{4}}}
+fmt.Println(len(xs), xs[0][0][1], xs[1][0][0])`, "2 2 4\n")
+}
+
+// The two spellings are interchangeable at any level, including mixed
+// within one literal -- naming the inner type still works and still
+// means the same thing.
+func TestElidedAndExplicitNestedFormsAgree(t *testing.T) {
+	wantOut(t, `a := [][]int{{1, 2}, []int{3, 4}}
+b := [][]int{[]int{1, 2}, {3, 4}}
+fmt.Println(a[0][1], a[1][0], b[0][1], b[1][0])`, "2 3 2 3\n")
+}
+
+// A struct field's literal elides against the field's declared type,
+// which is why declareType keeps the resolved type instead of discarding
+// it once the zero value is taken.
+func TestElidedCompositeInStructField(t *testing.T) {
+	wantOut(t, `type P struct {
+	Tags []string
+	M    map[string]int
+}
+p := P{Tags: {"a", "b"}, M: {"k": 1}}
+fmt.Println(len(p.Tags), p.Tags[1], p.M["k"])`, "2 b 1\n")
+	// Positional form takes the same path.
+	wantOut(t, `type P struct {
+	Tags []string
+}
+p := P{{"x"}}
+fmt.Println(p.Tags[0])`, "x\n")
+}
+
 // KNOWN GAP, pinned as it stands.
 //
-// Go lets a nested composite literal elide the element type -- the inner
-// []int in [][]int{{1, 2}} is implied. evalComposite requires an explicit
-// type on every literal (a *ast.CompositeLit with a nil Type reaches it
-// with nothing to build from), so the elided spelling is rejected.
+// Elision needs an element type to build against, and two positions
+// cannot supply one:
 //
-// The message is at least actionable, and writing the inner type out
-// works. Recording it here means a future fix shows up as a test change
-// rather than as an unexplained behavior shift.
-func TestElidedNestedCompositeTypeIsNotSupported(t *testing.T) {
-	wantErr(t, `xs := [][]int{{1, 2}}
-_ = xs`, "composite literal needs an explicit type here")
-	wantErr(t, `m := map[string][]int{"a": {1}}
-_ = m`, "composite literal needs an explicit type here")
+//   - []any{{1}} -- an interface element type says nothing about what to
+//     construct. Go rejects this too, for the same reason.
+//   - []P{{1}} where P is a script struct -- typeOf models only native
+//     types, so `[]P` does not resolve as a type at all. This is the
+//     larger gap (script struct types are second-class in TYPE position,
+//     not just in literals); elision inherits it rather than causing it.
+//
+// A bare `{1, 2}` in expression position keeps the original message,
+// because there nothing outside it could ever supply a type.
+func TestElisionNeedsATypeToBuildAgainst(t *testing.T) {
+	wantErr(t, `xs := []any{{1}}
+_ = xs`, "not a composite type")
+	wantErr(t, `type P struct {
+	X int
+}
+xs := []P{{1}}
+_ = xs`, "unknown type P")
 }
 
 // ---- type assertions ----

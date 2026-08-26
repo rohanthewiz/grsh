@@ -15,6 +15,13 @@ type StructType struct {
 	Fields []string
 	Zero   []Value // zero value per field (nil when the type is exotic)
 	Index  map[string]int
+
+	// FieldTypes is the resolved type per field, parallel to Fields, and
+	// nil at any position typeOf could not resolve (another script
+	// struct, or a type grsh does not model). It exists so a field's
+	// literal can elide its type the way a slice element's can:
+	// P{Tags: {"a"}} needs to know Tags is a []string.
+	FieldTypes []reflect.Type
 }
 
 // StructVal is an instance of a script-declared struct.
@@ -48,14 +55,22 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 		if len(f.Names) == 0 {
 			return in.errAt(f, "embedded fields are not supported yet")
 		}
+		// A field type grsh cannot model is not an error: assignment is
+		// dynamically typed, so the field simply starts nil and works.
+		// The resolved type is kept rather than discarded after the zero
+		// is taken, because an elided nested literal needs it later.
+		rt, err := in.typeOf(f.Type)
 		var zero Value
-		if rt, err := in.typeOf(f.Type); err == nil {
+		if err == nil {
 			zero = reflect.Zero(rt).Interface()
+		} else {
+			rt = nil
 		}
 		for _, n := range f.Names {
 			t.Index[n.Name] = len(t.Fields)
 			t.Fields = append(t.Fields, n.Name)
 			t.Zero = append(t.Zero, zero)
+			t.FieldTypes = append(t.FieldTypes, rt)
 		}
 	}
 	env.Define(ts.Name.Name, t)
@@ -81,7 +96,7 @@ func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) 
 			if !ok {
 				return nil, in.errAt(kv.Key, fmt.Sprintf("unknown field %s in %s", key.Name, t.Name))
 			}
-			v, err := in.eval1(env, kv.Value)
+			v, err := in.elidedElem(env, kv.Value, t.FieldTypes[idx])
 			if err != nil {
 				return nil, err
 			}
@@ -91,7 +106,7 @@ func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) 
 		if i >= len(t.Fields) {
 			return nil, in.errAt(el, fmt.Sprintf("too many values in %s literal", t.Name))
 		}
-		v, err := in.eval1(env, el)
+		v, err := in.elidedElem(env, el, t.FieldTypes[i])
 		if err != nil {
 			return nil, err
 		}
