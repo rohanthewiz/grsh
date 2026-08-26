@@ -303,13 +303,32 @@ func joinShell(lines []string, i int) (string, int, error) {
 		i++
 		text = joined + " " + strings.TrimLeft(lines[i], " \t")
 	}
-	for _, hd := range scanHeredocs(text) {
+	hds := scanHeredocs(text)
+	if len(hds) == 0 {
+		// The overwhelmingly common case. Returning text unchanged keeps
+		// a plain shell line allocation-free beyond what joining already
+		// cost — no Builder, no second copy of the string.
+		return text, i, nil
+	}
+	// Heredoc bodies are copied verbatim, one physical line at a time, and
+	// a body is unbounded (a here-doc'd file can be thousands of lines).
+	// `text += "\n" + lines[i]` allocated a fresh string holding EVERY
+	// byte accumulated so far on each line, so the total copying was
+	// quadratic in body length: a 512-line body burned ~5MB to produce a
+	// ~20KB chunk. A Builder appends into a doubling buffer instead, so
+	// the whole body costs O(total bytes) with an amortized-constant
+	// number of reallocations.
+	var b strings.Builder
+	b.Grow(len(text))
+	b.WriteString(text)
+	for _, hd := range hds {
 		for {
 			if i+1 >= len(lines) {
 				return "", 0, fmt.Errorf("heredoc <<%s: %w", hd.delim, errors.Join(ErrHeredoc, ErrIncomplete))
 			}
 			i++
-			text += "\n" + lines[i]
+			b.WriteByte('\n')
+			b.WriteString(lines[i])
 			cmp := lines[i]
 			if hd.stripTabs {
 				cmp = strings.TrimLeft(cmp, "\t")
@@ -319,7 +338,11 @@ func joinShell(lines []string, i int) (string, int, error) {
 			}
 		}
 	}
-	return text, i, nil
+	// Note the delimiter scan runs on `text`, the continuation-joined FIRST
+	// logical line, not on the accumulated chunk — body lines are raw data
+	// and must never be scanned for further << operators. Hoisting the scan
+	// above the Builder preserves that; it is not merely a fast path.
+	return b.String(), i, nil
 }
 
 // heredocRef is one << operator found on a logical shell line.

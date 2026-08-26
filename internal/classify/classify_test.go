@@ -2,6 +2,8 @@ package classify
 
 import (
 	"errors"
+	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -350,6 +352,89 @@ func TestHeredocChunks(t *testing.T) {
 		t.Errorf("follow-on chunk: got %v line %d, want shell line 5", chunks[1].Kind, chunks[1].StartLine)
 	}
 }
+
+// TestHeredocMultiChunkText pins the text of a TWO-heredoc chunk. One
+// command can open several bodies (`cat <<A <<B`), which are read in order,
+// each terminated by its own delimiter. joinShell accumulates all of them
+// into a single Builder across separate loop iterations, so this is the
+// case where a mis-seeded or re-seeded buffer would duplicate the command
+// line or drop the first body — neither of which the NeedsMore-only tests
+// in repl_test.go can see.
+func TestHeredocMultiChunkText(t *testing.T) {
+	src := strings.Join([]string{
+		`cat <<A <<-B`, // 1
+		`first body`,   // 2: belongs to A
+		`A`,            // 3
+		"\tsecond",     // 4: belongs to B, tab-stripped delimiter form
+		"\tB",          // 5
+		`echo done`,    // 6
+	}, "\n")
+	c := New(testPkgs)
+	chunks, err := c.File(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 {
+		for _, ch := range chunks {
+			t.Logf("chunk: %v %d-%d %q", ch.Kind, ch.StartLine, ch.EndLine, ch.Text)
+		}
+		t.Fatalf("got %d chunks, want 2", len(chunks))
+	}
+	want := "cat <<A <<-B\nfirst body\nA\n\tsecond\n\tB"
+	if chunks[0].Text != want {
+		t.Errorf("two-heredoc chunk text:\n got %q\nwant %q", chunks[0].Text, want)
+	}
+	if chunks[0].EndLine != 5 {
+		t.Errorf("two-heredoc chunk ends at line %d, want 5", chunks[0].EndLine)
+	}
+}
+
+// TestJoinShellHeredocLinear guards the heredoc body accumulation against
+// sliding back to `text += "\n" + line`, which reallocated the whole
+// accumulated chunk per body line.
+//
+// The assertion is on BYTES ALLOCATED, not on elapsed time, because that is
+// where the quadratic actually lives: the old loop made one allocation per
+// body line either way, so an alloc COUNT is linear under both shapes and
+// would catch nothing. Total bytes is also deterministic enough that a
+// modest ratio bound does not flake the way a timing ratio would.
+func TestJoinShellHeredocLinear(t *testing.T) {
+	body := func(n int) []string {
+		lines := make([]string, 0, n+2)
+		lines = append(lines, "cat <<EOF")
+		for i := range n {
+			lines = append(lines, fmt.Sprintf("body line %d with some filler text", i))
+		}
+		return append(lines, "EOF")
+	}
+	bytesPerJoin := func(n int) float64 {
+		lines := body(n)
+		const reps = 50
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		for range reps {
+			text, _, err := joinShell(lines, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			joinSink = text // keep the result live so nothing is elided
+		}
+		runtime.ReadMemStats(&after)
+		return float64(after.TotalAlloc-before.TotalAlloc) / reps
+	}
+	small, large := bytesPerJoin(64), bytesPerJoin(512)
+	// 8x the body is 8x the bytes to hold; the doubling buffer costs at
+	// most ~2x that in peak allocation, so 16x has real headroom. The
+	// quadratic scored ~64x here.
+	if ratio := large / small; ratio > 16 {
+		t.Errorf("8x the body lines allocated %.1fx the bytes — joinShell looks "+
+			"super-linear again (64 lines: %.0fB, 512 lines: %.0fB)", ratio, small, large)
+	}
+}
+
+// joinSink defeats dead-store elimination of joinShell's result above.
+var joinSink string
 
 // An unterminated heredoc in a script is a hard error wrapping
 // ErrIncomplete (the REPL turns that into "read more").
