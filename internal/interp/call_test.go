@@ -1,0 +1,493 @@
+package interp
+
+import (
+	"strings"
+	"testing"
+)
+
+// ---- closures ----
+
+func TestClosureCallAndReturn(t *testing.T) {
+	wantOut(t, `add := func(a int, b int) int { return a + b }
+fmt.Println(add(2, 3))`, "5\n")
+}
+
+// Grouped parameters (a, b int) flatten to one name each; flattenParams
+// is what keeps the arity check honest for that spelling.
+func TestClosureGroupedParams(t *testing.T) {
+	wantOut(t, `add := func(a, b, c int) int { return a + b + c }
+fmt.Println(add(1, 2, 3))`, "6\n")
+}
+
+// A function with no return statement yields no values, which is only
+// usable in statement position.
+func TestClosureWithNoReturnHasNoValue(t *testing.T) {
+	wantOut(t, `f := func() { fmt.Println("side effect") }
+f()`, "side effect\n")
+	// The assignment path reports it as a value-count mismatch...
+	wantErr(t, `f := func() { }
+x := f()
+_ = x`, "assignment mismatch: 1 variables but 0 values")
+	// ...and an expression context as an absent value.
+	wantErr(t, `f := func() { }
+fmt.Println(f())`, "expression has no value")
+}
+
+func TestClosureMultipleReturnValues(t *testing.T) {
+	wantOut(t, `split := func() (int, int) { return 1, 2 }
+a, b := split()
+fmt.Println(a, b)`, "1 2\n")
+}
+
+// Variadic parameters collect the surplus into a slice, and an empty
+// surplus is an empty slice rather than nil-and-a-panic.
+func TestClosureVariadic(t *testing.T) {
+	wantOut(t, `sum := func(label string, ns ...int) string {
+	total := 0
+	for _, n := range ns {
+		total += n
+	}
+	return label + fmt.Sprint(total)
+}
+fmt.Println(sum("t:", 1, 2, 3))
+fmt.Println(sum("empty:"))`, "t:6\nempty:0\n")
+}
+
+// Arity errors name the function when it has a name, so the message
+// points at the call the user wrote.
+func TestClosureArityErrors(t *testing.T) {
+	wantErr(t, `add := func(a, b int) int { return a + b }
+fmt.Println(add(1))`, "add expects 2 argument(s), got 1")
+	wantErr(t, `add := func(a, b int) int { return a + b }
+fmt.Println(add(1, 2, 3))`, "add expects 2 argument(s), got 3")
+	// An anonymous closure has no name to report.
+	wantErr(t, `fmt.Println(func(a int) int { return a }())`, "function expects 1 argument(s), got 0")
+	// Variadic arity is a minimum, and it is still checked.
+	wantErr(t, `f := func(a int, rest ...int) int { return a }
+fmt.Println(f())`, "expects 2 argument(s), got 0")
+}
+
+// A func literal can be called where it is written.
+func TestImmediatelyInvokedFuncLit(t *testing.T) {
+	wantOut(t, `fmt.Println(func(n int) int { return n * n }(6))`, "36\n")
+}
+
+// Functions are values: passable, storable, returnable.
+func TestFunctionsAreValues(t *testing.T) {
+	wantOut(t, `apply := func(f any, n int) any { return f }
+double := func(n int) int { return n * 2 }
+g := apply(double, 0)
+fmt.Println(g(21))`, "42\n")
+}
+
+// Run hoists every top-level `name := func(...)` before executing the
+// body, so a function may call one defined further down -- and two may
+// call each other.
+func TestTopLevelFunctionsAreHoisted(t *testing.T) {
+	wantOut(t, `main_ish := func() { fmt.Println(later()) }
+main_ish()
+later := func() string { return "defined below" }`, "defined below\n")
+}
+
+func TestMutualRecursion(t *testing.T) {
+	wantOut(t, `even := func(n int) bool {
+	if n == 0 {
+		return true
+	}
+	return odd(n - 1)
+}
+odd := func(n int) bool {
+	if n == 0 {
+		return false
+	}
+	return even(n - 1)
+}
+fmt.Println(even(10), odd(10))`, "true false\n")
+}
+
+// Hoisting applies only to the top level: a func assigned inside a block
+// is defined when that statement runs, so a forward call fails.
+func TestNestedFunctionsAreNotHoisted(t *testing.T) {
+	wantErr(t, `{
+	caller := func() { fmt.Println(callee()) }
+	caller()
+	callee := func() string { return "x" }
+	_ = callee
+}`, "undefined: callee")
+}
+
+// Runaway recursion is caught by a depth counter rather than by blowing
+// the host's stack, which would take the whole session with it.
+//
+// This case is slow -- about two seconds -- and the time is NOT the
+// descent. Nine thousand levels of legal recursion run in ~14ms; the
+// cost is the unwind, where callClosure wraps the error with an
+// "in_func" field at every level and serr copies the accumulated field
+// list on each wrap, making the unwind quadratic in depth. A runaway
+// recursion typed at the prompt therefore freezes the shell for seconds
+// before reporting a 40-character message. Left as found; recorded here
+// because this is the test that pays for it.
+func TestRunawayRecursionIsCaught(t *testing.T) {
+	wantErr(t, `f := func(n int) int { return f(n + 1) }
+fmt.Println(f(0))`, "call depth exceeded")
+}
+
+// ---- the reflect boundary: calling registered Go functions ----
+
+func TestCallGoFunction(t *testing.T) {
+	out, err := eval(t, `fmt.Println(shout("hi"), twice(21))`, map[string]any{
+		"shout": strings.ToUpper,
+		"twice": func(n int) int { return n * 2 },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "HI 42\n" {
+		t.Errorf("got %q, want %q", out, "HI 42\n")
+	}
+}
+
+func TestCallGoFunctionArityErrors(t *testing.T) {
+	extra := map[string]any{
+		"two":  func(a, b int) int { return a + b },
+		"vari": func(a int, rest ...int) int { return a },
+	}
+	for _, tc := range []struct{ src, want string }{
+		{`two(1)`, "two expects 2 argument(s), got 1"},
+		{`two(1, 2, 3)`, "two expects 2 argument(s), got 3"},
+		{`vari()`, "vari expects at least 1 argument(s), got 0"},
+	} {
+		_, err := eval(t, tc.src, extra)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want %q", tc.src, err, tc.want)
+		}
+	}
+}
+
+// A Go function that panics must not take the session down: callReflect
+// recovers and reports it as a positioned script error naming the callee.
+func TestPanicInGoFunctionBecomesAnError(t *testing.T) {
+	_, err := eval(t, `boom()`, map[string]any{
+		"boom": func() { panic("exploded") },
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "panic in boom") || !strings.Contains(err.Error(), "exploded") {
+		t.Errorf("err = %v; want it to name the function and the panic", err)
+	}
+}
+
+// A (T, error) return in a single-target assignment aborts the script on
+// a non-nil error, so scripts read like Go without the error dance...
+func TestSingleTargetAssignAbortsOnError(t *testing.T) {
+	_, err := eval(t, `v := mayFail(true)
+fmt.Println(v)`, map[string]any{
+		"mayFail": func(bad bool) (string, error) {
+			if bad {
+				return "", errFor("it failed")
+			}
+			return "ok", nil
+		},
+		"errFor": errFor,
+	})
+	if err == nil || !strings.Contains(err.Error(), "it failed") {
+		t.Fatalf("err = %v; want the callee's error to abort the script", err)
+	}
+}
+
+// ...and a nil error is dropped, leaving just the value.
+func TestSingleTargetAssignDropsNilError(t *testing.T) {
+	out, err := eval(t, `v := mayFail(false)
+fmt.Println(v)`, map[string]any{
+		"mayFail": func(bad bool) (string, error) { return "ok", nil },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "ok\n" {
+		t.Errorf("got %q, want %q", out, "ok\n")
+	}
+}
+
+// Naming the error explicitly hands control back to the script.
+func TestTwoTargetAssignExposesTheError(t *testing.T) {
+	out, err := eval(t, `v, err := mayFail(true)
+fmt.Println(v == "", err != nil)`, map[string]any{
+		"mayFail": func(bad bool) (string, error) { return "", errFor("nope") },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "true true\n" {
+		t.Errorf("got %q, want %q", out, "true true\n")
+	}
+}
+
+// KNOWN BEHAVIOR, pinned. In statement position nothing inspects the
+// return values, so an error from a call written as a bare statement is
+// discarded -- unlike the assignment forms above. Scripts that care must
+// assign. (Go's vet would flag the same shape; grsh has no vet.)
+func TestErrorFromAStatementCallIsDiscarded(t *testing.T) {
+	out, err := eval(t, `mayFail()
+fmt.Println("still here")`, map[string]any{
+		"mayFail": func() error { return errFor("ignored") },
+	})
+	if err != nil {
+		t.Fatalf("run: %v; a statement-position error should not abort", err)
+	}
+	if out != "still here\n" {
+		t.Errorf("got %q, want %q", out, "still here\n")
+	}
+}
+
+// ---- convertTo: adapting script values to Go parameter types ----
+
+// Go's int-to-string conversion produces a code point, which is almost
+// never what a script means. convertTo refuses it and names the fix.
+func TestIntArgumentToStringParamIsRefused(t *testing.T) {
+	_, err := eval(t, `shout(65)`, map[string]any{"shout": strings.ToUpper})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "strconv.Itoa") {
+		t.Errorf("err = %v; want the message to suggest strconv.Itoa", err)
+	}
+}
+
+// Numeric widths convert freely: a script int reaches an int64 or
+// float64 parameter without ceremony.
+func TestNumericArgumentsConvert(t *testing.T) {
+	out, err := eval(t, `fmt.Println(wide(7), precise(7))`, map[string]any{
+		"wide":    func(n int64) int64 { return n * 2 },
+		"precise": func(f float64) float64 { return f / 2 },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "14 3.5\n" {
+		t.Errorf("got %q, want %q", out, "14 3.5\n")
+	}
+}
+
+// A script slice is []any-flavored wherever it was built dynamically;
+// convertTo rebuilds it element-wise for a typed parameter.
+func TestSliceArgumentConvertsElementwise(t *testing.T) {
+	out, err := eval(t, `xs := []any{"a", "b"}
+fmt.Println(joined(xs))`, map[string]any{
+		"joined": func(ss []string) string { return strings.Join(ss, "-") },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "a-b\n" {
+		t.Errorf("got %q, want %q", out, "a-b\n")
+	}
+}
+
+// A nil script value becomes the parameter type's zero value rather than
+// an invalid reflect.Value that would panic inside Call.
+func TestNilArgumentBecomesTheZeroValue(t *testing.T) {
+	out, err := eval(t, `fmt.Println(describe(nil))`, map[string]any{
+		"describe": func(s string) string { return "[" + s + "]" },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "[]\n" {
+		t.Errorf("got %q, want %q", out, "[]\n")
+	}
+}
+
+// A value with no path to the parameter type reports both types.
+func TestUnconvertibleArgumentIsAnError(t *testing.T) {
+	_, err := eval(t, `takesSlice("not a slice")`, map[string]any{
+		"takesSlice": func(xs []int) int { return len(xs) },
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot use") {
+		t.Fatalf("err = %v; want a cannot-use message", err)
+	}
+}
+
+// Calling a non-function says so instead of failing inside reflect.
+func TestCallingANonFunctionIsAnError(t *testing.T) {
+	wantErr(t, `x := 5
+x()`, "not callable")
+}
+
+// The spread form is recognized and declined rather than silently
+// passing the slice as one argument.
+func TestSpreadCallIsNotSupported(t *testing.T) {
+	wantErr(t, `f := func(a, b int) int { return a + b }
+xs := []int{1, 2}
+fmt.Println(f(xs...))`, "spread calls")
+}
+
+// ---- Go builtins ----
+
+func TestBuiltinLenAndCap(t *testing.T) {
+	wantOut(t, `xs := make([]int, 2, 8)
+m := map[string]int{"a": 1}
+fmt.Println(len("abc"), len(xs), cap(xs), len(m))`, "3 2 8 1\n")
+}
+
+// len(nil) is 0 rather than an error: it keeps `len(m["missing"])` safe.
+func TestBuiltinLenOfNil(t *testing.T) {
+	wantOut(t, `fmt.Println(len(nil))`, "0\n")
+}
+
+// cap has no meaning on strings or maps and says so.
+func TestBuiltinCapRejectsStringsAndMaps(t *testing.T) {
+	wantErr(t, `fmt.Println(cap("abc"))`, "cap is not defined on string")
+	wantErr(t, `m := map[string]int{}
+fmt.Println(cap(m))`, "cap is not defined on map")
+}
+
+func TestBuiltinLenOfANumberIsAnError(t *testing.T) {
+	wantErr(t, `fmt.Println(len(5))`, "len is not defined on int")
+}
+
+func TestBuiltinAppend(t *testing.T) {
+	wantOut(t, `xs := []int{1}
+xs = append(xs, 2, 3)
+fmt.Println(xs)`, "[1 2 3]\n")
+}
+
+// append onto a nil base starts a fresh slice, so `var xs []int` -- and
+// an unset map entry -- accumulate without a make().
+func TestBuiltinAppendOntoNil(t *testing.T) {
+	wantOut(t, `xs := append(nil, 1, 2)
+fmt.Println(len(xs), xs[0], xs[1])`, "2 1 2\n")
+}
+
+func TestBuiltinAppendRejectsNonSlice(t *testing.T) {
+	wantErr(t, `fmt.Println(append("abc", 1))`, "append target must be a slice")
+}
+
+func TestBuiltinCopy(t *testing.T) {
+	wantOut(t, `dst := make([]int, 2)
+n := copy(dst, []int{7, 8, 9})
+fmt.Println(n, dst)`, "2 [7 8]\n")
+}
+
+// reflect.Copy panics on mismatched element types, so the check happens
+// before the call.
+func TestBuiltinCopyRejectsMismatchedElements(t *testing.T) {
+	wantErr(t, `dst := make([]int, 2)
+copy(dst, []string{"a"})`, "cannot copy")
+}
+
+func TestBuiltinMinMax(t *testing.T) {
+	wantOut(t, `fmt.Println(min(3, 1, 2), max(3, 1, 2))`, "1 3\n")
+	// They work on anything binaryOp can order, strings included.
+	wantOut(t, `fmt.Println(min("pear", "apple"), max("pear", "apple"))`, "apple pear\n")
+	// One argument is the trivial case, not an error.
+	wantOut(t, `fmt.Println(min(4), max(4))`, "4 4\n")
+}
+
+func TestBuiltinMake(t *testing.T) {
+	wantOut(t, `xs := make([]string, 2)
+m := make(map[string]int)
+m["a"] = 1
+fmt.Printf("%q %d\n", xs, len(m))`, "[\"\" \"\"] 1\n")
+}
+
+// reflect.MakeSlice panics on nonsense sizes; make validates first so the
+// script gets a positioned error.
+func TestBuiltinMakeRejectsBadSizes(t *testing.T) {
+	wantErr(t, `n := -1
+make([]int, n)`, "negative length")
+	wantErr(t, `make([]int, 5, 2)`, "length larger than capacity")
+}
+
+func TestBuiltinMakeRejectsUnsupportedTypes(t *testing.T) {
+	wantErr(t, `make(chan int)`, "")
+	wantErr(t, `make([3]int)`, "fixed-size arrays are not supported")
+}
+
+// iff is grsh's lazy ternary: the condition decides, and only the chosen
+// arm is evaluated -- so the dead arm may be an expression that would
+// fail. That laziness is the whole reason it is an intrinsic rather than
+// an ordinary function.
+func TestBuiltinIffIsLazy(t *testing.T) {
+	wantOut(t, `xs := []string{}
+fmt.Println(iff(len(xs) > 0, xs[0], "none"))`, "none\n")
+	wantOut(t, `xs := []string{"first"}
+fmt.Println(iff(len(xs) > 0, xs[0], "none"))`, "first\n")
+}
+
+func TestBuiltinIffArity(t *testing.T) {
+	wantErr(t, `fmt.Println(iff(true, 1))`, "iff expects (condition, thenValue, elseValue)")
+}
+
+// Builtins are only builtins while unshadowed: a script that binds the
+// name gets its own value, which is what keeps user code from colliding
+// with a surface that grows every milestone.
+func TestBuiltinsCanBeShadowed(t *testing.T) {
+	wantOut(t, `len := func(s string) string { return "shadowed:" + s }
+fmt.Println(len("x"))`, "shadowed:x\n")
+}
+
+// ---- conversions ----
+
+func TestConversions(t *testing.T) {
+	tests := []struct {
+		name, src, want string
+	}{
+		{"float to int truncates", `fmt.Println(int(3.9))`, "3\n"},
+		{"int to float", `fmt.Println(float64(3) / 2)`, "1.5\n"},
+		{"int to int64", `fmt.Println(int64(3))`, "3\n"},
+		{"int to rune", `fmt.Println(rune(65))`, "65\n"},
+		{"int to byte", `fmt.Println(byte(65))`, "65\n"},
+		{"rune to string", `fmt.Println(string(rune(65)))`, "A\n"},
+		{"int to string is a code point", `fmt.Println(string(65))`, "A\n"},
+		{"string of a string is identity", `fmt.Println(string("ab"))`, "ab\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) { wantOut(t, tc.src, tc.want) })
+	}
+}
+
+// A numeric conversion applied to a string is the classic slip; the
+// message points at strconv rather than producing a code point silently.
+func TestNumericConversionOfAStringIsRefused(t *testing.T) {
+	wantErr(t, `fmt.Println(int("42"))`, "use strconv")
+}
+
+func TestStringConversionOfAnUnsupportedTypeIsRefused(t *testing.T) {
+	wantErr(t, `fmt.Println(string(1.5))`, "use fmt.Sprint or strconv")
+}
+
+func TestConversionArity(t *testing.T) {
+	wantErr(t, `fmt.Println(int(1, 2))`, "conversion expects one argument")
+}
+
+// ---- package symbols ----
+
+// Package selectors resolve through the curated registry, both as
+// functions and as plain values.
+func TestPackageSymbols(t *testing.T) {
+	wantOut(t, `fmt.Println(strings.ToUpper("ab"), strconv.Itoa(7))`, "AB 7\n")
+}
+
+// A package in the registry but a symbol that is not says so precisely,
+// and distinguishes itself from an unknown package.
+func TestUnknownRegistrySymbolIsAnError(t *testing.T) {
+	wantErr(t, `strings.NoSuchFunction("x")`, "not in the grsh registry")
+	wantErr(t, `nosuchpkg.Thing()`, "undefined: nosuchpkg")
+}
+
+// A local binding shadows a package name, so `strings := "..."` does not
+// break the script -- evalSelector checks the environment first.
+func TestLocalBindingShadowsAPackageName(t *testing.T) {
+	wantErr(t, `strings := "shadowed"
+fmt.Println(strings.ToUpper("ab"))`, "unknown method ToUpper on string")
+}
+
+// errFor builds a plain error for the test cases above without dragging
+// serr's field machinery into the assertions.
+func errFor(msg string) error { return simpleErr(msg) }
+
+type simpleErr string
+
+func (e simpleErr) Error() string { return string(e) }
