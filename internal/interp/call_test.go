@@ -1,6 +1,9 @@
 package interp
 
 import (
+	"fmt"
+	"go/ast"
+	"go/token"
 	"strings"
 	"testing"
 )
@@ -482,6 +485,98 @@ func TestUnknownRegistrySymbolIsAnError(t *testing.T) {
 func TestLocalBindingShadowsAPackageName(t *testing.T) {
 	wantErr(t, `strings := "shadowed"
 fmt.Println(strings.ToUpper("ab"))`, "unknown method ToUpper on string")
+}
+
+// ---- the {expr} fragment cache ----
+//
+// wordEval.EvalGoExpr is the shell leg, which these tests deliberately do
+// not drive (see the harness note in helper_test.go) — but parseFragment
+// underneath it is pure interpreter, so it is exercised directly. The node
+// handed in plays the part of the enclosing __shell call: all it supplies
+// is a position to anchor the fragment's line info to.
+
+// fragmentHarness returns an interpreter with a live fset, plus a node
+// from it to anchor fragments against.
+func fragmentHarness(t *testing.T) (*Interp, ast.Node) {
+	t.Helper()
+	in, _, err := evalKeep(t, "x := 1\n_ = x", nil)
+	if err != nil {
+		t.Fatalf("harness run: %v", err)
+	}
+	// in.fset is the one Run installed; any position in it will do.
+	var node ast.Node
+	in.fset.Iterate(func(f *token.File) bool {
+		node = &ast.Ident{NamePos: f.Pos(0), Name: "anchor"}
+		return false
+	})
+	if node == nil {
+		t.Fatal("harness: the run left no file in the fileset")
+	}
+	return in, node
+}
+
+// The cache is what keeps a {expr} inside a loop from re-parsing per
+// iteration, so the hit has to be an actual reuse of the AST, not merely
+// an equal one.
+func TestFragmentCacheReusesTheParsedAST(t *testing.T) {
+	in, node := fragmentHarness(t)
+
+	first, err := in.parseFragment("strings.ToUpper(x)", node)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	second, err := in.parseFragment("strings.ToUpper(x)", node)
+	if err != nil {
+		t.Fatalf("re-parse: %v", err)
+	}
+	if first != second {
+		t.Error("the same fragment re-parsed: the cache did not hit")
+	}
+	other, err := in.parseFragment("strings.ToLower(x)", node)
+	if err != nil {
+		t.Fatalf("parse of a second fragment: %v", err)
+	}
+	if other == first {
+		t.Error("a different fragment returned the first one's AST")
+	}
+}
+
+// A generated script can hold more distinct {expr} sites than a person
+// would ever write. The cache must stay bounded through that, and must
+// still be serving hits on the other side of a flush.
+func TestFragmentCacheIsBounded(t *testing.T) {
+	in, node := fragmentHarness(t)
+
+	for i := range exprCacheMax * 3 {
+		if _, err := in.parseFragment(fmt.Sprintf("x + %d", i), node); err != nil {
+			t.Fatalf("fragment %d: %v", i, err)
+		}
+		if len(in.exprCache) > exprCacheMax {
+			t.Fatalf("cache holds %d entries after %d fragments, cap is %d",
+				len(in.exprCache), i+1, exprCacheMax)
+		}
+	}
+	// The flush must leave a working cache behind, not a dead one.
+	a, err := in.parseFragment("x + 1", node)
+	if err != nil {
+		t.Fatalf("parse after the flush: %v", err)
+	}
+	b, _ := in.parseFragment("x + 1", node)
+	if a != b {
+		t.Error("the cache stopped hitting after a flush")
+	}
+}
+
+// A malformed fragment must not be remembered as anything: the error is
+// the answer, and it is cheap to re-derive.
+func TestFragmentCacheDoesNotHoldFailures(t *testing.T) {
+	in, node := fragmentHarness(t)
+	if _, err := in.parseFragment("x +", node); err == nil {
+		t.Fatal("an incomplete fragment parsed without error")
+	}
+	if len(in.exprCache) != 0 {
+		t.Errorf("cache holds %d entries after a failed parse, want 0", len(in.exprCache))
+	}
 }
 
 // errFor builds a plain error for the test cases above without dragging

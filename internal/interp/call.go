@@ -105,6 +105,25 @@ func (w *wordEval) EvalGoExpr(src string) ([]string, error) {
 	}
 }
 
+// exprCacheMax bounds the fragment cache.
+//
+// The keys are (fragment source, script line) and both come from the
+// script's own text, so within one Run the entry count is bounded by the
+// number of distinct {expr} sites that actually execute — a handful for
+// anything hand-written, and the cache is dropped whenever fset is
+// replaced. The cap is for the script that is generated rather than
+// written, where "bounded by the source" is not a small number: without it
+// one long Run holds every fragment it has ever seen, each with its
+// go/parser AST.
+//
+// Eviction is a wholesale clear rather than an LRU. The steady state here
+// is a few entries and a hit rate near 1; at that shape a clear costs one
+// re-parse per live site per 1024 new ones, and an LRU would add a list
+// and a per-hit write to a path whose whole job is to be cheaper than
+// parsing. Note that the fileset itself still grows with every parse —
+// this bounds the ASTs, not the positions.
+const exprCacheMax = 1024
+
 // parseFragment parses a {expr} interior into the interpreter's own
 // fileset so its nodes resolve to real positions everywhere errAt is used
 // (a private fileset here would make eval errors report bogus near-line-1
@@ -126,7 +145,9 @@ func (in *Interp) parseFragment(src string, node ast.Node) (ast.Expr, error) {
 		tf.AddLineInfo(0, p.Filename, p.Line)
 	}
 	if in.exprCache == nil {
-		in.exprCache = map[string]ast.Expr{}
+		in.exprCache = make(map[string]ast.Expr, 8)
+	} else if len(in.exprCache) >= exprCacheMax {
+		clear(in.exprCache) // see exprCacheMax: bounded, not evicted one by one
 	}
 	in.exprCache[key] = e
 	return e, nil

@@ -33,6 +33,7 @@ type Interp struct {
 	// exprCache holds parsed {expr} interpolation fragments keyed by
 	// (src, line). Entries carry positions in fset, so the cache is valid
 	// only for the current Run and is reset whenever fset is replaced.
+	// It is bounded at exprCacheMax entries (see call.go).
 	exprCache map[string]ast.Expr
 }
 
