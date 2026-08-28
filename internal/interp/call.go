@@ -498,26 +498,6 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 	if rv.Type().AssignableTo(pt) {
 		return rv, nil
 	}
-	// A script struct crossing into a map's KEY position becomes the
-	// comparable stand-in the map can actually hash.
-	//
-	// This is the ONE hook the feature needs, and that is not luck: every
-	// key crossing in the interpreter — a read, the comma-ok read, a
-	// write, delete, and a map literal — already routed through convertTo
-	// to reach the map's key type. Sitting after the AssignableTo check
-	// above means a StructKey handed back in (nothing does today) passes
-	// through rather than being encoded twice.
-	if pt == structKeyType {
-		if sv, ok := v.(*StructVal); ok {
-			k, err := structKeyOf(sv)
-			if err != nil {
-				return reflect.Value{}, err
-			}
-			return reflect.ValueOf(k), nil
-		}
-		// Anything else falls through to the message at the bottom,
-		// where scriptTypeName renders the target as "struct".
-	}
 	// A script struct crossing into a CONTAINER slot becomes the type
 	// minted for its own struct. This is the sibling of the key case
 	// above and lands for the same reason: every write into a slice or
@@ -538,6 +518,40 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 			return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%s) as %s", v, sv.Type.Name, st.Name))
 		}
 		return intoStore(sv, pt), nil
+	}
+	// A script struct crossing into a map's KEY position becomes the
+	// comparable stand-in the map can actually hash, wrapped in the key
+	// type minted for its struct.
+	//
+	// This is the ONE hook the feature needs, and that is not luck: every
+	// key crossing in the interpreter — a read, the comma-ok read, a
+	// write, delete, and a map literal — already routed through convertTo
+	// to reach the map's key type. Sitting after the AssignableTo check
+	// above means a key handed back in (nothing does today) passes
+	// through rather than being encoded twice.
+	//
+	// It sits after the ELEMENT case rather than before it, which costs a
+	// key one failed registry lookup and saves every element write one.
+	// Element writes are the common path by a wide margin; both are
+	// behind the same Kind guard, so nothing else pays either.
+	if kt := keyOwnerOf(pt); kt != nil {
+		sv, ok := v.(*StructVal)
+		if !ok {
+			return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%s) as %s", v, scriptTypeName(rv.Type()), kt.Name))
+		}
+		// A Q is refused at a map[P]... key for the reason a Q is refused
+		// at a []P slot, and by the same test: the value's own minted
+		// type against the slot's. Comparing minted types rather than
+		// StructTypes is what keeps this agreeing with the interning
+		// rule in store.go.
+		if sv != nil && sv.Type.keyT != pt {
+			return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%s) as %s", v, sv.Type.Name, kt.Name))
+		}
+		k, err := structKeyOf(sv)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return intoKeyStore(k, pt), nil
 	}
 	// int → string would produce a rune-string surprise; refuse it.
 	if rv.Kind() != reflect.String && pt.Kind() == reflect.String && rv.CanInt() {
@@ -871,25 +885,37 @@ func (in *Interp) typeOf(env *Env, e ast.Expr) (TypeDesc, error) {
 		// field values, making every lookup with a freshly built key
 		// miss. StructKey is the comparable stand-in Go's own map
 		// equality already gets right, and convertTo does the swap.
+		//
+		// The swap targets the struct's OWN minted key type rather than
+		// the shared StructKey, which is what makes map[P]int and
+		// map[Q]int different reflect.Types — exact even when the map is
+		// empty and there is no key to read a struct off.
 		keyRT := k.RT
-		if k.ST != nil {
+		// IsStruct, not `k.ST != nil`: ST names the struct at an ELEMENT
+		// leaf too, so `map[[]P]int` would otherwise take this branch and
+		// build a map keyed by P — accepting a declaration Go rejects,
+		// then failing at the first write with a confusing message. A
+		// slice key falls through to the comparability check below and is
+		// refused where Go refuses it.
+		if k.IsStruct() {
 			// Go refuses a map key type that is not comparable, and a
 			// struct with a slice, map or func field is exactly that.
 			// The verdict already exists — it is the one `==` uses — so
-			// the two answers cannot drift apart.
+			// the two answers cannot drift apart. It is also what decides
+			// whether keyT was minted at all, so this check comes first.
 			if c := k.ST.noCmp; c != nil {
 				return TypeDesc{}, in.errAt(t.Key,
 					fmt.Sprintf("invalid map key type %s: field %s has type %s", k.ST.Name, c.Path, c.Type),
 					"hint", "key by one of its fields, or use a slice")
 			}
-			keyRT = structKeyType
+			keyRT = k.ST.keyT
 		}
 		// reflect.MapOf PANICS on a key type that is not comparable, so
 		// the check has to happen before the call. `map[[]int]int{}`
 		// used to reach it and surface through the top-level recover as
 		// an unpositioned "grsh internal error"; it is an ordinary
-		// positioned script error now. StructKey passes it, which is the
-		// point of StructKey.
+		// positioned script error now. A minted key type passes it, which
+		// is the point of minting one.
 		if !keyRT.Comparable() {
 			return TypeDesc{}, in.errAt(t.Key, "invalid map key type "+k.String())
 		}
@@ -1019,9 +1045,11 @@ func (in *Interp) elidedElem(env *Env, e ast.Expr, want TypeDesc) (Value, error)
 	// the type is the fix in both languages, so say so.
 	// A struct map key whose identity did not survive the trip: TypeDesc
 	// carries ONE key leaf, so a map nested inside another container
-	// arrives knowing its key is a struct but not WHICH. The literal has
-	// to name it. Only elision is lost -- `[]map[P]int{{P{1}: 2}}` works.
-	if want.RT == structKeyType && want.ST == nil {
+	// arrives knowing its key is a struct but not WHICH. The minted type
+	// could name a struct of that SHAPE, and that is exactly what must
+	// not be guessed at -- see TypeDesc.Key. The literal has to name it,
+	// and only elision is lost: `[]map[P]int{{P{1}: 2}}` works.
+	if keyOwnerOf(want.RT) != nil && want.ST == nil {
 		return nil, in.errAt(e, "a struct map key must name its type here",
 			"hint", "write P{...} instead of {...}: a map nested in another container does not carry its key type down")
 	}

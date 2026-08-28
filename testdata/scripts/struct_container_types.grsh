@@ -48,9 +48,9 @@ _, nestIsP := anyNest.(map[string][]P)
 _, nestIsQ := anyNest.(map[string][]Q)
 fmt.Println(mapIsP, mapIsQ, nestIsP, nestIsQ)
 
-# A struct map KEY is still erased -- it becomes the one comparable
-# stand-in the map can hash -- so that leaf is answered by the keys
-# themselves. An empty map has no key to ask, and accepts either.
+# A struct map KEY is minted per struct too, so that leaf is answered by
+# the TYPE. An empty map has no key to read a struct off and used to
+# accept either; its type names P whether or not it holds anything.
 var anyKeyed any = map[P]int{{1, "one"}: 5}
 var anyKeyedEmpty any = map[P]int{}
 _, keyIsP := anyKeyed.(map[P]int)
@@ -100,3 +100,11 @@ for k, val := range keyed {
 	fmt.Println(k, k.X, val, val.A)
 }
 fmt.Println(keyed[P{1, "one"}], keyed[P{9, "nine"}])
+
+# The key type is minted per struct too, so a map nested inside another
+# container is exact as well -- the descriptor drops its key leaf on the
+# way down, and the reflect type does not.
+var deepKeyed any = []map[P]int{{P{1, "one"}: 5}}
+_, deepIsP := deepKeyed.([]map[P]int)
+_, deepIsQ := deepKeyed.([]map[Q]int)
+fmt.Println(deepIsP, deepIsQ)

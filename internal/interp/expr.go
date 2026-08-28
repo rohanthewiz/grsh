@@ -87,11 +87,13 @@ func (in *Interp) evalExpr(env *Env, e ast.Expr) ([]Value, error) {
 			}
 			return []Value{d.Zero(), false}, nil
 		}
-		// A container answers on its type, because its element type is
-		// minted per struct — []P and []Q are genuinely different types
-		// now. The exception is a struct map KEY, which is still erased to
-		// the one StructKey; keysMatch asks the keys themselves.
-		if v != nil && reflect.TypeOf(v).AssignableTo(d.RT) && d.keysMatch(v) {
+		// A container answers on its TYPE alone, at both leaves: its
+		// element type and its key type are each minted per struct, so
+		// []P and []Q — and map[P]int and map[Q]int — are genuinely
+		// different reflect.Types. This used to need a walk over the
+		// values to decide the key leaf, which could not answer for an
+		// EMPTY map; the type answers for one now.
+		if v != nil && reflect.TypeOf(v).AssignableTo(d.RT) {
 			return []Value{v, true}, nil
 		}
 		return []Value{d.Zero(), false}, nil
@@ -862,12 +864,12 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 		keys := rv.MapKeys()
 		sortMapKeys(keys)
 		for _, k := range keys {
-			// fromKeyValue undoes the key erasure: a struct-keyed map
-			// stores a StructKey, and the script must range over its own
-			// P. The rebuilt struct is fresh each iteration, so assigning
-			// to the range variable's fields cannot reach the key inside
-			// the map.
-			cont, err := iterate(fromKeyValue(k.Interface()), fromStore(rv.MapIndex(k)))
+			// fromKeyStore undoes the key erasure: a struct-keyed map
+			// stores a minted key wrapping a StructKey, and the script
+			// must range over its own P. The rebuilt struct is fresh each
+			// iteration, so assigning to the range variable's fields
+			// cannot reach the key inside the map.
+			cont, err := iterate(fromKeyStore(k), fromStore(rv.MapIndex(k)))
 			if err != nil || !cont {
 				return err
 			}
@@ -896,13 +898,17 @@ func sortMapKeys(keys []reflect.Value) {
 		for i, k := range keys {
 			strs[i] = k.String()
 		}
-	case keys[0].Type() == structKeyType:
+	case keyOwnerOf(keys[0].Type()) != nil:
 		// A struct key holds a *StructType POINTER, so any ordering Go
 		// would derive from the key itself varies run to run. Sorting on
 		// the rendered struct — the same text the script would print —
 		// is both stable and the order a reader expects.
+		//
+		// The type is asked, not the value: every key in a map shares one
+		// type, so one lookup settles the whole slice.
 		for i, k := range keys {
-			strs[i] = k.Interface().(StructKey).String()
+			sk, _ := keyInStore(k)
+			strs[i] = sk.String()
 		}
 	default:
 		return

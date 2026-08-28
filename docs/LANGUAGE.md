@@ -300,13 +300,14 @@ captures buffer output.
   and hash by their FIELDS, `range` yields the struct back, and grsh
   sorts struct keys so ranging is deterministic. `m[missing]` on a
   struct-valued map yields the **zero struct**, as in Go.
-- **A container knows which struct it holds.** `[]Item` and `[]Order` are
-  different types to the interpreter, so `v.([]Item)` is exact even when
-  the slice is empty, and storing an `Order` into a `[]Item` — by
-  `append`, an index assignment, or a literal — is an error naming both
-  types rather than a silent success. The one leaf still decided by
-  contents is a struct map KEY: `map[Coord]int` and `map[Point]int` are
-  told apart by the keys present, so an EMPTY one asserts to either.
+- **A container knows which struct it holds**, at both leaves. `[]Item`
+  and `[]Order` are different types to the interpreter, and so are
+  `map[Coord]int` and `map[Point]int`, so `v.([]Item)` and
+  `v.(map[Coord]int)` are exact even when the container is EMPTY — and so
+  is `v.([]map[Coord]int)`, where the map is nested. Storing the wrong
+  struct — by `append`, an index assignment, a literal, or as a map key —
+  is an error naming both types rather than a silent success or a lookup
+  that quietly misses.
 - **Struct equality**: `p == q` compares **field-wise**, as Go does, so
   a copy equals its original and two separately built literals with the
   same fields are equal. It recurses into struct-typed fields, works in
@@ -379,7 +380,11 @@ All compound assignments work, including the bitwise set
 - Two identical `type` declarations of the same name — the same fields
   with the same types, declared twice, e.g. inside a loop — share one
   container-storage type, so a `[]P` built under one accepts a `P` built
-  under the other. `p.(P)` and `p == q` still tell them apart.
+  under the other. `p.(P)` and `p == q` still tell them apart. A struct
+  MAP KEY splits the same way and lands on the `==` side: a `map[P]int`
+  accepts a `P` from either declaration, but the keys already in it were
+  stored under the declaration that built them, so a lookup made after
+  re-declaring `P` misses.
 - Top-level `return` ends the script (status 0).
 - `import "strings"` lines are accepted and validated but optional — all
   registry packages are pre-loaded.

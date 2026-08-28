@@ -20,12 +20,23 @@ import (
 //	               asserted to a []P and nothing could tell
 //	append(xs, q)  a Q dropped into a []P with no complaint
 //
-// All three are the same missing fact: the CONTAINER does not know what
+//	map[P]int      map[P]int and map[Q]int were the SAME reflect.Type,
+//	               so an EMPTY one asserted to either
+//
+// All four are the same missing fact: the CONTAINER does not know what
 // it holds. So containers stop holding *StructVal and start holding a
 // type minted per struct:
 //
 //	[]P              []struct{ ScriptStruct "grsh:\"P|X:int\"" }
 //	map[string]P     map[string]struct{ ScriptStruct "grsh:\"P|X:int\"" }
+//	map[P]int        map[struct{ ScriptKey "grsh:\"P|X:int\"" }]int
+//
+// A KEY is minted from its own carrier, and the split is not cosmetic: a
+// map key must be Go-COMPARABLE with field-wise equality, which is what
+// StructKey is for, while an element must be the *StructVal a script can
+// hold. One carrier could not be both. So there are two minted types per
+// struct — its element type and its key type — and they are separate
+// tables minted from separate carriers.
 //
 // Two properties make this work where a plain wrapper would not:
 //
@@ -40,13 +51,14 @@ import (
 //     them is the same memory as the slice of pointers it replaces and
 //     boxing one into an interface still allocates nothing.
 //
-// What is embedded is ScriptStruct, NOT *StructVal, and that indirection
-// is load-bearing rather than tidy — see the warning on ScriptStruct.
+// What is embedded is ScriptStruct, NOT *StructVal — and ScriptKey, NOT
+// StructKey — and that indirection is load-bearing rather than tidy: see
+// the warning on ScriptStruct, which applies to both carriers.
 //
 // The cost is a rule with no compiler to enforce it: a minted value must
 // never reach script code. Every read out of a container goes through
-// fromStore, and every write in goes through convertTo. Those two are the
-// entire boundary.
+// fromStore or fromKeyStore, and every write in goes through convertTo.
+// Those are the entire boundary.
 //
 // A type minted here is never freed — reflect.StructOf caches globally —
 // so what the tag is keyed on decides whether that is a bounded cost or a
@@ -90,29 +102,69 @@ type ScriptStruct struct{ SV *StructVal }
 // panicking inside fmt.
 func (s ScriptStruct) String() string { return s.SV.String() }
 
-// carrierType is ScriptStruct's own reflect.Type, named once because
-// minting embeds it by name: an embedded field's Name must be its type's.
-var carrierType = reflect.TypeFor[ScriptStruct]()
+// ScriptKey is the carrier a minted KEY type embeds: the comparable
+// stand-in a script struct becomes in map-key position, held so that
+// String comes along with it.
+//
+// It is a separate carrier from ScriptStruct because the two positions
+// want different things from a value. An element must come back out as
+// the *StructVal the script wrote, so ScriptStruct holds one. A key must
+// be hashed and compared by GO, field-wise, which a *StructVal cannot be
+// — so ScriptKey holds the StructKey encoding instead.
+//
+// StructKey is held as a NAMED field rather than embedded, and that is
+// the same load-bearing indirection ScriptStruct describes: StructKey has
+// an unexported method (structVal), and promoting from an embedded type
+// that has one kills the process. A named field promotes nothing, so the
+// unexported method is out of reach and String is supplied here instead.
+//
+// DO NOT give this type an unexported method, and do not make it embed
+// anything. TestMintedTypePromotesExactlyOneMethod covers it.
+type ScriptKey struct{ K StructKey }
+
+// String is the only method, and the reason the carrier exists: it is
+// what a minted key type promotes, so `fmt.Println(m)` on a struct-keyed
+// map renders map[P{X: 1}:v] rather than grsh's storage. StructKey.String
+// already answers for the zero key, which is what a nil struct key
+// encodes to.
+func (k ScriptKey) String() string { return k.K.String() }
+
+// carrierType and keyCarrierType are the carriers' own reflect.Types,
+// named once because minting embeds them by name: an embedded field's
+// Name must be its type's.
+var (
+	carrierType    = reflect.TypeFor[ScriptStruct]()
+	keyCarrierType = reflect.TypeFor[ScriptKey]()
+)
 
 var (
-	// storeMu guards both tables and the replacer below. It is taken only
+	// storeMu guards every table and the replacer below. It is taken only
 	// when a struct type is DECLARED, never on a read.
 	storeMu sync.Mutex
 
-	// storeTypes interns minted types by struct signature, so re-running
-	// the same `type P struct{...}` — in a loop, in a function called
-	// repeatedly, at each REPL line — reuses one type instead of leaking
-	// a fresh one per execution.
+	// storeTypes and keyTypes intern minted types by struct signature, so
+	// re-running the same `type P struct{...}` — in a loop, in a function
+	// called repeatedly, at each REPL line — reuses one type instead of
+	// leaking a fresh one per execution. Two tables because a struct has
+	// two minted types, one per position, and they are different types.
 	storeTypes = map[string]reflect.Type{}
+	keyTypes   = map[string]reflect.Type{}
 
-	// storeOwners maps a minted type back to the struct it stores, which
-	// is what lets a map MISS build a real zero: the slot has no value to
-	// read a StructType off, but its TYPE now names one.
+	// storeOwners and keyOwners map a minted type back to the struct it
+	// stores, which is what lets a map MISS build a real zero: the slot
+	// has no value to read a StructType off, but its TYPE now names one.
+	//
+	// They stay SEPARATE rather than merging into one table, because the
+	// answer is used to decide how to unwrap: an element type unwraps two
+	// hops to a *StructVal, a key type unwraps to a StructKey and decodes.
+	// One table would make storeOwnerOf answer yes for a key type and
+	// fromStore would then read a StructKey as a *StructVal.
 	//
 	// Copy-on-write behind an atomic pointer: writes happen once per
 	// distinct struct shape in the program, reads happen on every element
 	// pulled out of a container, and a plain map read beats any lock.
 	storeOwners atomic.Pointer[map[reflect.Type]*StructType]
+	keyOwners   atomic.Pointer[map[reflect.Type]*StructType]
 
 	// storeNames rewrites minted type names back to the script's own in
 	// any message built from a reflect.Type. Rebuilt whenever a type is
@@ -156,11 +208,17 @@ func structSig(t *StructType) string {
 
 // sig renders a field's type for the signature above.
 //
-// A container needs no special casing: its element leaf is already a
-// minted type whose NAME contains that struct's own signature, so
-// reflect's rendering is exact by construction. The one edge reflect
-// cannot spell is a struct map KEY, which erases to the single StructKey
-// type — KT names it, and the substitution below puts it back.
+// A container needs no special casing at EITHER leaf: its element type
+// and its key type are both minted types whose NAMES contain that
+// struct's own signature, so reflect's rendering is exact by
+// construction. A struct map key used to be the one edge reflect could
+// not spell — every key erased to the single StructKey type, so the KT
+// field had to name it and the signature had to substitute it back.
+// Minting keys retired both.
+//
+// It is exact for the same reason the field loop can call it at all: a
+// field's type must already be declared, so its minted types exist and
+// already carry their signatures.
 func (d TypeDesc) sig() string {
 	switch {
 	case d.RT == nil:
@@ -172,11 +230,7 @@ func (d TypeDesc) sig() string {
 	case d.IsStruct():
 		return "{" + d.ST.sig + "}"
 	}
-	s := d.RT.String()
-	if d.KT != nil {
-		s = strings.ReplaceAll(s, structKeyType.String(), "{"+d.KT.sig+"}")
-	}
-	return s
+	return d.RT.String()
 }
 
 // mintStoreType returns the type values of t take inside a container,
@@ -185,37 +239,78 @@ func (d TypeDesc) sig() string {
 // Called from declareType, so it runs once per executed declaration and
 // never on a hot path.
 func mintStoreType(t *StructType) reflect.Type {
+	return mint(t, carrierType, storeTypes, &storeOwners)
+}
+
+// mintKeyType is mintStoreType for the KEY position, and its only
+// difference is which carrier it embeds — which is the whole reason the
+// two positions are separate types.
+//
+// declareType calls it only for a COMPARABLE struct. An incomparable one
+// can never reach a map key (typeOf refuses `map[P]int` and names the
+// field to blame), so minting for it would leak a type nothing can use,
+// and a nil keyT is the honest record of that.
+func mintKeyType(t *StructType) reflect.Type {
+	return mint(t, keyCarrierType, keyTypes, &keyOwners)
+}
+
+// mint interns one minted type per (carrier, signature) pair and records
+// the struct it belongs to.
+//
+// Both positions share this because everything except the carrier is the
+// same: the same interning rule, the same owner bookkeeping, the same
+// name rebuild. Splitting the carrier out is what keeps the two minted
+// types genuinely distinct types while keeping one description of how a
+// type gets minted.
+func mint(t *StructType, carrier reflect.Type, table map[string]reflect.Type, owners *atomic.Pointer[map[reflect.Type]*StructType]) reflect.Type {
 	storeMu.Lock()
 	defer storeMu.Unlock()
 
-	if mt, ok := storeTypes[t.sig]; ok {
+	if mt, ok := table[t.sig]; ok {
 		return mt
 	}
 	mt := reflect.StructOf([]reflect.StructField{{
 		// An embedded field must be named for its type, and being
 		// EMBEDDED is what promotes String onto the minted type.
-		Name:      carrierType.Name(),
-		Type:      carrierType,
+		Name:      carrier.Name(),
+		Type:      carrier,
 		Anonymous: true,
 		Tag:       reflect.StructTag(storeTagKey + `:"` + t.sig + `"`),
 	}})
-	storeTypes[t.sig] = mt
+	table[t.sig] = mt
 
-	owners := map[reflect.Type]*StructType{}
-	if cur := storeOwners.Load(); cur != nil {
+	next := map[reflect.Type]*StructType{}
+	if cur := owners.Load(); cur != nil {
 		for k, v := range *cur {
-			owners[k] = v
+			next[k] = v
 		}
 	}
-	owners[mt] = t
-	storeOwners.Store(&owners)
+	next[mt] = t
+	owners.Store(&next)
 
-	pairs := make([]string, 0, 2*len(owners))
-	for k, v := range owners {
-		pairs = append(pairs, k.String(), v.Name)
+	rebuildNamesLocked()
+	return mt
+}
+
+// rebuildNamesLocked refreshes the type-name replacer from both owner
+// tables. Called with storeMu held, once per minted type, which is rare
+// enough that rebuilding beats maintaining.
+//
+// Both tables feed ONE replacer because a single reflect.Type can contain
+// both minted kinds — map[P]Q is map[keyOf(P)]storeOf(Q) — so a pass that
+// knew about only one would leave the other printing as grsh's carrier.
+func rebuildNamesLocked() {
+	var pairs []string
+	for _, owners := range [2]*atomic.Pointer[map[reflect.Type]*StructType]{&storeOwners, &keyOwners} {
+		cur := owners.Load()
+		if cur == nil {
+			continue
+		}
+		for k, v := range *cur {
+			pairs = append(pairs, k.String(), v.Name)
+		}
 	}
 	storeNames.Store(strings.NewReplacer(pairs...))
-	return mt
 }
 
 // storeOwnerOf reports the script struct a minted type stores, or nil for
@@ -229,6 +324,23 @@ func storeOwnerOf(t reflect.Type) *StructType {
 		return nil
 	}
 	owners := storeOwners.Load()
+	if owners == nil {
+		return nil
+	}
+	return (*owners)[t]
+}
+
+// keyOwnerOf is storeOwnerOf for the key position: it reports the script
+// struct a minted KEY type stands in for, or nil for any other type.
+//
+// This is what closes the last leaf the erasure left. map[P]int and
+// map[Q]int are different reflect.Types now, so an assertion is exact
+// even on an EMPTY map, where there is no key to read a struct off.
+func keyOwnerOf(t reflect.Type) *StructType {
+	if t == nil || t.Kind() != reflect.Struct {
+		return nil
+	}
+	owners := keyOwners.Load()
 	if owners == nil {
 		return nil
 	}
@@ -268,6 +380,31 @@ func zeroInSlot(t reflect.Type) Value {
 	return reflect.Zero(t).Interface()
 }
 
+// fromKeyStore reads one map KEY as the script must see it: a minted key
+// becomes the *StructVal it encodes, everything else is itself.
+//
+// It is fromStore's counterpart, and the asymmetry is StructKey's: an
+// element hands back the very pointer the container holds, while a key
+// hands back a FRESH struct decoded from the encoding. That is what makes
+// `for k := range m { k.X = 9 }` safe — mutating the range variable
+// cannot reach the key inside the map and corrupt its hashing.
+func fromKeyStore(rv reflect.Value) Value {
+	if k, ok := keyInStore(rv); ok {
+		return k.structVal()
+	}
+	return rv.Interface()
+}
+
+// keyInStore unwraps a minted key to the StructKey it carries, and
+// reports whether rv was one. Two hops, like fromStore: the minted type
+// embeds the carrier, the carrier holds the encoding.
+func keyInStore(rv reflect.Value) (StructKey, bool) {
+	if rv.Kind() != reflect.Struct || keyOwnerOf(rv.Type()) == nil {
+		return StructKey{}, false
+	}
+	return rv.Field(0).Field(0).Interface().(StructKey), true
+}
+
 // intoStore wraps a script struct for a container slot of minted type mt.
 // It is convertTo's other half; nothing else should build one.
 func intoStore(sv *StructVal, mt reflect.Type) reflect.Value {
@@ -275,6 +412,34 @@ func intoStore(sv *StructVal, mt reflect.Type) reflect.Value {
 	if sv != nil {
 		w.Field(0).Field(0).Set(reflect.ValueOf(sv))
 	}
+	return w
+}
+
+// intoKeyStore wraps an encoded key for a map of minted key type kt. It
+// is intoStore's counterpart on the key side, and the same rule holds:
+// only convertTo should build one.
+func intoKeyStore(k StructKey, kt reflect.Type) reflect.Value {
+	w := reflect.New(kt).Elem()
+	// The zero StructKey — what a nil struct key encodes to — is already
+	// exactly what reflect.New produced, and its F is nil, which Set
+	// panics on. So `m[nil]` and a typed nil struct both stop here, on
+	// the same key.
+	if k.T == nil {
+		return w
+	}
+	// The two fields are set INDIVIDUALLY rather than by setting the
+	// StructKey whole, and that is measured rather than stylistic:
+	// reflect.ValueOf(k) boxes a three-word struct and costs an
+	// allocation on every key crossing, while a pointer and a field that
+	// is ALREADY an interface each box for free. One extra line keeps a
+	// struct-keyed read and write at the allocation count they had before
+	// keys were minted.
+	//
+	// It is the one place that depends on StructKey's field ORDER, and
+	// TestMintedTypePromotesExactlyOneMethod pins it.
+	sk := w.Field(0).Field(0)
+	sk.Field(0).Set(reflect.ValueOf(k.T))
+	sk.Field(1).Set(reflect.ValueOf(k.F))
 	return w
 }
 

@@ -11,8 +11,15 @@ import (
 // error/inspector rendering below.
 var structValType = reflect.TypeFor[*StructVal]()
 
-// structKeyType is the storage type a script struct erases to in map-KEY
+// structKeyType is the encoding a script struct takes in map-KEY
 // position, and anyType is the element type of the array inside it.
+//
+// It is no longer a TYPE the interpreter builds maps out of -- a key is
+// minted per struct now, and a StructKey only rides INSIDE that minted
+// wrapper or inside another key's field array. So eraseNames covers it as
+// a BELT rather than for a live path: no message renders one today, and
+// the encoding still exists, so the day one leaks it must not print as
+// interp.StructKey.
 var (
 	structKeyType = reflect.TypeFor[StructKey]()
 	anyType       = reflect.TypeFor[any]()
@@ -35,15 +42,24 @@ var (
 //	map[string][]P    RT map[string][]*StructVal  ST P
 //	[]int             RT []int                    ST nil
 //
-// A map KEY is the second place a struct can sit, and it needs its own
-// field. Struct map keys used to be REFUSED, and that refusal was exactly
-// what made one leaf enough; allowing them buys the feature back at the
-// price of the word it saved. KT names the struct at the key edge, and a
-// map is the only type that has one:
+// A map KEY is the second place a struct can sit, and KT names the struct
+// at the key edge. A map is the only type that has one:
 //
-//	map[P]int         RT map[StructKey]int          ST nil  KT P
-//	map[string][]P    RT map[string][]*StructVal    ST P    KT nil
-//	map[P]Q           RT map[StructKey]*StructVal   ST Q    KT P
+//	map[P]int         RT map[keyOf(P)]int             ST nil  KT P
+//	map[string][]P    RT map[string][]storeOf(P)      ST P    KT nil
+//	map[P]Q           RT map[keyOf(P)]storeOf(Q)      ST Q    KT P
+//
+// Minting a key type per struct (see store.go) narrowed KT's job to one
+// thing without removing it. RECOGNIZING a key struct no longer needs it
+// — map[P]int and map[Q]int are different reflect.Types, so an assertion
+// and a rendered type name both read the answer off RT. What still needs
+// it is BUILDING a key: a key's identity includes its *StructType
+// POINTER, and the registry behind the minted type can only hand back the
+// FIRST struct that minted that shape. Two identical declarations of P
+// share a minted type and do not share keys, so a key built from the
+// registry's P would silently miss every entry stored under the caller's.
+// KT is the caller's own struct, carried down from where the type was
+// spelled.
 //
 // TWO leaves is still a bounded claim rather than the start of a general
 // tree, and typeOf enforces it: a key must be comparable, which rules out
@@ -53,11 +69,11 @@ var (
 // type descriptor.
 //
 // Elem drops KT, because whatever sits at the element edge has its own
-// key edge or none. The cost of that is stated where it shows: a map
-// nested inside another container loses the identity of its key struct,
-// so `[]map[P]int{{{1}: 2}}` cannot ELIDE the key literal and wants
-// `[]map[P]int{{P{1}: 2}}` instead. Only elision is affected; the map
-// itself works at any depth.
+// key edge or none. What that costs is now only ELISION: a map nested
+// inside another container can still be asserted and used exactly, since
+// its type names its key struct, but `[]map[P]int{{{1}: 2}}` has no
+// StructType to build the key literal from and wants
+// `[]map[P]int{{P{1}: 2}}` instead.
 //
 // The descriptor is three words and travels by value: resolving a type
 // still allocates nothing.
@@ -70,21 +86,25 @@ type TypeDesc struct {
 // IsStruct reports whether this descriptor IS a script struct — not a
 // container holding one.
 //
-// Both storage types count. A key descriptor says StructKey because that
-// is what the MAP holds, but what the script builds for that position is
-// an ordinary P, and every construction path routes on this method:
-// structComposite makes the *StructVal and convertTo encodes it on the
-// way into the map.
-// A THIRD storage type counts as of the minting in store.go: inside a
-// container a struct is held as its own minted type, and TypeDesc.Elem
-// hands exactly that down. Comparing against d.ST's own storeT keeps the
-// answer exact without a registry lookup -- a minted type belonging to a
-// DIFFERENT struct is correctly not this descriptor's struct.
+// All THREE storage types count, because a struct is held differently in
+// each of the three positions it can occupy: bare as a *StructVal, inside
+// a container as its minted element type, and as a map key as its minted
+// key type. What the script builds is an ordinary P in every one of them,
+// and every construction path routes on this method -- structComposite
+// makes the *StructVal, and convertTo wraps or encodes it on the way into
+// whichever slot it is headed for.
+//
+// The two minted types are compared against d.ST's OWN storeT and keyT
+// rather than looked up in the registries, which keeps the answer exact
+// for free: a minted type belonging to a DIFFERENT struct is correctly
+// not this descriptor's struct. keyT is nil for an incomparable struct,
+// so it is checked rather than compared -- a nil RT must not match it.
 func (d TypeDesc) IsStruct() bool {
 	if d.ST == nil {
 		return false
 	}
-	return d.RT == structValType || d.RT == structKeyType || d.RT == d.ST.storeT
+	return d.RT == structValType || d.RT == d.ST.storeT ||
+		(d.ST.keyT != nil && d.RT == d.ST.keyT)
 }
 
 // storeRT is the reflect.Type this descriptor's values take when they sit
@@ -107,6 +127,13 @@ func (d TypeDesc) Elem() TypeDesc { return TypeDesc{RT: d.RT.Elem(), ST: d.ST} }
 
 // Key is the key descriptor of a map type, and KT becomes its ST: from
 // here down, the key's struct is the one that matters.
+//
+// It deliberately does NOT fall back to keyOwnerOf when KT is absent.
+// That would look like an improvement -- a nested map could then elide
+// its key literals -- and it would be a silent bug: the registry answers
+// with the first struct to mint the shape, and a key built from a
+// different declaration of P than the map's other keys matches none of
+// them. A missing KT has to stay an error, not a guess.
 func (d TypeDesc) Key() TypeDesc { return TypeDesc{RT: d.RT.Key(), ST: d.KT} }
 
 // Zero builds the value a `var x T` or an unset slot starts at.
@@ -151,12 +178,12 @@ func (d TypeDesc) String() string {
 	if d.ST != nil {
 		s = strings.ReplaceAll(s, structValType.String(), d.ST.Name)
 	}
-	if d.KT != nil {
-		s = strings.ReplaceAll(s, structKeyType.String(), d.KT.Name)
-	}
-	// Any erasure the descriptor could not name — the key of a map that
-	// reached here through a container, which dropped KT — still must not
-	// print as grsh's internals.
+	// A key needs no clause of its own, KT or not: its minted name
+	// carries the struct, so storeReplace above already turned it into
+	// the script's word -- which is why a map nested in a container
+	// prints its key struct now even though KT did not survive the trip.
+	// What is left is any erasure the descriptor could not name, which
+	// still must not print as grsh's internals.
 	return eraseNames(s, "struct")
 }
 
@@ -170,58 +197,15 @@ func scriptTypeName(t reflect.Type) string {
 
 // eraseNames replaces every storage type a script struct erases to with
 // the given name. Both erasures are handled together because a single
-// type can contain both: map[P]Q is map[StructKey]*StructVal.
+// value can carry both: a struct field NESTED inside a map key is encoded
+// as its own StructKey, inside a key whose own type is minted.
 func eraseNames(s, name string) string {
-	// A minted container type names its struct exactly, so it is replaced
-	// with that name rather than the neutral word -- and it is replaced
-	// FIRST, for the reason TypeDesc.String gives.
+	// A minted type -- element or key -- names its struct exactly, so it
+	// is replaced with that name rather than the neutral word, and it is
+	// replaced FIRST, for the reason TypeDesc.String gives.
 	s = storeReplace(s)
 	for _, erased := range [2]string{structValType.String(), structKeyType.String()} {
 		s = strings.ReplaceAll(s, erased, name)
 	}
 	return s
-}
-
-// keysMatch reports whether the struct KEYS actually present in v are the
-// struct this descriptor names at its key edge.
-//
-// It is the one place the erasure still has to be answered by the VALUE
-// rather than by the type. An element leaf no longer needs this: a
-// container holds its struct's own minted type, so []P and []Q are
-// different reflect.Types and AssignableTo is exact even for an empty
-// slice. A KEY leaf is not minted — a map key must be Go-comparable with
-// field-wise equality, which is what StructKey is for, and every script
-// struct erases to that one type. So map[P]int and map[Q]int ARE the same
-// reflect.Type, and the keys have to say which.
-//
-// What it cannot decide, it accepts:
-//
-//	map[P]int{}                   empty — no key names a struct
-//	m[nil] = v                    the zero StructKey names none either
-//	[]map[P]int                   Elem drops KT (see TypeDesc)
-//
-// So a container assertion is exact on its element leaf and "no key
-// contradicts it" on its key leaf.
-func (d TypeDesc) keysMatch(v Value) bool {
-	if d.KT == nil {
-		return true
-	}
-	rv := reflect.ValueOf(v)
-	if !rv.IsValid() || rv.Kind() != reflect.Map {
-		return true
-	}
-	for iter := rv.MapRange(); iter.Next(); {
-		sk, ok := iter.Key().Interface().(StructKey)
-		if !ok {
-			return false
-		}
-		// Compared by STORAGE type, not by StructType pointer, so the key
-		// side draws the same line the element side does: two identical
-		// declarations of P share a storage type and are mutually
-		// acceptable (see structSig), a Q is not.
-		if sk.T != nil && sk.T.storeT != d.KT.storeT {
-			return false
-		}
-	}
-	return true
 }

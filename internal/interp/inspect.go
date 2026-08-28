@@ -143,10 +143,15 @@ func displayType(v Value) string {
 	case reflect.Map:
 		kt, et := rv.Type().Key(), rv.Type().Elem()
 		val, valIsStruct := elemStructName(rv, et)
-		if kt == structKeyType || valIsStruct {
+		// The key side is answered by the TYPE now, exactly as the
+		// element side is: a struct key is minted per struct, so even an
+		// EMPTY map[P]int can be named map[P]int rather than falling back
+		// to the neutral word.
+		keySt := keyOwnerOf(kt)
+		if keySt != nil || valIsStruct {
 			key := kt.String()
-			if kt == structKeyType {
-				key = structNameInKeys(rv)
+			if keySt != nil {
+				key = keySt.Name
 			}
 			if !valIsStruct {
 				val = scriptTypeName(et)
@@ -196,19 +201,6 @@ func structNameIn(rv reflect.Value) string {
 		return true
 	})
 	return name
-}
-
-// structNameInKeys is structNameIn for the KEY side of a struct-keyed
-// map. The name is read off a key rather than off the map's type for the
-// same reason: every script struct erases to the one StructKey type, and
-// only an instance knows which struct it came from.
-func structNameInKeys(rv reflect.Value) string {
-	for _, k := range rv.MapKeys() {
-		if sk, ok := k.Interface().(StructKey); ok && sk.T != nil {
-			return sk.T.Name
-		}
-	}
-	return "struct"
 }
 
 // signatureOf renders a closure's parameter list from its AST.

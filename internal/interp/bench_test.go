@@ -342,6 +342,14 @@ _ = p`},
 // The native shapes are the control. They pay the Kind check and nothing
 // else, so a gap between them and the struct shapes is the boundary's
 // whole cost; a gap that moves is the map lookup getting expensive.
+//
+// The KEY shapes are priced against the interpreter before keys were
+// minted, not against a native control, because their cost is a different
+// one and it is real: wrapping an encoded key costs a reflect.New plus
+// two Sets where handing the map a bare StructKey cost one ValueOf, which
+// measured at +17% on a read or a write and +7% on a range over keys, at
+// an unchanged allocation count. The element shapes did not move. That is
+// what a struct-keyed map pays for its type telling P from Q while empty.
 func BenchmarkStructContainer(b *testing.B) {
 	shapes := []struct{ name, body string }{
 		{"slice-index-native", `xs := []int{0, 0, 0, 0}
@@ -394,6 +402,40 @@ n := 0
 for i := 0; i < %d/4; i++ {
 	for _, p := range xs {
 		n = p.X
+	}
+}
+_ = n`},
+		// The KEY boundary, which is a different and dearer one: every
+		// crossing ENCODES the struct into a comparable array rather than
+		// wrapping a pointer, so this is priced against the string-keyed
+		// map above rather than expected to match it.
+		{"map-key-struct-hit", `type P struct {
+	X int
+}
+m := map[P]int{{1}: 1}
+k := P{1}
+n := 0
+for i := 0; i < %d; i++ {
+	n = m[k]
+}
+_ = n`},
+		{"map-key-struct-write", `type P struct {
+	X int
+}
+m := map[P]int{}
+k := P{1}
+for i := 0; i < %d; i++ {
+	m[k] = i
+}
+_ = m`},
+		{"range-map-key-struct", `type P struct {
+	X int
+}
+m := map[P]int{{1}: 1, {2}: 2, {3}: 3, {4}: 4}
+n := 0
+for i := 0; i < %d/4; i++ {
+	for k := range m {
+		n = k.X
 	}
 }
 _ = n`},

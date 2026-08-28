@@ -674,11 +674,14 @@ fmt.Println(z, ok, z == nil)`, "[] false true\n"},
 	}
 }
 
-// A struct map KEY is the one leaf that is still erased -- it becomes
-// StructKey so the map can hash it, and every script struct becomes the
-// same StructKey. So map[P]int and map[Q]int ARE one reflect.Type, and
-// the assertion has to read the keys.
-func TestMapKeyAssertionReadsKeys(t *testing.T) {
+// A struct map KEY is minted per struct, so map[P]int and map[Q]int are
+// different reflect.Types and the assertion is answered by the TYPE --
+// including for a map that holds no key to read a struct off.
+//
+// This used to be a walk over the keys, which was exact for a populated
+// map and had to ACCEPT whatever it could not decide: an empty map and a
+// nil key both named no struct, so both asserted to either type.
+func TestMapKeyAssertionUsesTheType(t *testing.T) {
 	decls := `type P struct {
 	X int
 }
@@ -695,25 +698,37 @@ type Q struct {
 _, a := v.(map[P]int)
 _, b := v.(map[Q]int)
 fmt.Println(a, b)`, "true false\n"},
-		// Both leaves at once, each answered its own way: the value side
-		// by the minted type, the key side by the keys.
+		// Both leaves at once, each answered the same way: a minted type
+		// per struct at the element edge and at the key edge.
 		{"both leaves", `var v any = map[P]Q{{1}: {true}}
 _, a := v.(map[P]Q)
 _, b := v.(map[P]P)
 _, c := v.(map[Q]Q)
 fmt.Println(a, b, c)`, "true false false\n"},
-		// What the key walk cannot decide, it accepts -- neither an empty
-		// map nor a nil key names a struct.
-		{"empty accepts either", `var v any = map[P]int{}
+		// THE LEAF THIS CLOSES. Neither an empty map nor a nil key names
+		// a struct, so a walk over the keys had to accept both; the type
+		// names one whether or not any key does.
+		{"empty is exact", `var v any = map[P]int{}
 _, a := v.(map[P]int)
 _, b := v.(map[Q]int)
-fmt.Println(a, b)`, "true true\n"},
-		{"nil key accepts either", `m := map[P]int{}
+fmt.Println(a, b)`, "true false\n"},
+		{"nil key is exact", `m := map[P]int{}
 m[nil] = 7
 var v any = m
 _, a := v.(map[P]int)
 _, b := v.(map[Q]int)
-fmt.Println(a, b)`, "true true\n"},
+fmt.Println(a, b)`, "true false\n"},
+		// A map reached through another container is exact too. The
+		// descriptor drops its key leaf on the way down (TypeDesc.Elem),
+		// so the walk could not see this key at all -- the type can.
+		{"nested under a slice", `var v any = []map[P]int{{P{1}: 2}}
+_, a := v.([]map[P]int)
+_, b := v.([]map[Q]int)
+fmt.Println(a, b)`, "true false\n"},
+		{"nested and empty", `var v any = []map[P]int{}
+_, a := v.([]map[P]int)
+_, b := v.([]map[Q]int)
+fmt.Println(a, b)`, "true false\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wantOut(t, decls+tc.body, tc.want)
@@ -1019,17 +1034,62 @@ for k := range m {
 fmt.Println(m[P{1}], len(m))`, "10 1\n")
 }
 
-// Identity is part of the key, so two struct types never collide however
-// alike their fields are -- the same answer `==` gives.
+// Two struct types never collide however alike their fields are, and the
+// answer moved from the VALUE to the TYPE: a map[P]int's key type is P's,
+// so a Q reaching it is reported where it happens.
+//
+// It used to be a silent miss -- the Q went in as a StructKey naming Q,
+// found no entry, and yielded a zero. Go rejects `m[Q{1}]` outright, and
+// this is the same line the element side draws for `xs[0] = Q{}`.
 func TestStructMapKeysDoNotCollideAcrossTypes(t *testing.T) {
-	wantOut(t, `type P struct {
+	decls := `type P struct {
 	X int
 }
 type Q struct {
 	X int
 }
-m := map[P]int{{1}: 10}
-fmt.Println(m[Q{1}], len(m))`, "0 1\n")
+`
+	// Every crossing takes the same hook, so all four report.
+	for _, body := range []string{
+		"m := map[P]int{{1}: 10}\nfmt.Println(m[Q{1}])",
+		"m := map[P]int{{1}: 10}\nm[Q{1}] = 3",
+		"m := map[P]int{{1}: 10}\ndelete(m, Q{1})",
+		"m := map[P]int{Q{1}: 10}\n_ = m",
+	} {
+		wantErr(t, decls+body, "cannot use Q{X: 1} (Q) as P")
+	}
+	// A P still keys its own map, and the two maps stay separate types.
+	wantOut(t, decls+`p := map[P]int{{1}: 10}
+q := map[Q]int{{1}: 20}
+fmt.Println(p[P{1}], q[Q{1}], len(p), len(q))`, "10 20 1 1\n")
+}
+
+// A key that is a CONTAINER of structs is not a struct key, and Go
+// refuses it: []P is not comparable.
+//
+// It used to be accepted at the declaration, because the descriptor's
+// struct leaf was consulted rather than whether the key IS one -- ST
+// names the struct at an element leaf too. The map was then built keyed
+// by P, and the first write failed with "cannot use [P{X: 1}] ([]P) as
+// struct", pointing at the wrong line and the wrong thing.
+func TestSliceOfStructIsNotAMapKey(t *testing.T) {
+	wantErr(t, `type P struct {
+	X int
+}
+m := map[[]P]int{}
+_ = m`, "invalid map key type []P")
+	// A map of them is refused the same way, and so is the case that
+	// always worked: a struct whose own field costs it comparability.
+	wantErr(t, `type P struct {
+	X int
+}
+m := map[map[string]P]int{}
+_ = m`, "invalid map key type map[string]P")
+	wantErr(t, `type P struct {
+	Tags []string
+}
+m := map[P]int{}
+_ = m`, "invalid map key type P: field Tags has type []string")
 }
 
 // A nested struct FIELD is encoded recursively -- without that it would
@@ -1098,9 +1158,9 @@ m[nil] = 5
 fmt.Println(m[nil], len(m), m)`, "5 1 map[<nil>:5]\n")
 }
 
-// The inspector reads the key's name off a KEY for the same reason it
-// reads the element's off an element: every script struct erases to the
-// one StructKey type, so only an instance knows which struct it was.
+// The inspector reads the key's name off the TYPE for the same reason it
+// reads the element's off the type: both are minted per struct, so an
+// EMPTY map[P]int is still a map[P]int on screen.
 func TestInspectStructKeyedMap(t *testing.T) {
 	got := inspect(t, `type P struct {
 	X int
@@ -1114,12 +1174,12 @@ g := map[P]Q{{1}: {2}}`, "g")
 			t.Errorf("inspect = %q, want it to contain %q", got, want)
 		}
 	}
-	// An empty map has no key to read the name off, so it falls back to
-	// the neutral word rather than printing grsh's own StructKey.
+	// An empty map has no key to read a name off, and used to fall back
+	// to the neutral word. Its TYPE names P.
 	if got := inspect(t, `type P struct {
 	X int
 }
-g := map[P]int{}`, "g"); !strings.Contains(got, "map[struct]int") {
+g := map[P]int{}`, "g"); !strings.Contains(got, "map[P]int") {
 		t.Errorf("inspect of an empty struct-keyed map = %q", got)
 	}
 }
@@ -1161,23 +1221,26 @@ for k := range m {
 // whose key struct the descriptor still names, and one whose key struct
 // it no longer can.
 func TestStructKeyTypeNamesInMessages(t *testing.T) {
-	// convertTo sees only the storage type and says the neutral word.
+	// convertTo used to see only the shared StructKey and could say no
+	// more than the neutral word. A minted key type names its struct.
 	wantErr(t, `type P struct {
 	X int
 }
 m := map[P]int{}
-m[5] = 1`, "cannot use 5 (int) as struct")
+m[5] = 1`, "cannot use 5 (int) as P")
 	// The descriptor still holds KT here, so it names P.
 	wantErr(t, `type P struct {
 	X int
 }
 m := map[map[P]int]string{}
 _ = m`, "invalid map key type map[P]int")
-	// Elem dropped KT on the way through the slice, so the struct cannot
-	// be named -- but it still must not print as interp.StructKey.
+	// Elem dropped KT on the way through the slice, so the DESCRIPTOR
+	// cannot name the struct -- but the minted key type in the reflect
+	// type still does, which is what this used to render as
+	// []map[struct]int.
 	wantErr(t, `type P struct {
 	X int
 }
 m := map[[]map[P]int]string{}
-_ = m`, "invalid map key type []map[struct]int")
+_ = m`, "invalid map key type []map[P]int")
 }

@@ -47,14 +47,42 @@ func TestMintedTypePromotesExactlyOneMethod(t *testing.T) {
 	st := declare(t, "type P struct {\n\tX int\n}", "P")
 	mt := st.storeT
 
-	if got := mt.NumMethod(); got != 1 {
-		t.Fatalf("minted type has %d methods, want exactly 1 (String).\n"+
-			"An unexported method on ScriptStruct or *StructVal breaks "+
-			"reflect.StructOf promotion and crashes the process from "+
-			"itabInit -- see the warning on ScriptStruct.", got)
+	// Checked before it is dereferenced, and with Fatal: a comparable
+	// struct that minted no key type would otherwise nil-panic below and
+	// take the whole package's output down with it, which is the same
+	// reason this test checks the CAUSE before the effect.
+	if st.keyT == nil {
+		t.Fatal("a comparable struct minted no key type; map[P]int cannot name its key struct")
 	}
-	if !mt.Implements(reflect.TypeFor[fmt.Stringer]()) {
-		t.Fatal("minted type is not a fmt.Stringer; a []P would print as grsh's storage")
+	// Both carriers are held to it. The key carrier is the sharper case:
+	// what it HOLDS, StructKey, has an unexported method, so it is only
+	// the named-field indirection that keeps promotion down to one.
+	for _, c := range []struct {
+		what string
+		t    reflect.Type
+	}{{"element", mt}, {"key", st.keyT}} {
+		if got := c.t.NumMethod(); got != 1 {
+			t.Fatalf("minted %s type has %d methods, want exactly 1 (String).\n"+
+				"An unexported method on ScriptStruct, ScriptKey, or anything "+
+				"they embed breaks reflect.StructOf promotion and crashes the "+
+				"process from itabInit -- see the warning on ScriptStruct.", c.what, got)
+		}
+		if !c.t.Implements(reflect.TypeFor[fmt.Stringer]()) {
+			t.Fatalf("minted %s type is not a fmt.Stringer; it would print as grsh's storage", c.what)
+		}
+	}
+	// A key type must also be usable AS one, which is the property the
+	// element type is not asked for.
+	if !st.keyT.Comparable() {
+		t.Fatal("minted key type is not comparable; reflect.MapOf would panic on it")
+	}
+	// intoKeyStore fills StructKey's fields BY INDEX to avoid boxing the
+	// struct whole on every key crossing, so reordering them would write
+	// the encoding into the wrong slots -- silently, since both are set.
+	for i, want := range [2]string{"T", "F"} {
+		if got := structKeyType.Field(i).Name; got != want {
+			t.Fatalf("StructKey field %d is %s, want %s: intoKeyStore sets these by index", i, got, want)
+		}
 	}
 	if got, want := mt.Size(), reflect.TypeFor[*StructVal]().Size(); got != want {
 		t.Errorf("minted type is %d bytes, want %d: the storage must stay one pointer wide", got, want)
@@ -72,6 +100,30 @@ func TestMintedTypePromotesExactlyOneMethod(t *testing.T) {
 	if got := fmt.Sprint(reflect.Zero(mt).Interface()); got != "<nil>" {
 		t.Errorf("the zero minted value renders as %q, want <nil>", got)
 	}
+
+	// The same detonation on the key side: a map keyed by a minted type
+	// hands every key to fmt, and the zero key is what `m[nil]` stores.
+	k, err := structKeyOf(st.newZero())
+	if err != nil {
+		t.Fatalf("encoding a key: %v", err)
+	}
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(7))
+	if got := fmt.Sprint(mp.Interface()); got != "map[P{X: 0}:7]" {
+		t.Errorf("a map[P]int renders as %q, want map[P{X: 0}:7]", got)
+	}
+	if got := fmt.Sprint(reflect.Zero(st.keyT).Interface()); got != "<nil>" {
+		t.Errorf("the zero minted key renders as %q, want <nil>", got)
+	}
+	// A freshly built key must find the entry an equal one stored: the
+	// whole reason a key is encoded rather than held as a *StructVal.
+	again, err := structKeyOf(st.newZero())
+	if err != nil {
+		t.Fatalf("re-encoding a key: %v", err)
+	}
+	if got := mp.MapIndex(intoKeyStore(again, st.keyT)); !got.IsValid() {
+		t.Error("an equal key built fresh did not find its entry; minting broke field-wise equality")
+	}
 }
 
 // Minting is interned on the struct's SHAPE, and that is what keeps a
@@ -84,8 +136,23 @@ func TestMintedTypesInternByShape(t *testing.T) {
 	if same.storeT != again.storeT {
 		t.Error("two identical declarations of P got different storage types")
 	}
+	if same.keyT != again.keyT {
+		t.Error("two identical declarations of P got different key types")
+	}
 	if same == again {
 		t.Error("harness: the two declarations should still be distinct StructTypes")
+	}
+	// The two positions must never share a type: one unwraps to a
+	// *StructVal and the other to a StructKey, and a single type would
+	// make storeOwnerOf answer for a key and read it as the wrong thing.
+	if same.storeT == same.keyT {
+		t.Error("the element and key storage types are the same type")
+	}
+	if storeOwnerOf(same.keyT) != nil {
+		t.Error("a key type is registered as an element type")
+	}
+	if keyOwnerOf(same.storeT) != nil {
+		t.Error("an element type is registered as a key type")
 	}
 
 	for _, tc := range []struct{ name, src, decl string }{
@@ -95,8 +162,12 @@ func TestMintedTypesInternByShape(t *testing.T) {
 		{"extra field", "type P struct {\n\tX int\n\tY int\n}", "P"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if other := declare(t, tc.src, tc.decl); other.storeT == same.storeT {
+			other := declare(t, tc.src, tc.decl)
+			if other.storeT == same.storeT {
 				t.Errorf("%s shares a storage type with P{X int}", tc.name)
+			}
+			if other.keyT == same.keyT {
+				t.Errorf("%s shares a key type with P{X int}", tc.name)
 			}
 		})
 	}
@@ -117,7 +188,7 @@ func TestMintedTypesInternByShape(t *testing.T) {
 // count.
 func TestRepeatedDeclarationMintsOnce(t *testing.T) {
 	storeMu.Lock()
-	before := len(storeTypes)
+	before, keysBefore := len(storeTypes), len(keyTypes)
 	storeMu.Unlock()
 
 	if _, err := eval(t, `for i := 0; i < 50; i++ {
@@ -131,10 +202,39 @@ func TestRepeatedDeclarationMintsOnce(t *testing.T) {
 	}
 
 	storeMu.Lock()
-	after := len(storeTypes)
+	after, keysAfter := len(storeTypes), len(keyTypes)
 	storeMu.Unlock()
 	if grew := after - before; grew != 1 {
 		t.Errorf("50 executions of one declaration minted %d types, want 1", grew)
+	}
+	// The key table is bounded the same way and by the same signature --
+	// it is the second thing per shape that reflect.StructOf never frees.
+	if grew := keysAfter - keysBefore; grew != 1 {
+		t.Errorf("50 executions of one declaration minted %d key types, want 1", grew)
+	}
+}
+
+// An incomparable struct can never reach a map key -- typeOf refuses
+// map[P]... and names the field to blame -- so no key type is minted for
+// one. Nothing would hold it, and reflect.StructOf never frees.
+func TestIncomparableStructMintsNoKeyType(t *testing.T) {
+	storeMu.Lock()
+	before := len(keyTypes)
+	storeMu.Unlock()
+
+	st := declare(t, "type Leaky struct {\n\tTags []string\n}", "Leaky")
+	if st.keyT != nil {
+		t.Error("an incomparable struct minted a key type nothing can use")
+	}
+	if st.storeT == nil {
+		t.Error("an incomparable struct is still a perfectly good container element")
+	}
+
+	storeMu.Lock()
+	after := len(keyTypes)
+	storeMu.Unlock()
+	if after != before {
+		t.Errorf("the key table grew by %d for an incomparable struct", after-before)
 	}
 }
 
@@ -159,6 +259,17 @@ fmt.Printf("%T\n", v)`},
 }`},
 		{"make fill", `xs := make([]P, 1)
 fmt.Printf("%T\n", xs[0])`},
+		// The key side. A minted KEY unwraps through a different door --
+		// fromKeyStore, which decodes rather than dereferences -- and
+		// range is the only path that hands one back to a script.
+		{"range map keys", `for k := range map[P]int{{1}: 2} {
+	fmt.Printf("%T\n", k)
+}`},
+		{"range map keys, nil key", `m := map[P]int{}
+m[nil] = 1
+for k := range m {
+	fmt.Printf("%T\n", k)
+}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// %T is the one place the erasure is visible to a script at

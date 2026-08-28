@@ -37,12 +37,17 @@ type StructType struct {
 	// a StructType after env.Define publishes it.
 	keyArr reflect.Type
 
-	// sig and storeT are the struct's identity and its type INSIDE a
-	// container -- see store.go, which owns both and explains why a
-	// container cannot just hold the erased *StructVal. Both are set once
-	// at declaration, after the field loop has resolved FieldTypes.
+	// sig is the struct's identity, and storeT and keyT are its types
+	// inside a container -- storeT at an ELEMENT slot, keyT at a map KEY
+	// -- see store.go, which owns all three and explains why a container
+	// cannot just hold the erased *StructVal. They are set once at
+	// declaration, after the field loop has resolved FieldTypes.
+	//
+	// keyT is nil for an INCOMPARABLE struct, which can never reach a map
+	// key at all, so nothing would ever hold one.
 	sig    string
 	storeT reflect.Type
+	keyT   reflect.Type
 
 	// noCmp names the field that makes this type incomparable, or is nil
 	// when == is allowed. Go decides comparability from the STATIC field
@@ -303,6 +308,12 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 	// nested struct already has a signature of its own.
 	t.sig = structSig(t)
 	t.storeT = mintStoreType(t)
+	// The key type is minted only when the struct can BE a key. noCmp was
+	// settled by the loop above, and typeOf refuses map[P]... when it is
+	// set -- so minting one here would leak a type nothing can reach.
+	if t.noCmp == nil {
+		t.keyT = mintKeyType(t)
+	}
 	env.Define(ts.Name.Name, t)
 	return nil
 }
