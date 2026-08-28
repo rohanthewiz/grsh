@@ -192,11 +192,54 @@ func decodeKeyArr(t *StructType, arr reflect.Value) *StructVal {
 // It is a threshold rather than a rule because the array's TYPE is chosen
 // at runtime -- [len(Fields)]any -- and Go has no way to write a literal
 // whose length is a variable. Enumerating the small lengths is the only
-// way to reach the fast path at all, so the cutoff is set where the
-// enumeration stops paying: struct map keys in practice have a handful of
-// fields, and every length past this one falls back to the reflect path
-// below, which is correct for any length.
-const keyArrFanout = 4
+// way to reach the fast path at all, and every length past the last case
+// falls back to the reflect path below, which is correct for any length.
+//
+// WHERE IT IS SET, and why it is not set where the first version guessed.
+// That version said the cutoff belongs "where the enumeration stops
+// paying", which assumed the two paths converge. Measured against each
+// other at every arity -- both paths in one binary, the cutoff forced
+// either way, minimum of ten runs, Apple M3 -- they never do:
+//
+//	fields    1     2     3     4     5     6     8    12
+//	reflect  49    67    81   100   117   132   159   224   ns
+//	literal  16    20    23    26    31    34    41    56   ns
+//
+// The literal path holds a ~75% saving out to twelve fields and one
+// allocation fewer at every arity, because reflect costs ~15ns per field
+// against ~3ns and then Interface() copies the array out. So there is no
+// crossover to find, and the cutoff is a trade instead: what an added
+// case gives a key of THAT arity, against what it costs every key.
+//
+// What it costs is the shared buffer below, which is sized by this
+// constant and zeroed whole on every call. Holding the case count fixed
+// and growing only the buffer from 4 slots to 12 costs a one-field key
+// 0.8ns and a four-field key 1.6ns -- about 0.18ns per unused slot.
+// Holding the buffer fixed and growing only the case count from 5 to 13
+// costs nothing measurable, so the switch itself is free and the buffer
+// is the whole tax.
+//
+// 8 spends ~0.7ns of a 15ns one-field encode to take a five- to
+// eight-field key from ~117-159ns down to ~31-41ns. Past 8 the trade
+// inverts in practice: the tax is paid by every key ever encoded and the
+// saving goes to arities a script hardly writes.
+//
+// What a SCRIPT feels, from two interleaved builds differing only in this
+// constant: a six-field key read costs 19.7% less and one allocation
+// fewer per crossing, and the one-field shapes do not move -- the 0.7ns
+// is real in-binary and sits under the +/-1.9% the untouched control
+// shapes drift between builds. BenchmarkStructContainer's
+// map-key-struct-hit-6 is the shape that bought it and its one-field
+// neighbours are the ones that pay.
+//
+// Moving it is safe in both directions, and differently so in each.
+// Raising it past the last case costs speed and never correctness: the
+// switch below falls through to reflect. LOWERING it below the last case
+// does not compile at all, because the buffer is sized by this constant
+// and the higher cases then index past its end -- which is the compiler
+// enforcing what TestKeyEncodingMatchesTheDeclaredArrayType checks for
+// the direction it cannot see.
+const keyArrFanout = 8
 
 // structKeyOf encodes a struct value into the key the map actually holds.
 //
@@ -253,6 +296,14 @@ func structKeyOf(sv *StructVal) (StructKey, error) {
 			return StructKey{T: sv.Type, F: [3]any{buf[0], buf[1], buf[2]}}, nil
 		case 4:
 			return StructKey{T: sv.Type, F: [4]any{buf[0], buf[1], buf[2], buf[3]}}, nil
+		case 5:
+			return StructKey{T: sv.Type, F: [5]any{buf[0], buf[1], buf[2], buf[3], buf[4]}}, nil
+		case 6:
+			return StructKey{T: sv.Type, F: [6]any{buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]}}, nil
+		case 7:
+			return StructKey{T: sv.Type, F: [7]any{buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]}}, nil
+		case 8:
+			return StructKey{T: sv.Type, F: [8]any{buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]}}, nil
 		}
 	}
 	// The general path: reflect is the only way to build a value of an

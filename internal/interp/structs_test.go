@@ -1123,10 +1123,11 @@ fmt.Println(m[Out{In{1}, "a"}], m[Out{In{2}, "a"}], m)`,
 // the field order both serve. Field 0 is held constant across the two
 // keys so a miss can only come from the fields the arity added.
 func TestStructMapKeysAtEveryArity(t *testing.T) {
-	names := []string{"A", "B", "C", "D", "E", "F"}
-	// 0 crosses the empty-array case, 4 is keyArrFanout itself, and 5 is
-	// the first arity that falls through to the reflect path.
-	for _, n := range []int{0, 1, 2, 3, 4, 5} {
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+	// Every arity the fast path enumerates, plus both edges: 0 crosses
+	// the empty-array case, 8 is keyArrFanout itself, and 9 is the first
+	// arity that falls through to the reflect path.
+	for _, n := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {
 		t.Run(fmt.Sprintf("%d-fields", n), func(t *testing.T) {
 			var decl strings.Builder
 			decl.WriteString("type P struct {\n")
@@ -1200,8 +1201,8 @@ func TestStructMapKeysAtEveryArity(t *testing.T) {
 // is invisible from a script and would surface only when the fanout is
 // changed. This is the assertion that makes that safe to do.
 func TestKeyEncodingMatchesTheDeclaredArrayType(t *testing.T) {
-	names := []string{"A", "B", "C", "D", "E", "F"}
-	for _, n := range []int{0, 1, 2, 3, 4, 5} {
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+	for _, n := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {
 		src := "type P struct {\n"
 		for i := 0; i < n; i++ {
 			src += "\t" + names[i] + " int\n"
