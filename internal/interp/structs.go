@@ -162,19 +162,51 @@ func (k StructKey) structVal() *StructVal {
 	if k.T == nil {
 		return nil
 	}
-	vals := make([]Value, len(k.T.Fields))
-	if arr := reflect.ValueOf(k.F); arr.IsValid() {
+	return decodeKeyArr(k.T, reflect.ValueOf(k.F))
+}
+
+// decodeKeyArr rebuilds a script struct from a key's field array.
+//
+// It takes the array as a reflect.Value rather than as the StructKey that
+// holds it so that decodeMintedKey can reach it WITHOUT ever materialising
+// a StructKey: a key sitting in a map is read through reflect, and pulling
+// a three-word struct out of a field with Interface() has to copy it to
+// the heap first. One decoder, two ways in, so the two can never drift.
+//
+// An invalid arr -- a key whose F was never set -- decodes to the
+// struct's fields all nil rather than panicking, which is the same answer
+// the field loop would give for an array of nil interfaces.
+func decodeKeyArr(t *StructType, arr reflect.Value) *StructVal {
+	vals := make([]Value, len(t.Fields))
+	if arr.IsValid() {
 		for i := range vals {
 			vals[i] = fromKeyValue(arr.Index(i).Interface())
 		}
 	}
-	return &StructVal{Type: k.T, Vals: vals}
+	return &StructVal{Type: t, Vals: vals}
 }
+
+// keyArrFanout is the field count up to which structKeyOf builds the key
+// array as a Go literal instead of through reflect.
+//
+// It is a threshold rather than a rule because the array's TYPE is chosen
+// at runtime -- [len(Fields)]any -- and Go has no way to write a literal
+// whose length is a variable. Enumerating the small lengths is the only
+// way to reach the fast path at all, so the cutoff is set where the
+// enumeration stops paying: struct map keys in practice have a handful of
+// fields, and every length past this one falls back to the reflect path
+// below, which is correct for any length.
+const keyArrFanout = 4
 
 // structKeyOf encodes a struct value into the key the map actually holds.
 //
 // Recursion terminates for copyStruct's reason: a struct value cannot
 // contain itself, because every store takes a copy first.
+//
+// This is the hot half of a struct-keyed crossing -- every read, write,
+// delete and literal entry encodes one key -- so it has two paths for
+// what is the same job. See keyArrFanout for why the split exists and
+// BenchmarkKeyCrossing for what it buys.
 func structKeyOf(sv *StructVal) (StructKey, error) {
 	// A typed nil is an ordinary value in grsh, and the zero StructKey is
 	// its encoding -- so a nil stored under one name is found by a nil
@@ -182,6 +214,51 @@ func structKeyOf(sv *StructVal) (StructKey, error) {
 	if sv == nil {
 		return StructKey{}, nil
 	}
+	if n := len(sv.Vals); n <= keyArrFanout && n == len(sv.Type.Fields) {
+		// A fixed-size stack array collects the encoded fields, and the
+		// switch copies out of it into an array of the RIGHT length. That
+		// length is what makes the key's type -- a [2]any and a [3]any are
+		// different types and can never collide -- so it must match
+		// sv.Type.keyArr, which is ArrayOf(len(Fields), anyType).
+		//
+		// Every instance carries one Val per field, so the two lengths
+		// agree; the guard above checks it rather than trusting it,
+		// because a short Vals would otherwise mint a key of a length
+		// the rest of the interpreter does not expect. The reflect path
+		// below sizes itself from keyArr and handles that case as it
+		// always did.
+		//
+		// A nil field needs no special case here: an unset element of the
+		// buffer is already the nil interface the reflect path leaves
+		// behind, so both paths encode a nil field identically.
+		var buf [keyArrFanout]any
+		for i, v := range sv.Vals {
+			ev, err := keyValue(v)
+			if err != nil {
+				return StructKey{}, err
+			}
+			buf[i] = ev
+		}
+		// Each case RETURNS, so a length with no case here simply falls
+		// through to the general path below. Raising keyArrFanout without
+		// adding a case therefore costs speed and never correctness.
+		switch n {
+		case 0:
+			return StructKey{T: sv.Type, F: [0]any{}}, nil
+		case 1:
+			return StructKey{T: sv.Type, F: [1]any{buf[0]}}, nil
+		case 2:
+			return StructKey{T: sv.Type, F: [2]any{buf[0], buf[1]}}, nil
+		case 3:
+			return StructKey{T: sv.Type, F: [3]any{buf[0], buf[1], buf[2]}}, nil
+		case 4:
+			return StructKey{T: sv.Type, F: [4]any{buf[0], buf[1], buf[2], buf[3]}}, nil
+		}
+	}
+	// The general path: reflect is the only way to build a value of an
+	// array type chosen at runtime. It costs one allocation more than the
+	// literals above, because Interface() on an ADDRESSABLE value has to
+	// copy the array out before it can box it.
 	arr := reflect.New(sv.Type.keyArr).Elem()
 	for i, v := range sv.Vals {
 		ev, err := keyValue(v)

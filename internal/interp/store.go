@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // Storage types: repairing the erasure where it actually costs something.
@@ -57,7 +58,8 @@ import (
 //
 // The cost is a rule with no compiler to enforce it: a minted value must
 // never reach script code. Every read out of a container goes through
-// fromStore or fromKeyStore, and every write in goes through convertTo.
+// fromStore or decodeMintedKey, and every write in goes through
+// convertTo.
 // Those are the entire boundary.
 //
 // A type minted here is never freed — reflect.StructOf caches globally —
@@ -251,7 +253,17 @@ func mintStoreType(t *StructType) reflect.Type {
 // field to blame), so minting for it would leak a type nothing can use,
 // and a nil keyT is the honest record of that.
 func mintKeyType(t *StructType) reflect.Type {
-	return mint(t, keyCarrierType, keyTypes, &keyOwners)
+	kt := mint(t, keyCarrierType, keyTypes, &keyOwners)
+	// intoKeyStore reinterprets a *ScriptKey as a *kt, which is sound
+	// only while kt is exactly one ScriptKey at offset zero. mint builds
+	// it that way today; checking here is what turns a future second
+	// field into a loud failure at declaration rather than keys that
+	// silently read the wrong memory.
+	if kt.NumField() != 1 || kt.Field(0).Type != keyCarrierType ||
+		kt.Field(0).Offset != 0 || kt.Size() != keyCarrierType.Size() {
+		panic("grsh: minted key type " + kt.String() + " is not layout-identical to ScriptKey; intoKeyStore's alias is unsound")
+	}
+	return kt
 }
 
 // mint interns one minted type per (carrier, signature) pair and records
@@ -380,29 +392,38 @@ func zeroInSlot(t reflect.Type) Value {
 	return reflect.Zero(t).Interface()
 }
 
-// fromKeyStore reads one map KEY as the script must see it: a minted key
-// becomes the *StructVal it encodes, everything else is itself.
+// decodeMintedKey reads one map KEY as the script must see it: it
+// rebuilds the *StructVal a minted key encodes.
 //
 // It is fromStore's counterpart, and the asymmetry is StructKey's: an
 // element hands back the very pointer the container holds, while a key
 // hands back a FRESH struct decoded from the encoding. That is what makes
 // `for k := range m { k.X = 9 }` safe — mutating the range variable
 // cannot reach the key inside the map and corrupt its hashing.
-func fromKeyStore(rv reflect.Value) Value {
-	if k, ok := keyInStore(rv); ok {
-		return k.structVal()
+//
+// Unlike fromStore it takes no non-key values: the caller must have
+// ESTABLISHED that rv is a minted key, and there is no guard here on
+// purpose. Keys are read a whole map at a time, and every such loop
+// already knows the answer for the whole map — one key type per map — so
+// a guard would put a registry lookup inside the loop for nothing.
+//
+// The two StructKey fields are read THROUGH reflect rather than by
+// lifting the whole StructKey out with Interface(). A three-word struct
+// does not fit in an interface word, so boxing one out of an ADDRESSABLE
+// field copies it to the heap first; reading the fields separately never
+// does, because a pointer unboxes for free and Elem() reads the field
+// array out of its `any` field in place.
+func decodeMintedKey(rv reflect.Value) *StructVal {
+	// Two hops, like fromStore: the minted type embeds the carrier, the
+	// carrier holds the encoding.
+	sk := rv.Field(0).Field(0)
+	t, _ := sk.Field(0).Interface().(*StructType)
+	if t == nil {
+		// The zero key, which `m[nil] = 1` puts in a map. structVal
+		// answers a typed nil for it and so must this.
+		return nil
 	}
-	return rv.Interface()
-}
-
-// keyInStore unwraps a minted key to the StructKey it carries, and
-// reports whether rv was one. Two hops, like fromStore: the minted type
-// embeds the carrier, the carrier holds the encoding.
-func keyInStore(rv reflect.Value) (StructKey, bool) {
-	if rv.Kind() != reflect.Struct || keyOwnerOf(rv.Type()) == nil {
-		return StructKey{}, false
-	}
-	return rv.Field(0).Field(0).Interface().(StructKey), true
+	return decodeKeyArr(t, sk.Field(1).Elem())
 }
 
 // intoStore wraps a script struct for a container slot of minted type mt.
@@ -418,29 +439,25 @@ func intoStore(sv *StructVal, mt reflect.Type) reflect.Value {
 // intoKeyStore wraps an encoded key for a map of minted key type kt. It
 // is intoStore's counterpart on the key side, and the same rule holds:
 // only convertTo should build one.
+//
+// It builds the value by ALIASING rather than by filling it field by
+// field, and that is measured rather than clever. A minted key type is
+// exactly one embedded ScriptKey and nothing else, so it has ScriptKey's
+// size, alignment and pointer map — the two are the same three words
+// under different names, which is precisely the case reflect.NewAt
+// exists for. Going through reflect.New and a Set per field produced the
+// same bytes for twice the time, and this runs on every read, write,
+// delete and literal entry of a struct-keyed map.
+//
+// The alias is sound only while the minted type keeps that shape.
+// mintKeyType CHECKS it at declaration rather than trusting it, so a
+// second field added to the mint would fail loudly there instead of
+// silently mis-typing every key.
+//
+// The zero StructKey — what a nil struct key encodes to — needs no case
+// of its own: a zero ScriptKey is already the zero minted value.
 func intoKeyStore(k StructKey, kt reflect.Type) reflect.Value {
-	w := reflect.New(kt).Elem()
-	// The zero StructKey — what a nil struct key encodes to — is already
-	// exactly what reflect.New produced, and its F is nil, which Set
-	// panics on. So `m[nil]` and a typed nil struct both stop here, on
-	// the same key.
-	if k.T == nil {
-		return w
-	}
-	// The two fields are set INDIVIDUALLY rather than by setting the
-	// StructKey whole, and that is measured rather than stylistic:
-	// reflect.ValueOf(k) boxes a three-word struct and costs an
-	// allocation on every key crossing, while a pointer and a field that
-	// is ALREADY an interface each box for free. One extra line keeps a
-	// struct-keyed read and write at the allocation count they had before
-	// keys were minted.
-	//
-	// It is the one place that depends on StructKey's field ORDER, and
-	// TestMintedTypePromotesExactlyOneMethod pins it.
-	sk := w.Field(0).Field(0)
-	sk.Field(0).Set(reflect.ValueOf(k.T))
-	sk.Field(1).Set(reflect.ValueOf(k.F))
-	return w
+	return reflect.NewAt(kt, unsafe.Pointer(&ScriptKey{K: k})).Elem()
 }
 
 // storeReplace rewrites minted type names in s to the script's own struct

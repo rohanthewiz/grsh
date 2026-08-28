@@ -862,14 +862,24 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 	case reflect.Map:
 		// Sort keys when possible so scripts are deterministic.
 		keys := rv.MapKeys()
-		sortMapKeys(keys)
-		for _, k := range keys {
-			// fromKeyStore undoes the key erasure: a struct-keyed map
-			// stores a minted key wrapping a StructKey, and the script
-			// must range over its own P. The rebuilt struct is fresh each
-			// iteration, so assigning to the range variable's fields
-			// cannot reach the key inside the map.
-			cont, err := iterate(fromKeyStore(k), fromStore(rv.MapIndex(k)))
+		// sortMapKeys hands back the script's own keys for a struct-keyed
+		// map, because ordering had to decode every one of them anyway.
+		// Decoding again in this loop would do that work twice per key.
+		decoded := sortMapKeys(keys)
+		for i, k := range keys {
+			// The key erasure is undone by that decode: a struct-keyed
+			// map stores a minted key wrapping a StructKey, and the
+			// script must range over its own P. Each key's struct was
+			// rebuilt fresh and is used by exactly one iteration, so
+			// assigning to the range variable's fields can reach neither
+			// the key inside the map nor another iteration.
+			var key Value
+			if decoded != nil {
+				key = decoded[i]
+			} else {
+				key = k.Interface()
+			}
+			cont, err := iterate(key, fromStore(rv.MapIndex(k)))
 			if err != nil || !cont {
 				return err
 			}
@@ -888,11 +898,22 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 	return nil
 }
 
-func sortMapKeys(keys []reflect.Value) {
+// sortMapKeys orders a map's keys so a range over it is deterministic,
+// and returns the SCRIPT-facing key for each slot, in the sorted order,
+// or nil when the keys need no decoding.
+//
+// The two jobs are one function because for a struct-keyed map they are
+// one piece of work: ordering needs every key rendered, rendering needs
+// it decoded, and the decoded struct is exactly what the range variable
+// must be. Kept apart, every key of every range was decoded twice.
+func sortMapKeys(keys []reflect.Value) []Value {
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 	strs := make([]string, len(keys))
+	// decoded stays nil for every key kind that is already the script's
+	// own value, which is the signal the caller reads.
+	var decoded []Value
 	switch {
 	case keys[0].Kind() == reflect.String:
 		for i, k := range keys {
@@ -906,20 +927,28 @@ func sortMapKeys(keys []reflect.Value) {
 		//
 		// The type is asked, not the value: every key in a map shares one
 		// type, so one lookup settles the whole slice.
+		decoded = make([]Value, len(keys))
 		for i, k := range keys {
-			sk, _ := keyInStore(k)
-			strs[i] = sk.String()
+			sv := decodeMintedKey(k)
+			// Held as the *StructVal it is, so a nil key stays the typed
+			// nil the script sees everywhere else. String answers for it.
+			decoded[i] = sv
+			strs[i] = sv.String()
 		}
 	default:
-		return
+		return nil
 	}
 	// insertion sort keeps this dependency-free
 	for i := 1; i < len(keys); i++ {
 		for j := i; j > 0 && strs[j] < strs[j-1]; j-- {
 			strs[j], strs[j-1] = strs[j-1], strs[j]
 			keys[j], keys[j-1] = keys[j-1], keys[j]
+			if decoded != nil {
+				decoded[j], decoded[j-1] = decoded[j-1], decoded[j]
+			}
 		}
 	}
+	return decoded
 }
 
 // ---- declarations & switch ----

@@ -76,12 +76,24 @@ func TestMintedTypePromotesExactlyOneMethod(t *testing.T) {
 	if !st.keyT.Comparable() {
 		t.Fatal("minted key type is not comparable; reflect.MapOf would panic on it")
 	}
-	// intoKeyStore fills StructKey's fields BY INDEX to avoid boxing the
-	// struct whole on every key crossing, so reordering them would write
-	// the encoding into the wrong slots -- silently, since both are set.
+	// intoKeyStore builds a key by reinterpreting a *ScriptKey as a
+	// pointer to the minted type, so the two must be the same bytes: one
+	// ScriptKey at offset zero and nothing else. mintKeyType panics if
+	// that ever stops holding, and this is the same invariant stated
+	// where a reader of the test will meet it.
+	kc := reflect.TypeFor[ScriptKey]()
+	if st.keyT.NumField() != 1 || st.keyT.Field(0).Type != kc ||
+		st.keyT.Field(0).Offset != 0 || st.keyT.Size() != kc.Size() {
+		t.Fatalf("minted key type %s is not layout-identical to ScriptKey (%d fields, %d bytes vs %d): "+
+			"intoKeyStore's reflect.NewAt alias reads the wrong memory",
+			st.keyT, st.keyT.NumField(), st.keyT.Size(), kc.Size())
+	}
+	// decodeMintedKey reads StructKey's fields BY INDEX -- T then F --
+	// rather than lifting the struct out whole, so reordering them would
+	// decode the encoding out of the wrong slots.
 	for i, want := range [2]string{"T", "F"} {
 		if got := structKeyType.Field(i).Name; got != want {
-			t.Fatalf("StructKey field %d is %s, want %s: intoKeyStore sets these by index", i, got, want)
+			t.Fatalf("StructKey field %d is %s, want %s: decodeMintedKey reads these by index", i, got, want)
 		}
 	}
 	if got, want := mt.Size(), reflect.TypeFor[*StructVal]().Size(); got != want {
@@ -260,7 +272,7 @@ fmt.Printf("%T\n", v)`},
 		{"make fill", `xs := make([]P, 1)
 fmt.Printf("%T\n", xs[0])`},
 		// The key side. A minted KEY unwraps through a different door --
-		// fromKeyStore, which decodes rather than dereferences -- and
+		// decodeMintedKey, which decodes rather than dereferences -- and
 		// range is the only path that hands one back to a script.
 		{"range map keys", `for k := range map[P]int{{1}: 2} {
 	fmt.Printf("%T\n", k)

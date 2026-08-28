@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"io"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/rohanthewiz/grsh/internal/shellexec"
@@ -345,11 +346,24 @@ _ = p`},
 //
 // The KEY shapes are priced against the interpreter before keys were
 // minted, not against a native control, because their cost is a different
-// one and it is real: wrapping an encoded key costs a reflect.New plus
-// two Sets where handing the map a bare StructKey cost one ValueOf, which
-// measured at +17% on a read or a write and +7% on a range over keys, at
-// an unchanged allocation count. The element shapes did not move. That is
-// what a struct-keyed map pays for its type telling P from Q while empty.
+// one: a key is ENCODED into a comparable array on every crossing rather
+// than wrapped like a pointer, so it can never match the string-keyed
+// map above.
+//
+// Minting keys first cost +20% on a read, +21% on a write and +8% on a
+// range, all at an unchanged allocation count. Encoding through a Go
+// array literal instead of reflect, aliasing the wrap instead of filling
+// it field by field, and decoding a map's keys once for both the
+// ordering and the loop put all three back where they were -- +2%, +2%
+// and -1.5%, against a control band of the same width -- and one
+// allocation cheaper per read or write, 1755 cheaper over the range
+// shape. BenchmarkKeyCrossing prices those three pieces directly; this
+// measures what a script actually feels.
+//
+// Both figures are the MINIMUM of a dozen interleaved runs with the
+// binaries rotated. Machine noise on these shapes is wider than several
+// of the numbers above, and a baseline taken in another session is not a
+// baseline -- the native controls are here to say how wide it was.
 func BenchmarkStructContainer(b *testing.B) {
 	shapes := []struct{ name, body string }{
 		{"slice-index-native", `xs := []int{0, 0, 0, 0}
@@ -453,6 +467,88 @@ _ = n`},
 		})
 	}
 }
+
+// BenchmarkKeyCrossing prices the three pieces of a struct-keyed map
+// crossing on their own, because BenchmarkStructContainer measures them
+// buried under an interpreted loop that costs several times as much --
+// which is enough to tell whether a change helped, and not enough to say
+// WHERE.
+//
+// encode   structKeyOf: the script's struct into a comparable [N]any
+// wrap     intoKeyStore: that encoding into the map's minted key type
+// decode   decodeMintedKey: a key in the map back into the script's struct
+//
+// Two field counts, because encode and decode are per-field work and wrap
+// is not, so a change that helps one and not the others shows here as a
+// different slope rather than as one number moving.
+//
+// THE DECODE INPUT COMES FROM MapKeys, and that is not incidental.
+// reflect boxes a struct out of an ADDRESSABLE value by copying it to the
+// heap first and out of a non-addressable one for free, so a decode
+// benchmarked on a key straight from intoKeyStore -- which is addressable
+// -- reports an allocation the real path never pays. A decode measured
+// that way once made a change look like it saved an allocation per
+// ranged key when it saved none.
+func BenchmarkKeyCrossing(b *testing.B) {
+	names := []string{"A", "B", "C", "D", "E", "F"}
+	for _, nf := range []int{1, 3} {
+		src := "type P struct {\n"
+		for i := 0; i < nf; i++ {
+			src += "\t" + names[i] + " int\n"
+		}
+		// The map literal is what forces the key type to be minted.
+		src += "}\n_ = map[P]int{}\n"
+		in, fset, f := prepScript(b, src)
+		if err := in.Run(fset, f); err != nil {
+			b.Fatalf("declaring P: %v", err)
+		}
+		v, ok := in.globals.Get("P")
+		if !ok {
+			b.Fatal("P was not defined")
+		}
+		st := v.(*StructType)
+
+		vals := make([]Value, nf)
+		for i := range vals {
+			vals[i] = i
+		}
+		sv := &StructVal{Type: st, Vals: vals}
+		k, err := structKeyOf(sv)
+		if err != nil {
+			b.Fatalf("encoding a key: %v", err)
+		}
+		mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+		mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(7))
+		inMap := mp.MapKeys()[0]
+
+		b.Run(fmt.Sprintf("encode/%d", nf), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				keySink, _ = structKeyOf(sv)
+			}
+		})
+		b.Run(fmt.Sprintf("wrap/%d", nf), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				wrapSink = intoKeyStore(k, st.keyT)
+			}
+		})
+		b.Run(fmt.Sprintf("decode/%d", nf), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				svSink = decodeMintedKey(inMap)
+			}
+		})
+	}
+}
+
+// Sinks for the three above: each result is otherwise dead and the
+// compiler is free to delete the call that made it.
+var (
+	keySink  StructKey
+	wrapSink reflect.Value
+	svSink   *StructVal
+)
 
 // BenchmarkNewEnv isolates the cost the loop shapes pay repeatedly: an
 // Env plus its eagerly allocated map. If NewEnv ever grows a lazy map,

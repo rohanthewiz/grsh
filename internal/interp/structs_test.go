@@ -1,6 +1,8 @@
 package interp
 
 import (
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1107,6 +1109,112 @@ m := map[Out]int{}
 m[Out{In{1}, "a"}] = 7
 fmt.Println(m[Out{In{1}, "a"}], m[Out{In{2}, "a"}], m)`,
 		"7 0 map[Out{I: In{N: 1}, T: a}:7]\n")
+}
+
+// structKeyOf has one code path PER FIELD COUNT up to keyArrFanout and a
+// reflect path past it, so a key's arity is now a branch and every branch
+// needs walking. A single case building an array of the wrong length --
+// or dropping a field on the way in -- is invisible to any test that only
+// ever uses a one-field key.
+//
+// Each arity is exercised through the map rather than through the
+// encoder: an entry has to be STORED under a key and then FOUND by an
+// equal one built separately, which is the property the array length and
+// the field order both serve. Field 0 is held constant across the two
+// keys so a miss can only come from the fields the arity added.
+func TestStructMapKeysAtEveryArity(t *testing.T) {
+	names := []string{"A", "B", "C", "D", "E", "F"}
+	// 0 crosses the empty-array case, 4 is keyArrFanout itself, and 5 is
+	// the first arity that falls through to the reflect path.
+	for _, n := range []int{0, 1, 2, 3, 4, 5} {
+		t.Run(fmt.Sprintf("%d-fields", n), func(t *testing.T) {
+			var decl strings.Builder
+			decl.WriteString("type P struct {\n")
+			for i := 0; i < n; i++ {
+				fmt.Fprintf(&decl, "\t%s int\n", names[i])
+			}
+			decl.WriteString("}\n")
+
+			// lit writes a key literal whose field `differs` is bumped,
+			// or the stored key itself when differs is out of range.
+			// Every field gets a DISTINCT value, so a path that writes
+			// them into the wrong slots -- or into one slot -- lands
+			// somewhere the lookup does not.
+			lit := func(differs int) string {
+				var b strings.Builder
+				b.WriteString("P{")
+				for i := 0; i < n; i++ {
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					v := i + 1
+					if i == differs {
+						v += 100
+					}
+					fmt.Fprintf(&b, "%d", v)
+				}
+				b.WriteString("}")
+				return b.String()
+			}
+
+			// Both ends of the field list are probed, not just one: a
+			// collapse that writes every field into slot 0 leaves the
+			// LAST field deciding the key, so a miss on the last field
+			// still reports correctly and only a miss on the first one
+			// catches it.
+			store := decl.String() + "m := map[P]int{}\nm[" + lit(-1) + "] = 7\n"
+			src := store +
+				"fmt.Println(m[" + lit(-1) + "], m[" + lit(n-1) + "], m[" + lit(0) + "], len(m))"
+			// A zero-field struct has exactly one value, so both "miss"
+			// keys are the stored key and find the entry.
+			want := "7 0 0 1\n"
+			if n == 0 {
+				want = "7 7 7 1\n"
+			}
+			wantOut(t, src, want)
+
+			// Lookups alone cannot see a PERMUTED encoding: a key stored
+			// and sought through the same wrong order still matches
+			// itself. Printing the map decodes the key back against the
+			// field NAMES, which is where a swap shows.
+			var render strings.Builder
+			render.WriteString("map[P{")
+			for i := 0; i < n; i++ {
+				if i > 0 {
+					render.WriteString(", ")
+				}
+				fmt.Fprintf(&render, "%s: %d", names[i], i+1)
+			}
+			render.WriteString("}:7]\n")
+			wantOut(t, store+"fmt.Println(m)", render.String())
+		})
+	}
+}
+
+// The two paths in structKeyOf must produce the same TYPE, not merely a
+// working key: the array's length is part of it, and keyArr is what the
+// rest of the interpreter believes a key holds.
+//
+// A map only ever exercises one of the paths -- every key of a given
+// struct takes the same branch -- so a length disagreement between them
+// is invisible from a script and would surface only when the fanout is
+// changed. This is the assertion that makes that safe to do.
+func TestKeyEncodingMatchesTheDeclaredArrayType(t *testing.T) {
+	names := []string{"A", "B", "C", "D", "E", "F"}
+	for _, n := range []int{0, 1, 2, 3, 4, 5} {
+		src := "type P struct {\n"
+		for i := 0; i < n; i++ {
+			src += "\t" + names[i] + " int\n"
+		}
+		st := declare(t, src+"}", "P")
+		k, err := structKeyOf(st.newZero())
+		if err != nil {
+			t.Fatalf("%d fields: encoding: %v", n, err)
+		}
+		if got := reflect.TypeOf(k.F); got != st.keyArr {
+			t.Errorf("%d fields: key holds %s, want %s -- the fast path and the reflect path disagree on the array type", n, got, st.keyArr)
+		}
+	}
 }
 
 // A field declared `any` is statically comparable and dynamically
