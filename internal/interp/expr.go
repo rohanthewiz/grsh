@@ -410,27 +410,45 @@ func safeEqual(x, y Value) bool {
 	return x == y
 }
 
+// errorInterface is `error` as a reflect.Type, for the one question
+// isNilRef has to ask about a pointer.
+var errorInterface = reflect.TypeOf((*error)(nil)).Elem()
+
 // isNilRef reports whether v counts as nil against the `nil` literal:
-// either an untyped nil, or one of the reference kinds whose nil the
-// interpreter itself materializes as a non-nil interface.
+// either an untyped nil, or one of the kinds whose nil the interpreter
+// materializes as a non-nil interface wrapping a nil.
 //
-// Deliberately NOT included:
-//
-//   - POINTER. grsh has no static types, so a nil `*os.File` a builtin
-//     returned and a typed nil stuffed into an `error` are the same
-//     value here. Go calls the second one non-nil, and it is the case
-//     that matters: making `err == nil` true for it would swallow a real
-//     error. The first case is the rarer one, and it stays as it was.
-//   - STRUCT. A *StructVal never reaches safeEqual through `==`;
-//     binaryOp routes it to valuesEqual, which already answers true for
-//     a typed nil against the literal.
+// A STRUCT is not among them and does not need to be: a *StructVal never
+// reaches safeEqual through `==`, because binaryOp routes it to
+// valuesEqual, which already answers true for a typed nil.
 func isNilRef(v Value) bool {
 	if v == nil {
 		return true
 	}
-	switch rv := reflect.ValueOf(v); rv.Kind() {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
 	case reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
 		return rv.IsNil()
+
+	case reflect.Pointer:
+		// A nil pointer is nil, and scripts do get handed one:
+		// `re, err := regexp.Compile("(")` leaves re a nil
+		// *regexp.Regexp beside its error, and Go calls that nil.
+		//
+		// UNLESS the pointer's type implements error. Then this is the
+		// value grsh's own error rule acts on -- assignRHS and the
+		// statement-position abort both detect a failure with
+		// `.(error)`, an assertion that SUCCEEDS on a typed nil and
+		// treats it as live. Calling it nil here would split the script
+		// from its own runtime over a single value: `if err != nil`
+		// would step past an error that a one-value call would have
+		// aborted the script on. Go's interface rule reaches the same
+		// answer, from its own direction.
+		//
+		// The cut is exactly `.(error)`'s, not a judgement about which
+		// pointers matter -- that is what keeps the two in agreement no
+		// matter what a callee returns.
+		return !rv.Type().Implements(errorInterface) && rv.IsNil()
 	}
 	return false
 }

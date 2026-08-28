@@ -37,3 +37,9 @@ type P struct{ X int }
 var p P
 var ps []P
 fmt.Println(p == nil, ps == nil)
+
+# A nil POINTER is nil too, and scripts really are handed one: a failed
+# compile returns a nil *regexp.Regexp beside its error.
+bad, cerr := regexp.Compile("(")
+good, _ := regexp.Compile("a+")
+fmt.Println(bad == nil, cerr != nil, good == nil)

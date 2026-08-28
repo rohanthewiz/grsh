@@ -1,6 +1,10 @@
 package interp
 
-import "testing"
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
 
 // ---- literals ----
 
@@ -214,6 +218,57 @@ func TestZeroSliceFromMissingKeyIsNil(t *testing.T) {
 	wantOut(t, `m := map[string][]int{"a": {1}}
 fmt.Println(m["a"] == nil, m["zz"] == nil)`, "false true\n")
 }
+
+// A nil POINTER is nil too. Scripts are handed one by the registry: a
+// failed regexp.Compile returns a nil *regexp.Regexp beside its error.
+func TestNilPointerEqualsNil(t *testing.T) {
+	out, err := eval(t, `p := nilPtr()
+q := livePtr()
+fmt.Println(p == nil, q == nil)`, map[string]any{
+		"nilPtr":  func() *bytes.Buffer { return nil },
+		"livePtr": func() *bytes.Buffer { return new(bytes.Buffer) },
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "true false\n" {
+		t.Errorf("got %q, want %q", out, "true false\n")
+	}
+}
+
+// The exception, and the reason for it: a pointer whose TYPE implements
+// error stays non-nil, because that is the value grsh's own error rule
+// acts on. Both halves are asserted together -- the script's `== nil`
+// and the runtime's `.(error)` have to reach the same verdict on one
+// value, or `if err != nil` could step past a failure that the
+// one-value form of the same call would have aborted on.
+func TestTypedNilErrorDoesNotEqualNil(t *testing.T) {
+	extra := map[string]any{
+		"boom": func() (int, error) { var e *testErr; return 7, e },
+	}
+	// The script's own view.
+	out, err := eval(t, `v, err := boom()
+fmt.Println(v, err == nil, err != nil)`, extra)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "7 false true\n" {
+		t.Errorf("got %q, want %q", out, "7 false true\n")
+	}
+	// The runtime's view of the SAME value: the one-value form aborts,
+	// which is only consistent if `err == nil` was false above.
+	if _, err := eval(t, `v := boom()
+fmt.Println(v)`, extra); err == nil || !strings.Contains(err.Error(), "typed nil") {
+		t.Errorf("one-value form: got %v, want an abort mentioning the error", err)
+	}
+}
+
+// testErr exists to be a POINTER type that implements error, which is
+// the shape of Go's own typed-nil trap. The method has a value body it
+// never reaches -- a nil receiver is only ever compared, never called.
+type testErr struct{}
+
+func (*testErr) Error() string { return "typed nil error" }
 
 // Unwrapping applies to reference kinds only: a number, a string or a
 // bool stays unequal to nil rather than matching on its zero.
