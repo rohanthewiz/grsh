@@ -394,12 +394,45 @@ func valTypeName(v Value) string {
 	return scriptTypeName(reflect.TypeOf(v))
 }
 
+// safeEqual is `==` for everything binaryOp's typed cases did not claim:
+// nil, errors, slices, maps, and whatever a Go builtin handed back.
 func safeEqual(x, y Value) bool {
 	if x == nil || y == nil {
-		return x == nil && y == nil
+		// The `nil` literal arrives as an untyped Go nil, but a nil MAP,
+		// SLICE, FUNC or CHAN does NOT: `var n map[string]int` stores
+		// what reflect.Zero hands back, which is a non-nil interface
+		// wrapping a nil header. Comparing the two interfaces alone
+		// therefore answers false for `n == nil` -- so the other side is
+		// unwrapped and asked whether it is nil directly.
+		return isNilRef(x) && isNilRef(y)
 	}
 	defer func() { recover() }() //nolint: uncomparable types compare unequal
 	return x == y
+}
+
+// isNilRef reports whether v counts as nil against the `nil` literal:
+// either an untyped nil, or one of the reference kinds whose nil the
+// interpreter itself materializes as a non-nil interface.
+//
+// Deliberately NOT included:
+//
+//   - POINTER. grsh has no static types, so a nil `*os.File` a builtin
+//     returned and a typed nil stuffed into an `error` are the same
+//     value here. Go calls the second one non-nil, and it is the case
+//     that matters: making `err == nil` true for it would swallow a real
+//     error. The first case is the rarer one, and it stays as it was.
+//   - STRUCT. A *StructVal never reaches safeEqual through `==`;
+//     binaryOp routes it to valuesEqual, which already answers true for
+//     a typed nil against the literal.
+func isNilRef(v Value) bool {
+	if v == nil {
+		return true
+	}
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // toI64 accepts integer-kinded values (int, byte, rune, int64, ...).

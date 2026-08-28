@@ -1,0 +1,39 @@
+# Comparing reference values against the nil literal.
+# A nil map or slice is stored as a non-nil interface wrapping a nil
+# header, so `== nil` has to unwrap it rather than compare interfaces.
+var m map[string]int
+var xs []int
+fmt.Println(m == nil, xs == nil, m != nil, xs != nil)
+
+# Built values are not nil, including empty ones.
+m = map[string]int{}
+xs = []int{}
+fmt.Println(m == nil, xs == nil, len(m), len(xs))
+
+# A missing key hands back the element's zero, which for a slice is nil.
+byName := map[string][]int{"a": {1}}
+fmt.Println(byName["a"] == nil, byName["zz"] == nil)
+
+# The nil check drives control flow, not just printing.
+var out []string
+if xs == nil {
+	out = append(out, "unreachable")
+}
+var ys []int
+switch {
+case ys == nil:
+	out = append(out, "switch saw nil")
+}
+if ys != nil {
+	out = append(out, "unreachable")
+}
+fmt.Println(out)
+
+# Non-reference values keep answering false against nil.
+fmt.Println(0 == nil, "" == nil, false == nil, nil == nil)
+
+# A struct is unaffected: a real instance is never nil.
+type P struct{ X int }
+var p P
+var ps []P
+fmt.Println(p == nil, ps == nil)

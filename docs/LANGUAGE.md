@@ -354,6 +354,15 @@ All compound assignments work, including the bitwise set
   scripts are deterministic by default.
 - `type` declarations create dynamic struct types; `fmt.Println(v)`
   prints them as `Name{Field: val, ...}`.
+- **`== nil` unwraps reference values.** A nil map, slice, func or chan
+  compares equal to `nil` (`var m map[string]int; m == nil` is true), and
+  so does the zero a missing key hands back for a slice-typed element.
+  An empty-but-built `[]int{}` or `map[string]int{}` is NOT nil, as in
+  Go. Scalars keep their own zeros: `0 == nil` and `"" == nil` are false.
+  A nil POINTER is the one divergence — grsh has no static types, so it
+  cannot tell a script's own nil `*T` from the typed nil a Go callee put
+  in an `error`, and it treats both as non-nil so a real error is never
+  swallowed.
 - Top-level `return` ends the script (status 0).
 - `import "strings"` lines are accepted and validated but optional — all
   registry packages are pre-loaded.

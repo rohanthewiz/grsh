@@ -191,6 +191,50 @@ b := []int{1}
 fmt.Println(a == b)`, "false\n")
 }
 
+// A nil map or slice is stored as reflect.Zero's result -- a non-nil
+// interface wrapping a nil header -- so comparing the interfaces alone
+// would call `n == nil` false. The reference kinds are unwrapped instead.
+func TestNilReferenceValuesEqualNil(t *testing.T) {
+	wantOut(t, `var m map[string]int
+var xs []int
+fmt.Println(m == nil, xs == nil, m != nil, xs != nil)`, "true true false false\n")
+}
+
+// The other half of the same claim: a built value is never nil, and an
+// EMPTY one is still not nil.
+func TestBuiltReferenceValuesAreNotNil(t *testing.T) {
+	wantOut(t, `m := map[string]int{}
+xs := []int{}
+fmt.Println(m == nil, xs == nil)`, "false false\n")
+}
+
+// A missing key hands back the element type's zero, and for a slice
+// element that zero is nil -- the same unwrap has to answer it.
+func TestZeroSliceFromMissingKeyIsNil(t *testing.T) {
+	wantOut(t, `m := map[string][]int{"a": {1}}
+fmt.Println(m["a"] == nil, m["zz"] == nil)`, "false true\n")
+}
+
+// Unwrapping applies to reference kinds only: a number, a string or a
+// bool stays unequal to nil rather than matching on its zero.
+func TestZeroScalarsDoNotEqualNil(t *testing.T) {
+	wantOut(t, `fmt.Println(0 == nil, "" == nil, false == nil, nil == nil)`,
+		"false false false true\n")
+}
+
+// The nil check has to drive control flow, not just printing: `if` and
+// `switch` route through the same binaryOp.
+func TestNilComparisonDrivesControlFlow(t *testing.T) {
+	wantOut(t, `var xs []int
+if xs == nil {
+	fmt.Println("if")
+}
+switch {
+case xs == nil:
+	fmt.Println("switch")
+}`, "if\nswitch\n")
+}
+
 // An operator with no rule for its operand types names both types.
 func TestUndefinedOperatorMessageNamesTypes(t *testing.T) {
 	wantErr(t, `fmt.Println("a" * 2)`, "not defined on")
