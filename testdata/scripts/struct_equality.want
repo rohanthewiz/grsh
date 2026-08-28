@@ -1,0 +1,6 @@
+literals: true false
+copy: true false
+nested: true false
+containers: true true
+switch: second
+from shell: true

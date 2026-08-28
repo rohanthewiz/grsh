@@ -562,3 +562,171 @@ var v any = []P{{1}}
 _, ok := v.([]Q)
 fmt.Println(ok)`, "true\n")
 }
+
+// ---- struct equality ----
+//
+// A *StructVal is a pointer, so `==` used to compare identities and call
+// every separately-built pair of equal structs unequal. It compares
+// FIELD-WISE now, the way Go compares struct values.
+
+func TestStructEqualityFieldWise(t *testing.T) {
+	// The case that was wrong before: two literals, same fields, never
+	// the same instance.
+	wantOut(t, `type P struct {
+	X int
+	S string
+}
+fmt.Println(P{1, "a"} == P{1, "a"}, P{1, "a"} == P{2, "a"}, P{1, "a"} != P{1, "b"})`,
+		"true false true\n")
+	// b := a makes a COPY (copyOnStore), so identity comparison called
+	// these unequal. Field-wise, a copy equals its original.
+	wantOut(t, `type P struct {
+	X int
+}
+a := P{1}
+b := a
+fmt.Println(a == b, a == a)`, "true true\n")
+	// A struct-typed field is part of the value and compares with it.
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+	T string
+}
+fmt.Println(Out{In{1}, "z"} == Out{In{1}, "z"}, Out{In{1}, "z"} == Out{In{2}, "z"})`,
+		"true false\n")
+	// A struct read back out of a container compares by value too --
+	// there is no shared instance to lean on.
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[string]P{"a": {1}}
+xs := []P{{1}}
+fmt.Println(m["a"] == P{1}, xs[0] == m["a"])`, "true true\n")
+	// switch is the same operator, so it follows for free.
+	wantOut(t, `type P struct {
+	X int
+}
+p := P{2}
+switch p {
+case P{1}:
+	fmt.Println("one")
+case P{2}:
+	fmt.Println("two")
+}`, "two\n")
+}
+
+// Two DIFFERENT struct types are unequal rather than an error, matching
+// what the rest of the interpreter already answers for a cross-type ==
+// (`1 == "a"` is false, not a complaint). Go decides this at compile
+// time; grsh has no compile time to decide it in.
+func TestStructEqualityAcrossTypes(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+type Q struct {
+	X int
+}
+fmt.Println(P{1} == Q{1}, P{1} != Q{1})`, "false true\n")
+}
+
+// A typed nil struct is reachable (append(xs, nil) makes one) and is the
+// only struct value equal to nil. Go would reject `p == nil` outright;
+// false is the honest answer where the comparison is allowed to happen.
+func TestStructEqualityWithNil(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+var xs []P
+xs = append(xs, nil)
+fmt.Println(xs[0] == nil, P{1} == nil, nil == P{1}, xs[0] != nil)`,
+		"true false false false\n")
+	// Two typed nils reach structEqual itself, where the case above does
+	// not: `xs[0] == nil` has an UNTYPED nil on the right, so it is
+	// answered one level up. Only a comparison whose both sides came out
+	// of a []P gets that far, and without the nil guard there it
+	// dereferences.
+	wantOut(t, `type P struct {
+	X int
+}
+var xs []P
+xs = append(xs, nil, nil, P{1})
+fmt.Println(xs[0] == xs[1], xs[0] == xs[2], xs[2] == xs[0])`,
+		"true false false\n")
+}
+
+// Comparability is decided from the STATIC field types, once, at
+// declaration -- so == either always works for a type or always fails,
+// instead of depending on whether a slice field happens to be nil at the
+// moment of the comparison. The message names the field to change.
+func TestStructEqualityRefusedOnUncomparableFields(t *testing.T) {
+	wantErr(t, `type P struct {
+	Tags []string
+}
+fmt.Println(P{} == P{})`, "P cannot be compared with ==: field Tags has type []string")
+	wantErr(t, `type P struct {
+	M map[string]int
+}
+fmt.Println(P{} == P{})`, "field M has type map[string]int")
+	// A func type never resolves (grsh closures are not reflect funcs),
+	// so this verdict is read off the syntax rather than off TypeDesc --
+	// otherwise it would pass while both Fn fields were nil and start
+	// failing the moment either was set.
+	wantErr(t, `type P struct {
+	Fn func(int) error
+}
+fmt.Println(P{} == P{})`, "field Fn has type func")
+	// A slice OF the struct is the erasure's own case: []P is
+	// []*StructVal, which reflect already calls incomparable.
+	wantErr(t, `type P struct {
+	X int
+}
+type Box struct {
+	Ps []P
+}
+fmt.Println(Box{} == Box{})`, "field Ps has type []P")
+	// The culprit can be several types down, so the path is dotted. A
+	// struct field erases to a POINTER, which reflect calls comparable --
+	// only the nested type's own verdict is correct here.
+	wantErr(t, `type In struct {
+	Tags []string
+}
+type Out struct {
+	I In
+}
+fmt.Println(Out{} == Out{})`, "Out cannot be compared with ==: field I.Tags has type []string")
+	// Two bad fields: the FIRST is what the message names, so the
+	// diagnostic does not wander as a declaration grows.
+	wantErr(t, `type P struct {
+	Tags []string
+	M    map[string]int
+}
+fmt.Println(P{} == P{})`, "field Tags has type []string")
+	// Ordering is not defined on structs, in Go or here, and the message
+	// names the script's type rather than *interp.StructVal.
+	wantErr(t, `type P struct {
+	X int
+}
+fmt.Println(P{1} < P{2})`, "operator < is not defined on P and P")
+}
+
+// A field whose declared type is comparable but whose VALUE need not be
+// -- `any` -- is Go's runtime-panic case. The value is what gets checked,
+// and the check reports instead of panicking.
+func TestStructEqualityDynamicField(t *testing.T) {
+	wantOut(t, `type P struct {
+	V any
+}
+fmt.Println(P{1} == P{1}, P{1} == P{"a"}, P{} == P{})`, "true false true\n")
+	wantErr(t, `type P struct {
+	V any
+}
+fmt.Println(P{[]int{1}} == P{[]int{1}})`, "cannot compare a field holding []int")
+	// Outside a struct the fallback still answers false for an
+	// uncomparable pair rather than failing: only the FIELD walk, which
+	// is claiming to implement Go's ==, reports.
+	wantOut(t, `xs := []int{1}
+ys := []int{1}
+fmt.Println(xs == ys)`, "false\n")
+}

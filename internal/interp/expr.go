@@ -265,6 +265,25 @@ func (in *Interp) binaryOp(n ast.Node, op token.Token, x, y Value) (Value, error
 		return floatOp(in, n, op, xf, yf)
 	}
 
+	// Script structs compare FIELD-WISE, so they have to be intercepted
+	// before the fallback below -- a *StructVal is a pointer, and the
+	// fallback's `x == y` would compare two identities and call every
+	// separately-built pair of equal structs unequal.
+	//
+	// Ordering: this sits last among the typed cases because a struct is
+	// none of the kinds above, so no hot path pays for the two assertions.
+	// Non-equality operators fall THROUGH to the message at the bottom;
+	// there is no ordering on structs, in Go or here.
+	_, xIsStruct := x.(*StructVal)
+	_, yIsStruct := y.(*StructVal)
+	if (xIsStruct || yIsStruct) && (op == token.EQL || op == token.NEQ) {
+		eq, err := in.valuesEqual(n, x, y)
+		if err != nil {
+			return nil, err
+		}
+		return eq == (op == token.EQL), nil
+	}
+
 	// Fallback equality for everything else (nil, errors, slices...).
 	switch op {
 	case token.EQL:
@@ -272,7 +291,10 @@ func (in *Interp) binaryOp(n ast.Node, op token.Token, x, y Value) (Value, error
 	case token.NEQ:
 		return !safeEqual(x, y), nil
 	}
-	return nil, in.errAt(n, fmt.Sprintf("operator %s is not defined on %T and %T", op, x, y))
+	// %T would print grsh's own *interp.StructVal here, at the one place
+	// the message is meant to describe the script's own values.
+	return nil, in.errAt(n, fmt.Sprintf("operator %s is not defined on %s and %s",
+		op, valTypeName(x), valTypeName(y)))
 }
 
 func intOp(in *Interp, n ast.Node, op token.Token, x, y int64) (Value, error) {
@@ -351,6 +373,25 @@ func floatOp(in *Interp, n ast.Node, op token.Token, x, y float64) (Value, error
 		return x >= y, nil
 	}
 	return nil, in.errAt(n, "operator "+op.String()+" is not supported on floats")
+}
+
+// valTypeName is %T for a script-facing message, with the struct erasure
+// undone: `operator < is not defined on P and P`, not on two
+// *interp.StructVal, at the one place whose whole job is describing the
+// script's own values.
+//
+// The NAME is read off the instance, since reflect.TypeOf sees only the
+// erased storage type and could never say which struct it is. A typed nil
+// has no instance to read, and falls back to scriptTypeName's neutral
+// word.
+func valTypeName(v Value) string {
+	if v == nil {
+		return "<nil>"
+	}
+	if sv, ok := v.(*StructVal); ok && sv != nil {
+		return sv.Type.Name
+	}
+	return scriptTypeName(reflect.TypeOf(v))
 }
 
 func safeEqual(x, y Value) bool {

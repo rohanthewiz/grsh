@@ -28,6 +28,66 @@ type StructType struct {
 	// duplicated in newZero rather than aliased — and the flag keeps the
 	// ordinary all-scalar struct out of that loop entirely.
 	structFields bool
+
+	// noCmp names the field that makes this type incomparable, or is nil
+	// when == is allowed. Go decides comparability from the STATIC field
+	// types, and so does this: the verdict is computed once at
+	// declaration, so `p == q` either always works or always fails,
+	// rather than depending on whether a slice field happens to be nil
+	// at the moment of the comparison.
+	noCmp *cmpDefect
+}
+
+// cmpDefect names the first field that costs a struct its comparability,
+// and is what turns Go's blunt "struct containing []string cannot be
+// compared" into a message pointing at the field to change.
+//
+// Path is dotted through struct-typed fields ("I.Tags"), because the
+// offending field can be several types down from the one being compared.
+type cmpDefect struct {
+	Path string // field path from the compared struct to the culprit
+	Type string // the culprit's type, spelled as the script spelled it
+}
+
+// compareDefect reports why a field named name, declared as e and
+// resolved to d, makes its struct incomparable — or nil if it does not.
+func compareDefect(name string, d TypeDesc, e ast.Expr) *cmpDefect {
+	switch {
+	case d.RT == nil:
+		// A type grsh does not model can still be one Go plainly refuses
+		// to compare, and a func field is the reachable case: grsh leaves
+		// func types unresolved because its closures are *Closure values,
+		// not reflect funcs. Reading the verdict off the SYNTAX is what
+		// keeps it stable -- left to the field walk, `p == q` would
+		// succeed while both Fn fields were nil and start failing the
+		// moment either was set.
+		if _, isFunc := ast.Unparen(e).(*ast.FuncType); isFunc {
+			// The bare kind word, not the full signature. Rendering the
+			// signature means an AST printer: go/types.ExprString costs
+			// 1.6MB of binary (+14%) and go/printer 276KB (+2.5%), both
+			// for decoration -- the FIELD NAME is the actionable half of
+			// the message, and it is already there.
+			return &cmpDefect{Path: name, Type: "func"}
+		}
+		// Anything else unresolved has nothing static to say, so the
+		// verdict is left to the field walk, which checks the value the
+		// field actually holds.
+		return nil
+	case d.IsStruct():
+		// The erasure makes a struct field a POINTER, and reflect calls
+		// every pointer comparable — so RT.Comparable() would wave
+		// through a struct whose own fields are slices. The nested type's
+		// verdict is the only correct one, and it is already final: a
+		// field type must be declared before the struct that uses it, so
+		// the type graph is a DAG and d.ST was finished first.
+		if inner := d.ST.noCmp; inner != nil {
+			return &cmpDefect{Path: name + "." + inner.Path, Type: inner.Type}
+		}
+		return nil
+	case !d.RT.Comparable():
+		return &cmpDefect{Path: name, Type: d.String()}
+	}
+	return nil
 }
 
 // StructVal is an instance of a script-declared struct.
@@ -93,6 +153,12 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 			t.Fields = append(t.Fields, n.Name)
 			t.Zero = append(t.Zero, zero)
 			t.FieldTypes = append(t.FieldTypes, d)
+			// First defect wins: the message names one field to fix, and
+			// the rest of the declaration is still recorded normally --
+			// an incomparable struct is a perfectly usable struct.
+			if t.noCmp == nil {
+				t.noCmp = compareDefect(n.Name, d, f.Type)
+			}
 		}
 	}
 	env.Define(ts.Name.Name, t)
@@ -229,6 +295,90 @@ func (sv *StructVal) copyStruct() *StructVal {
 		vals[i] = copyOnStore(v)
 	}
 	return &StructVal{Type: sv.Type, Vals: vals}
+}
+
+// structEqual is `a == b` for two script structs, compared FIELD-WISE the
+// way Go compares struct values -- not by the identity of the two
+// *StructVal pointers, which is what the erasure would otherwise leave
+// `==` meaning.
+//
+// There is deliberately no `a == b` identity fast path. It would be
+// correct for the answer and wrong for the ERROR: comparing an
+// incomparable struct to itself would quietly succeed while comparing it
+// to an equal-looking twin failed, and a diagnostic that depends on
+// whether the two operands happen to be the same instance is worse than
+// no diagnostic.
+//
+// Recursion terminates for the same reason copyStruct's does: a struct
+// value cannot contain itself. Building one needs a finite literal, and
+// `a.Next = a` stores a copy taken BEFORE the write, so copy-on-store is
+// what makes a cycle unconstructible. (The type DAG alone would not be
+// enough -- a self-referential field like `Next N` is left unresolved and
+// still holds a real struct at runtime.)
+func (in *Interp) structEqual(n ast.Node, a, b *StructVal) (bool, error) {
+	// Typed nils are reachable (append(xs, nil) makes one), so nil is a
+	// value here rather than an impossibility.
+	if a == nil || b == nil {
+		return a == nil && b == nil, nil
+	}
+	// Two DIFFERENT struct types are unequal rather than an error, which
+	// is the answer the rest of the interpreter already gives for a
+	// cross-type ==: `1 == "a"` is false, not a type complaint. Go decides
+	// this at compile time and grsh has no compile time to decide it in.
+	if a.Type != b.Type {
+		return false, nil
+	}
+	if d := a.Type.noCmp; d != nil {
+		return false, in.errAt(n, fmt.Sprintf("%s cannot be compared with ==: field %s has type %s",
+			a.Type.Name, d.Path, d.Type),
+			"hint", "compare the fields that matter, or give "+a.Type.Name+" an Equal method")
+	}
+	for i := range a.Vals {
+		eq, err := in.valuesEqual(n, a.Vals[i], b.Vals[i])
+		if err != nil || !eq {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// valuesEqual compares two values under struct equality: the operands of
+// a top-level `==` where at least one side is a struct, and every field
+// pair reached from there.
+//
+// The non-comparable complaint at the bottom is reachable only through
+// the FIELD walk. A top-level `==` routes a non-struct pair to binaryOp's
+// ordinary fallback, which answers false for an uncomparable pair rather
+// than failing -- so `xs == ys` on two slices keeps behaving as it did.
+// Inside a struct the same silence would be a trap: the field walk is
+// claiming to implement Go's ==, and Go rejects that struct outright.
+func (in *Interp) valuesEqual(n ast.Node, x, y Value) (bool, error) {
+	xs, xok := x.(*StructVal)
+	ys, yok := y.(*StructVal)
+	switch {
+	case xok && yok:
+		return in.structEqual(n, xs, ys)
+	case xok:
+		// A struct against a non-struct. Only untyped nil can match, and
+		// only a typed-nil struct matches it: `p == nil` is false for a
+		// real instance, which is the honest answer where Go would not
+		// have allowed the comparison at all.
+		return xs == nil && y == nil, nil
+	case yok:
+		return ys == nil && x == nil, nil
+	case x == nil || y == nil:
+		return x == nil && y == nil, nil
+	}
+	// A field noCmp could not settle statically reaches here: an `any`,
+	// which Go also calls comparable and also fails at runtime, or a type
+	// grsh does not model. The VALUE is what gets checked, and reporting
+	// is what Go's own runtime panic would have done.
+	for _, v := range [2]Value{x, y} {
+		if t := reflect.TypeOf(v); !t.Comparable() {
+			return false, in.errAt(n, "cannot compare a field holding "+scriptTypeName(t))
+		}
+	}
+	return safeEqual(x, y), nil
 }
 
 // methodKey is the global a top-level method declaration transforms into

@@ -819,8 +819,13 @@ func (in *Interp) typeOf(env *Env, e ast.Expr) (TypeDesc, error) {
 		// A script struct erases to a POINTER, and a pointer is
 		// comparable — so map[P]V would build happily and then compare
 		// identities instead of field values, making every lookup with a
-		// freshly built key miss. Refusing it is the only honest answer
-		// until struct values have real equality.
+		// freshly built key miss.
+		//
+		// Field-wise `==` does NOT lift this. The interpreter owns the ==
+		// operator, but it does not own the map: reflect.Map hashes and
+		// compares the erased *StructVal with Go's own runtime, which
+		// this package cannot reach into. Keying by struct would need a
+		// hashable encoding of the value, which is a different feature.
 		if k.ST != nil {
 			return TypeDesc{}, in.errAt(t.Key, "a script struct cannot be a map key yet",
 				"hint", "key by one of its fields, or use a slice")
