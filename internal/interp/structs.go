@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"reflect"
 	"strings"
+	"unsafe"
 
 	"github.com/rohanthewiz/serr"
 )
@@ -36,6 +37,13 @@ type StructType struct {
 	// built once at declaration rather than on demand, so nothing mutates
 	// a StructType after env.Define publishes it.
 	keyArr reflect.Type
+
+	// keyArrZero is the zero keyArr, boxed, and it is kept for its TYPE
+	// WORD alone -- boxKeyArr borrows it to name an array type whose
+	// length is only known at runtime. Cached here because the general
+	// encode path reads it on every crossing and building one costs an
+	// allocation.
+	keyArrZero any
 
 	// sig is the struct's identity, and storeT and keyT are its types
 	// inside a container -- storeT at an ELEMENT slot, keyT at a map KEY
@@ -187,58 +195,65 @@ func decodeKeyArr(t *StructType, arr reflect.Value) *StructVal {
 }
 
 // keyArrFanout is the field count up to which structKeyOf builds the key
-// array as a Go literal instead of through reflect.
+// array as a Go literal instead of allocating it through reflect.
 //
 // It is a threshold rather than a rule because the array's TYPE is chosen
 // at runtime -- [len(Fields)]any -- and Go has no way to write a literal
 // whose length is a variable. Enumerating the small lengths is the only
 // way to reach the fast path at all, and every length past the last case
-// falls back to the reflect path below, which is correct for any length.
+// falls back to the general path below, which is correct for any length.
 //
-// WHERE IT IS SET, and why it is not set where the first version guessed.
-// That version said the cutoff belongs "where the enumeration stops
-// paying", which assumed the two paths converge. Measured against each
-// other at every arity -- both paths in one binary, the cutoff forced
-// either way, minimum of ten runs, Apple M3 -- they never do:
+// WHERE IT IS SET. Both paths measured against each other at every arity
+// -- both in one binary with the cutoff forced either way, minimum of ten
+// runs, Apple M3, one allocation on either path throughout:
 //
-//	fields    1     2     3     4     5     6     8    12
-//	reflect  49    67    81   100   117   132   159   224   ns
-//	literal  16    20    23    26    31    34    41    56   ns
+//	fields      1     2     4     6     8    10    12
+//	general  23.6  27.3  31.5  39.7  44.1  55.0  57.5  ns
+//	literal  16.2  20.0  24.9  32.5  38.2  47.3  54.2  ns
 //
-// The literal path holds a ~75% saving out to twelve fields and one
-// allocation fewer at every arity, because reflect costs ~15ns per field
-// against ~3ns and then Interface() copies the array out. So there is no
-// crossover to find, and the cutoff is a trade instead: what an added
-// case gives a key of THAT arity, against what it costs every key.
+// They do not cross: a literal is ~6-7ns cheaper at every length, being a
+// stack array and one convT against reflect.New and a runtime type
+// lookup. That is 31% at one field and 13% at eight, and it is the whole
+// reason the enumeration exists.
 //
-// What it costs is the shared buffer below, which is sized by this
-// constant and zeroed whole on every call. Holding the case count fixed
-// and growing only the buffer from 4 slots to 12 costs a one-field key
-// 0.8ns and a four-field key 1.6ns -- about 0.18ns per unused slot.
+// THE NUMBERS THIS CONSTANT WAS FIRST SET ON WERE MUCH BIGGER -- the
+// general path then cost 3-5x the literal one, ~117-224ns at five to
+// twelve fields, because it went through a reflect Set per field and then
+// copied the whole array to box it. Rebuilding that path (see boxKeyArr)
+// took both away, and the trade had to be re-taken rather than inherited:
+// an enumeration justified against a path that no longer exists is an
+// enumeration justified by nothing.
+//
+// What an added case costs is the shared buffer below, which is sized by
+// this constant and zeroed whole on every call. Holding the case count
+// fixed and growing only the buffer from 4 slots to 12 costs a one-field
+// key 0.8ns and a four-field key 1.6ns -- about 0.18ns per unused slot.
 // Holding the buffer fixed and growing only the case count from 5 to 13
 // costs nothing measurable, so the switch itself is free and the buffer
 // is the whole tax.
 //
-// 8 spends ~0.7ns of a 15ns one-field encode to take a five- to
-// eight-field key from ~117-159ns down to ~31-41ns. Past 8 the trade
-// inverts in practice: the tax is paid by every key ever encoded and the
-// saving goes to arities a script hardly writes.
+// 8 therefore stands, on a much narrower margin than it was set with:
+// cases 5 through 8 each save a key of their own arity ~6ns and cost
+// every other key ~0.7ns. Past 8 the saving stays real -- ~8ns at ten
+// fields -- but it goes to arities a script hardly writes while the tax
+// keeps landing on the one-field key scripts write constantly.
 //
-// What a SCRIPT feels, from two interleaved builds differing only in this
-// constant: a six-field key read costs 19.7% less and one allocation
-// fewer per crossing, and the one-field shapes do not move -- the 0.7ns
-// is real in-binary and sits under the +/-1.9% the untouched control
-// shapes drift between builds. BenchmarkStructContainer's
-// map-key-struct-hit-6 is the shape that bought it and its one-field
-// neighbours are the ones that pay.
+// What a SCRIPT felt when this moved from 4 to 8, two interleaved builds
+// differing only in the constant: a six-field key read 19.7% cheaper and
+// one allocation lighter per crossing, the one-field shapes unmoved. Both
+// halves of that were measured against the OLD general path, so the same
+// experiment today would show a smaller gap -- not because the cases got
+// worse but because what they save you from got cheaper.
+// BenchmarkStructContainer's map-key-struct-hit-6 is the shape that
+// bought it and its one-field neighbours are the ones that pay.
 //
 // Moving it is safe in both directions, and differently so in each.
 // Raising it past the last case costs speed and never correctness: the
-// switch below falls through to reflect. LOWERING it below the last case
-// does not compile at all, because the buffer is sized by this constant
-// and the higher cases then index past its end -- which is the compiler
-// enforcing what TestKeyEncodingMatchesTheDeclaredArrayType checks for
-// the direction it cannot see.
+// switch below falls through to the general path. LOWERING it below the
+// last case does not compile at all, because the buffer is sized by this
+// constant and the higher cases then index past its end -- which is the
+// compiler enforcing what TestKeyEncodingMatchesTheDeclaredArrayType
+// checks for the direction it cannot see.
 const keyArrFanout = 8
 
 // structKeyOf encodes a struct value into the key the map actually holds.
@@ -306,24 +321,34 @@ func structKeyOf(sv *StructVal) (StructKey, error) {
 			return StructKey{T: sv.Type, F: [8]any{buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]}}, nil
 		}
 	}
-	// The general path: reflect is the only way to build a value of an
-	// array type chosen at runtime. It costs one allocation more than the
-	// literals above, because Interface() on an ADDRESSABLE value has to
-	// copy the array out before it can box it.
-	arr := reflect.New(sv.Type.keyArr).Elem()
+	// The general path: reflect is the only way to ALLOCATE a value of an
+	// array type chosen at runtime, and that allocation is all it is used
+	// for here. Filling and boxing both go around it.
+	//
+	// The array is filled through a slice aliasing it rather than by a
+	// reflect Set per field, which is the same trade the literal cases
+	// above make: an ordinary interface assignment against reflect's
+	// generic one, ~3ns a field against ~15ns. slots is sized from the
+	// ARRAY, never from Vals, so a Vals longer than the struct's fields
+	// -- the case this path exists to survive -- lands on a bounds check
+	// exactly as arr.Index(i) used to, instead of writing past the end.
+	//
+	// A nil field needs no case of its own any more: assigning a nil
+	// interface is just an assignment, where reflect.ValueOf(nil) is an
+	// invalid Value that Set would panic on.
+	p := reflect.New(sv.Type.keyArr)
+	slots := unsafe.Slice((*any)(p.UnsafePointer()), sv.Type.keyArr.Len())
 	for i, v := range sv.Vals {
 		ev, err := keyValue(v)
 		if err != nil {
 			return StructKey{}, err
 		}
-		// A nil field stays the array element's own zero: reflect.ValueOf
-		// of a nil Value is invalid and Set would panic on it.
-		if ev == nil {
-			continue
-		}
-		arr.Index(i).Set(reflect.ValueOf(ev))
+		slots[i] = ev
 	}
-	return StructKey{T: sv.Type, F: arr.Interface()}, nil
+	// Boxed by aliasing, not by copying -- see boxKeyArr. The fill above
+	// is the array's only writer and it is done, so handing the same
+	// memory to an interface hands over something already immutable.
+	return StructKey{T: sv.Type, F: boxKeyArr(sv.Type.keyArrZero, p.UnsafePointer())}, nil
 }
 
 // keyValue encodes one field value on its way into a key, and is where
@@ -430,6 +455,7 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 		}
 	}
 	t.keyArr = reflect.ArrayOf(len(t.Fields), anyType)
+	t.keyArrZero = mintKeyArrZero(t.keyArr)
 	// The signature reads FieldTypes, so it can only be taken once the
 	// loop above is done -- and it is exact by then for the reason the
 	// loop relies on: a field's type must already be declared, so every

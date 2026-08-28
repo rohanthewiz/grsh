@@ -3,8 +3,10 @@ package interp
 import (
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // ---- script-declared struct types ----
@@ -1123,11 +1125,12 @@ fmt.Println(m[Out{In{1}, "a"}], m[Out{In{2}, "a"}], m)`,
 // the field order both serve. Field 0 is held constant across the two
 // keys so a miss can only come from the fields the arity added.
 func TestStructMapKeysAtEveryArity(t *testing.T) {
-	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"}
 	// Every arity the fast path enumerates, plus both edges: 0 crosses
-	// the empty-array case, 8 is keyArrFanout itself, and 9 is the first
-	// arity that falls through to the reflect path.
-	for _, n := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {
+	// the empty-array case, 8 is keyArrFanout itself, 9 is the first
+	// arity that falls through to the general path, and 12 walks that
+	// path somewhere it is not also the first case past a boundary.
+	for _, n := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12} {
 		t.Run(fmt.Sprintf("%d-fields", n), func(t *testing.T) {
 			var decl strings.Builder
 			decl.WriteString("type P struct {\n")
@@ -1201,8 +1204,8 @@ func TestStructMapKeysAtEveryArity(t *testing.T) {
 // is invisible from a script and would surface only when the fanout is
 // changed. This is the assertion that makes that safe to do.
 func TestKeyEncodingMatchesTheDeclaredArrayType(t *testing.T) {
-	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
-	for _, n := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} {
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"}
+	for _, n := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12} {
 		src := "type P struct {\n"
 		for i := 0; i < n; i++ {
 			src += "\t" + names[i] + " int\n"
@@ -1352,4 +1355,200 @@ _ = m`, "invalid map key type map[P]int")
 }
 m := map[[]map[P]int]string{}
 _ = m`, "invalid map key type []map[P]int")
+}
+
+// The general encode path hands an interface a pointer to an array it
+// does not own a copy of, so the collector has to keep that array alive
+// on the strength of the box alone. A type word and a data word that
+// disagreed about what lives there would show up here and almost nowhere
+// else: the key reads back correctly until a collection moves or frees
+// what it points at.
+//
+// Ten fields puts every key on the general path, and the keys are held in
+// a slice so they are live across the collections rather than dying
+// immediately.
+func TestWideKeysSurviveGC(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+	C int
+	D int
+	E int
+	F int
+	G int
+	H int
+	I int
+	J int
+}`, "P")
+	vals := make([]Value, len(st.Fields))
+	for i := range vals {
+		vals[i] = i + 1
+	}
+	sv := &StructVal{Type: st, Vals: vals}
+	want, err := structKeyOf(sv)
+	if err != nil {
+		t.Fatalf("encoding: %v", err)
+	}
+
+	keys := make([]StructKey, 0, 4096)
+	for i := 0; i < 4096; i++ {
+		k, err := structKeyOf(sv)
+		if err != nil {
+			t.Fatalf("encoding %d: %v", i, err)
+		}
+		keys = append(keys, k)
+		if i%512 == 0 {
+			runtime.GC()
+		}
+	}
+	runtime.GC()
+	runtime.GC()
+
+	for i, k := range keys {
+		if k != want {
+			t.Fatalf("key %d stopped comparing equal after a collection", i)
+		}
+		// Decoding reads the array THROUGH the box, which is what a
+		// range loop does, so a data word pointing somewhere stale shows
+		// as the wrong fields rather than as an inequality.
+		if got := decodeKeyArr(k.T, reflect.ValueOf(k.F)); got.String() != sv.String() {
+			t.Fatalf("key %d decodes to %s, want %s", i, got, sv)
+		}
+	}
+}
+
+// A nil field on the GENERAL path. The literal cases leave an unwritten
+// buffer slot nil and the old reflect path skipped nil explicitly; the
+// slice fill assigns it like any other value, and this is the shape that
+// says all three agree. An `any` field is the only way a script reaches
+// a nil field, and it is statically comparable, so P is still a key type.
+func TestWideKeyWithNilField(t *testing.T) {
+	wantOut(t, `type P struct {
+	A int
+	B int
+	C int
+	D int
+	E any
+	F int
+	G int
+	H int
+	I int
+	J int
+}
+m := map[P]int{}
+m[P{1, 2, 3, 4, nil, 6, 7, 8, 9, 10}] = 7
+fmt.Println(m[P{1, 2, 3, 4, nil, 6, 7, 8, 9, 10}], m[P{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}], len(m))`,
+		"7 0 1\n")
+}
+
+// boxKeyArr claims two things the type system cannot: the result IS the
+// declared array type, and it is the SAME array rather than a copy of it.
+// Both are asserted here at several lengths, because the type word is
+// borrowed from a cached zero and a length that took the wrong one would
+// still produce a working-looking key.
+//
+// The aliasing half is checked by writing through the array AFTER boxing
+// and watching the box change. That is not a property to rely on -- it is
+// the hazard the design avoids by making structKeyOf's fill loop the
+// array's only writer and letting it finish first -- but it is the
+// evidence that no copy happened, which is the entire point of the box.
+func TestKeyArrayBoxAliasesRatherThanCopies(t *testing.T) {
+	for _, n := range []int{1, 3, 9, 12} {
+		arr := reflect.ArrayOf(n, anyType)
+		zero := mintKeyArrZero(arr)
+
+		p := reflect.New(arr)
+		slots := unsafe.Slice((*any)(p.UnsafePointer()), n)
+		for i := range slots {
+			slots[i] = i + 1
+		}
+		boxed := boxKeyArr(zero, p.UnsafePointer())
+
+		if got := reflect.TypeOf(boxed); got != arr {
+			t.Fatalf("%d: boxed as %v, want %v", n, got, arr)
+		}
+		bv := reflect.ValueOf(boxed)
+		for i := 0; i < n; i++ {
+			if got := bv.Index(i).Interface(); got != any(i+1) {
+				t.Fatalf("%d: element %d is %v, want %d", n, i, got, i+1)
+			}
+		}
+		// The box must not have copied: a later write through the array
+		// has to be visible through it.
+		slots[0] = "changed"
+		if got := reflect.ValueOf(boxed).Index(0).Interface(); got != any("changed") {
+			t.Errorf("%d: the box copied the array instead of aliasing it", n)
+		}
+	}
+}
+
+// The general path sizes its slice from the declared array, never from
+// the instance, so an instance carrying MORE values than the type has
+// fields stops on a bounds check instead of writing past the array --
+// which is what a slice sized from the instance would do, silently, into
+// whatever the allocator put next.
+//
+// Nothing in the interpreter builds such an instance; every instance gets
+// one Val per field. This pins the behaviour anyway, because the
+// difference between the two ways of sizing that slice is invisible
+// until the day something does.
+func TestKeyEncodingRefusesAnOversizedInstance(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+	C int
+	D int
+	E int
+	F int
+	G int
+	H int
+	I int
+}`, "P")
+	// One Val per field plus one, and nine fields puts it on the general
+	// path rather than in a literal case.
+	vals := make([]Value, len(st.Fields)+1)
+	for i := range vals {
+		vals[i] = i
+	}
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("encoding an oversized instance did not panic; the fill wrote past the key array")
+		}
+	}()
+	k, err := structKeyOf(&StructVal{Type: st, Vals: vals})
+	t.Fatalf("expected a panic, got key %#v (err %v)", k, err)
+}
+
+// A SHORT instance is the other side of that guard and is not an error:
+// the missing fields stay nil, which is what the literal path's unwritten
+// buffer slots give too.
+func TestKeyEncodingAcceptsAShortInstance(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+	C int
+	D int
+	E int
+	F int
+	G int
+	H int
+	I int
+}`, "P")
+	k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{1, 2}})
+	if err != nil {
+		t.Fatalf("encoding: %v", err)
+	}
+	if got := reflect.TypeOf(k.F); got != st.keyArr {
+		t.Fatalf("key holds %v, want %v", got, st.keyArr)
+	}
+	arr := reflect.ValueOf(k.F)
+	if arr.Index(0).Interface() != any(1) || arr.Index(1).Interface() != any(2) {
+		t.Errorf("the values given did not land in the first slots: %v", k.F)
+	}
+	for i := 2; i < arr.Len(); i++ {
+		if got := arr.Index(i).Interface(); got != nil {
+			t.Errorf("slot %d is %v, want nil", i, got)
+		}
+	}
 }

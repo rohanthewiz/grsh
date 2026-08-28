@@ -460,6 +460,72 @@ func intoKeyStore(k StructKey, kt reflect.Type) reflect.Value {
 	return reflect.NewAt(kt, unsafe.Pointer(&ScriptKey{K: k})).Elem()
 }
 
+// eface mirrors the two-word layout of an interface holding a value too
+// big to fit in a word: a type word, and a pointer to the value itself.
+//
+// Only the REINTERPRETATION in boxKeyArr is unsafe. Every pointer here is
+// written by an ordinary assignment to this typed struct, so the write
+// barrier the collector needs is emitted the usual way; storing straight
+// into an `any`'s words through a pointer would skip it, which is the
+// version of this trick that breaks under a concurrent mark.
+type eface struct {
+	typ  unsafe.Pointer
+	data unsafe.Pointer
+}
+
+// boxKeyArr returns an `any` holding the [N]any that p points at, WITHOUT
+// copying it.
+//
+// This exists because reflect cannot box an array it just built without
+// paying for it twice. reflect.New allocates the array; Interface() on
+// the addressable value it yields allocates a SECOND array and copies
+// into it, because an addressable value could still be written through
+// and an interface's contents must not change underneath it. Here nothing
+// can write through it: the only alias is structKeyOf's fill loop, which
+// is finished, so the array is already the immutable thing an interface
+// requires and the copy is pure cost. Removing it halves both the
+// allocations and the bytes of a wide key, and takes ~72% off the time.
+//
+// zero is a boxed value of the SAME array type, and it is here only for
+// its type word. N is chosen at runtime, so no literal of that type can
+// be written and the word has to be borrowed from a value that already
+// carries it. StructType caches one per declared struct.
+//
+// mintKeyArrZero checks at declaration that this actually reproduces the
+// array rather than trusting the layout, in the same spirit as
+// mintKeyType's check on intoKeyStore's alias.
+func boxKeyArr(zero any, p unsafe.Pointer) any {
+	e := *(*eface)(unsafe.Pointer(&zero))
+	e.data = p
+	return *(*any)(unsafe.Pointer(&e))
+}
+
+// mintKeyArrZero returns the boxed zero of arr for boxKeyArr to borrow a
+// type word from, having first confirmed on this very type that the
+// borrow works.
+//
+// The probe writes a distinctive value into a fresh array and reads it
+// back THROUGH the box, so it fails if the type word is wrong, if the
+// data word is wrong, or if an interface ever stops being two words in
+// this order. It runs once per declared struct, on the declaration path,
+// which is cold.
+func mintKeyArrZero(arr reflect.Type) any {
+	zero := reflect.Zero(arr).Interface()
+	probe := reflect.New(arr)
+	const mark = "grsh key array probe"
+	if arr.Len() > 0 {
+		probe.Elem().Index(0).Set(reflect.ValueOf(any(mark)))
+	}
+	boxed := boxKeyArr(zero, probe.UnsafePointer())
+	if reflect.TypeOf(boxed) != arr {
+		panic("grsh: aliasing a " + arr.String() + " produced a " + reflect.TypeOf(boxed).String() + "; boxKeyArr's view of an interface is wrong")
+	}
+	if arr.Len() > 0 && reflect.ValueOf(boxed).Index(0).Interface() != any(mark) {
+		panic("grsh: aliasing a " + arr.String() + " did not read back the array it was given; boxKeyArr's view of an interface is wrong")
+	}
+	return zero
+}
+
 // storeReplace rewrites minted type names in s to the script's own struct
 // names. It runs before any other erasure, because a minted type's name
 // contains grsh's own carrier and would otherwise be reported piecemeal.

@@ -368,6 +368,14 @@ _ = p`},
 // of them -- the narrow shapes are what pays for the extra cases, so a
 // tax that showed up would show up in THEM.
 //
+// Rebuilding the general path -- the one a key WIDER than the fanout
+// still takes -- then moved map-key-struct-hit-10 by -23.8% and one
+// allocation per crossing, 499KB of a thousand crossings down to 339KB,
+// with every other shape here inside +/-0.8%. The two wide shapes are
+// there to keep those two changes separable: 6 is on the literal path
+// and 10 is on the general one, so a change to either shows in exactly
+// one of them.
+//
 // Both figures are the MINIMUM of a dozen interleaved runs with the
 // binaries rotated. Machine noise on these shapes is wider than several
 // of the numbers above, and a baseline taken in another session is not a
@@ -470,6 +478,29 @@ for i := 0; i < %d; i++ {
 	n = m[k]
 }
 _ = n`},
+		// Wider than keyArrFanout, so this is the only shape here that
+		// crosses on the general path: reflect allocates the array, a
+		// slice aliasing it takes the fields, and the box aliases it
+		// again rather than copying.
+		{"map-key-struct-hit-10", `type P struct {
+	A int
+	B int
+	C int
+	D int
+	E int
+	F int
+	G int
+	H int
+	I int
+	J int
+}
+m := map[P]int{{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}: 1}
+k := P{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+n := 0
+for i := 0; i < %d; i++ {
+	n = m[k]
+}
+_ = n`},
 		{"range-map-key-struct", `type P struct {
 	X int
 }
@@ -506,12 +537,14 @@ _ = n`},
 // wrap     intoKeyStore: that encoding into the map's minted key type
 // decode   decodeMintedKey: a key in the map back into the script's struct
 //
-// Three field counts, because encode and decode are per-field work and
+// Four field counts, because encode and decode are per-field work and
 // wrap is not, so a change that helps one and not the others shows here
 // as a different slope rather than as one number moving. 6 is past the
 // fanout keyArrFanout used to hold and inside the one it holds now,
-// which is the arity where raising it shows: ~117ns of encode became
-// ~34ns there while 1 and 3 barely moved.
+// which is the arity where raising it showed: ~117ns of encode became
+// ~34ns there while 1 and 3 barely moved. 10 is past the fanout
+// altogether, so it is the only one of the four that prices the GENERAL
+// path -- the one that fills through a slice and boxes by aliasing.
 //
 // THE DECODE INPUT COMES FROM MapKeys, and that is not incidental.
 // reflect boxes a struct out of an ADDRESSABLE value by copying it to the
@@ -521,8 +554,8 @@ _ = n`},
 // that way once made a change look like it saved an allocation per
 // ranged key when it saved none.
 func BenchmarkKeyCrossing(b *testing.B) {
-	names := []string{"A", "B", "C", "D", "E", "F"}
-	for _, nf := range []int{1, 3, 6} {
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+	for _, nf := range []int{1, 3, 6, 10} {
 		src := "type P struct {\n"
 		for i := 0; i < nf; i++ {
 			src += "\t" + names[i] + " int\n"
