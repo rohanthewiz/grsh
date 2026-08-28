@@ -363,14 +363,22 @@ m := map[string]Job{"k": {"a"}}`, "m")
 	if !strings.HasPrefix(got, "m: map[string]Job (len 1) {") {
 		t.Errorf("map header = %q, want a map[string]Job header", firstLine(got))
 	}
-	// An EMPTY container has no element to read the name off, which is
-	// the one case the neutral word is for.
+	// An EMPTY container used to be the one case with no element to read
+	// the name off. Its element TYPE names the struct now, so the header
+	// is exact without any instance to consult.
 	got = inspect(t, `type Job struct {
 	Name string
 }
 xs := []Job{}`, "xs")
-	if !strings.HasPrefix(got, "xs: []struct (len 0) [") {
-		t.Errorf("empty slice header = %q, want the neutral []struct", firstLine(got))
+	if !strings.HasPrefix(got, "xs: []Job (len 0) [") {
+		t.Errorf("empty slice header = %q, want a []Job header", firstLine(got))
+	}
+	got = inspect(t, `type Job struct {
+	Name string
+}
+m := map[string]Job{}`, "m")
+	if !strings.HasPrefix(got, "m: map[string]Job (len 0) {") {
+		t.Errorf("empty map header = %q, want a map[string]Job header", firstLine(got))
 	}
 	// Nothing else moved: a native container still renders through %T.
 	got = inspect(t, `xs := []int{1}`, "xs")

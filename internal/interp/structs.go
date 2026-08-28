@@ -37,6 +37,13 @@ type StructType struct {
 	// a StructType after env.Define publishes it.
 	keyArr reflect.Type
 
+	// sig and storeT are the struct's identity and its type INSIDE a
+	// container -- see store.go, which owns both and explains why a
+	// container cannot just hold the erased *StructVal. Both are set once
+	// at declaration, after the field loop has resolved FieldTypes.
+	sig    string
+	storeT reflect.Type
+
 	// noCmp names the field that makes this type incomparable, or is nil
 	// when == is allowed. Go decides comparability from the STATIC field
 	// types, and so does this: the verdict is computed once at
@@ -290,6 +297,12 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 		}
 	}
 	t.keyArr = reflect.ArrayOf(len(t.Fields), anyType)
+	// The signature reads FieldTypes, so it can only be taken once the
+	// loop above is done -- and it is exact by then for the reason the
+	// loop relies on: a field's type must already be declared, so every
+	// nested struct already has a signature of its own.
+	t.sig = structSig(t)
+	t.storeT = mintStoreType(t)
 	env.Define(ts.Name.Name, t)
 	return nil
 }

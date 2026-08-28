@@ -298,9 +298,15 @@ captures buffer output.
   the same way Go's do: `[]Item{{"nut", 2}}`, `Order{Head: {"crate", 1}}`.
   A struct works as a **map key** too (`map[Coord]string`): keys compare
   and hash by their FIELDS, `range` yields the struct back, and grsh
-  sorts struct keys so ranging is deterministic. One limit: `m[missing]`
-  on a struct-valued map yields `nil` rather than the zero struct — use
-  the comma-ok form, which is exact.
+  sorts struct keys so ranging is deterministic. `m[missing]` on a
+  struct-valued map yields the **zero struct**, as in Go.
+- **A container knows which struct it holds.** `[]Item` and `[]Order` are
+  different types to the interpreter, so `v.([]Item)` is exact even when
+  the slice is empty, and storing an `Order` into a `[]Item` — by
+  `append`, an index assignment, or a literal — is an error naming both
+  types rather than a silent success. The one leaf still decided by
+  contents is a struct map KEY: `map[Coord]int` and `map[Point]int` are
+  told apart by the keys present, so an EMPTY one asserts to either.
 - **Struct equality**: `p == q` compares **field-wise**, as Go does, so
   a copy equals its original and two separately built literals with the
   same fields are equal. It recurses into struct-typed fields, works in
@@ -365,6 +371,15 @@ All compound assignments work, including the bitwise set
   a live failure to the error-return convention below, and calling it
   nil would let `if err != nil` step past an error the one-value form of
   the same call aborts on.
+- **`%T` prints storage, not script types.** A script struct has no Go
+  type of its own, so `fmt.Printf("%T", it)` reports grsh's internal
+  representation. Every message grsh itself produces names the script's
+  own type (`cannot use Order{...} (Order) as Item`); only a raw `%T`
+  handed straight to Go's `fmt` shows through.
+- Two identical `type` declarations of the same name — the same fields
+  with the same types, declared twice, e.g. inside a loop — share one
+  container-storage type, so a `[]P` built under one accepts a `P` built
+  under the other. `p.(P)` and `p == q` still tell them apart.
 - Top-level `return` ends the script (status 0).
 - `import "strings"` lines are accepted and validated but optional — all
   registry packages are pre-loaded.

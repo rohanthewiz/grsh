@@ -75,7 +75,7 @@ func inspectValue(name string, v Value) string {
 			n = inspectMaxItems
 		}
 		for i := 0; i < n; i++ {
-			fmt.Fprintf(&b, "  %3d: %s\n", i, oneLine(rv.Index(i).Interface()))
+			fmt.Fprintf(&b, "  %3d: %s\n", i, oneLine(fromStore(rv.Index(i))))
 		}
 		if rv.Len() > n {
 			fmt.Fprintf(&b, "  ... %d more\n", rv.Len()-n)
@@ -97,7 +97,7 @@ func inspectValue(name string, v Value) string {
 			n = inspectMaxItems
 		}
 		for i := 0; i < n; i++ {
-			fmt.Fprintf(&b, "  %-*s: %s\n", w, strs[i], oneLine(rv.MapIndex(keys[i]).Interface()))
+			fmt.Fprintf(&b, "  %-*s: %s\n", w, strs[i], oneLine(fromStore(rv.MapIndex(keys[i]))))
 		}
 		if len(keys) > n {
 			fmt.Fprintf(&b, "  ... %d more\n", len(keys)-n)
@@ -121,6 +121,12 @@ func inspectValue(name string, v Value) string {
 // prints a header for. A [][]Job still falls through to %T: deeper
 // shapes are rendered row by row below, where each row is a value that
 // does know its own name.
+//
+// The element side is now answered by the TYPE, since a container holds
+// its struct's own minted type (see store.go) -- so an EMPTY []Job reads
+// as []Job rather than the neutral word it used to fall back to. Reading
+// the name off an instance survives as the fallback for a container that
+// still holds the bare erasure, which convertTo can still produce.
 func displayType(v Value) string {
 	if sv, ok := v.(*StructVal); ok {
 		if sv == nil {
@@ -131,24 +137,36 @@ func displayType(v Value) string {
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
-		if rv.Type().Elem() == structValType {
-			return "[]" + structNameIn(rv)
+		if name, ok := elemStructName(rv, rv.Type().Elem()); ok {
+			return "[]" + name
 		}
 	case reflect.Map:
 		kt, et := rv.Type().Key(), rv.Type().Elem()
-		if kt == structKeyType || et == structValType {
+		val, valIsStruct := elemStructName(rv, et)
+		if kt == structKeyType || valIsStruct {
 			key := kt.String()
 			if kt == structKeyType {
 				key = structNameInKeys(rv)
 			}
-			val := et.String()
-			if et == structValType {
-				val = structNameIn(rv)
+			if !valIsStruct {
+				val = scriptTypeName(et)
 			}
 			return "map[" + key + "]" + val
 		}
 	}
 	return fmt.Sprintf("%T", v)
+}
+
+// elemStructName names the script struct a container's elements hold, and
+// reports whether they hold one at all.
+func elemStructName(rv reflect.Value, et reflect.Type) (string, bool) {
+	if st := storeOwnerOf(et); st != nil {
+		return st.Name, true
+	}
+	if et == structValType {
+		return structNameIn(rv), true
+	}
+	return "", false
 }
 
 // structNameIn reads the struct type's name off the first non-nil entry
@@ -171,7 +189,7 @@ func structNameIn(rv reflect.Value) string {
 	}
 	name := "struct"
 	elems(func(e reflect.Value) bool {
-		if sv, ok := e.Interface().(*StructVal); ok && sv != nil {
+		if sv, ok := fromStore(e).(*StructVal); ok && sv != nil {
 			name = sv.Type.Name
 			return false
 		}

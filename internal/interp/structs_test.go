@@ -506,20 +506,60 @@ _ = m`, "invalid map key type P: field Tags has type []string")
 _ = m`, "invalid map key type []int")
 }
 
-// KNOWN DIVERGENCE, pinned.
-//
-// A missing entry in a struct-valued map yields nil, where Go yields the
-// zero struct. The element type has erased to *StructVal, which cannot
-// say WHICH struct, so reflect.Zero would hand back a typed nil that
-// panics on the first field access. Untyped nil is the honest answer,
-// and the comma-ok form is exact either way.
-func TestStructMapMissYieldsNil(t *testing.T) {
+// A missing entry in a struct-valued map yields Go's ZERO STRUCT, which
+// it could not before: the element type had erased to *StructVal, and a
+// slot with no value in it has nothing to read a StructType off. It works
+// now because the erasure moved into the TYPE -- a container holds the
+// type minted for its own struct, and that type names one. See store.go.
+func TestStructMapMissYieldsZeroStruct(t *testing.T) {
 	wantOut(t, `type P struct {
 	X int
 }
 m := map[string]P{"a": {1}}
 v, ok := m["nope"]
-fmt.Println(m["nope"] == nil, v, ok)`, "true <nil> false\n")
+fmt.Println(m["nope"] == nil, v, ok)`, "false P{X: 0} false\n")
+	// The zero is a real struct, not a placeholder: its fields read and
+	// write like any other, and it is not aliased to anything in the map.
+	wantOut(t, `type P struct {
+	X int
+	S string
+}
+m := map[string]P{}
+p := m["nope"]
+p.X = 7
+fmt.Println(p, m["nope"], len(m))`, "P{X: 7, S: } P{X: 0, S: } 0\n")
+	// The miss zeroes every field type the struct declares, including a
+	// nested struct and a reference field.
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I  In
+	Xs []int
+}
+m := map[string]Out{}
+fmt.Println(m["nope"], m["nope"].I.N, m["nope"].Xs == nil)`,
+		"Out{I: In{N: 0}, Xs: []} 0 true\n")
+	// Two misses do not share a nested struct -- the same isolation
+	// newZero gives make([]P, 2).
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+m := map[string]Out{}
+a := m["x"]
+b := m["y"]
+a.I.N = 5
+fmt.Println(a.I.N, b.I.N)`, "5 0\n")
+	// A missing SLICE element type still yields the nil slice, because
+	// that IS Go's zero there. The repair is for struct slots only.
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[string][]P{}
+fmt.Println(m["nope"] == nil, len(m["nope"]))`, "true 0\n")
 	// A nil element is reachable the same way through a slice, and every
 	// path that could dereference it reports instead of panicking.
 	wantErr(t, `type P struct {
@@ -549,7 +589,10 @@ _, okP := v.(P)
 _, okQ := v.(Q)
 z, _ := v.(Q)
 fmt.Println(okP, okQ, z)`, "true false Q{X: 0}\n")
-	// The divergence, stated as a test so it cannot change silently.
+	// One level up, the type alone cannot answer: []P and []Q are the
+	// SAME reflect.Type. The ELEMENTS answer instead, so a []P holding a
+	// P is not a []Q -- P and Q having identical fields changes nothing,
+	// because the check is on StructType identity, not shape.
 	wantOut(t, `type P struct {
 	X int
 }
@@ -557,8 +600,163 @@ type Q struct {
 	X int
 }
 var v any = []P{{1}}
-_, ok := v.([]Q)
-fmt.Println(ok)`, "true\n")
+_, okQ := v.([]Q)
+_, okP := v.([]P)
+fmt.Println(okQ, okP)`, "false true\n")
+}
+
+// ---- container assertions, and the one leaf still answered by value ----
+
+func TestContainerAssertionIsExactOnElements(t *testing.T) {
+	decls := `type P struct {
+	X int
+}
+type Q struct {
+	A bool
+}
+`
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		// A container holds the type minted for its own struct, so these
+		// are ordinary reflect.Type comparisons -- no contents consulted.
+		{"slice", `var v any = []P{{1}}
+_, a := v.([]P)
+_, b := v.([]Q)
+fmt.Println(a, b)`, "true false\n"},
+		{"map value", `var v any = map[string]P{"k": {1}}
+_, a := v.(map[string]P)
+_, b := v.(map[string]Q)
+fmt.Println(a, b)`, "true false\n"},
+		{"map value through a slice", `var v any = map[string][]P{"k": {{1}}}
+_, a := v.(map[string][]P)
+_, b := v.(map[string][]Q)
+fmt.Println(a, b)`, "true false\n"},
+		// The case the old element walk could not decide: with nothing
+		// inside to read a StructType off, only the TYPE can answer -- and
+		// now it does.
+		{"empty is still exact", `var v any = []P{}
+_, a := v.([]P)
+_, b := v.([]Q)
+fmt.Println(a, b)`, "true false\n"},
+		{"nil element is still exact", `xs := []P{}
+xs = append(xs, nil)
+var v any = xs
+_, a := v.([]P)
+_, b := v.([]Q)
+fmt.Println(a, b)`, "true false\n"},
+		// Identical FIELDS are not identical types: the storage type is
+		// keyed on the struct's name too (see structSig).
+		{"same shape different name", `type R struct {
+	X int
+}
+var v any = []P{{1}}
+_, a := v.([]R)
+fmt.Println(a)`, "false\n"},
+		// A []any holding structs is not a []P, which is Go's answer too.
+		{"[]any is not []P", `var v any = []any{P{1}}
+_, a := v.([]P)
+fmt.Println(a)`, "false\n"},
+		// Nothing else moved.
+		{"no struct leaf", `var v any = []int{1, 2}
+_, a := v.([]int)
+_, b := v.([]string)
+fmt.Println(a, b)`, "true false\n"},
+		{"failed assertion zeroes", `var v any = []P{{1}}
+z, ok := v.([]Q)
+fmt.Println(z, ok, z == nil)`, "[] false true\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantOut(t, decls+tc.body, tc.want)
+		})
+	}
+}
+
+// A struct map KEY is the one leaf that is still erased -- it becomes
+// StructKey so the map can hash it, and every script struct becomes the
+// same StructKey. So map[P]int and map[Q]int ARE one reflect.Type, and
+// the assertion has to read the keys.
+func TestMapKeyAssertionReadsKeys(t *testing.T) {
+	decls := `type P struct {
+	X int
+}
+type Q struct {
+	A bool
+}
+`
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"key names its struct", `var v any = map[P]int{{1}: 2}
+_, a := v.(map[P]int)
+_, b := v.(map[Q]int)
+fmt.Println(a, b)`, "true false\n"},
+		// Both leaves at once, each answered its own way: the value side
+		// by the minted type, the key side by the keys.
+		{"both leaves", `var v any = map[P]Q{{1}: {true}}
+_, a := v.(map[P]Q)
+_, b := v.(map[P]P)
+_, c := v.(map[Q]Q)
+fmt.Println(a, b, c)`, "true false false\n"},
+		// What the key walk cannot decide, it accepts -- neither an empty
+		// map nor a nil key names a struct.
+		{"empty accepts either", `var v any = map[P]int{}
+_, a := v.(map[P]int)
+_, b := v.(map[Q]int)
+fmt.Println(a, b)`, "true true\n"},
+		{"nil key accepts either", `m := map[P]int{}
+m[nil] = 7
+var v any = m
+_, a := v.(map[P]int)
+_, b := v.(map[Q]int)
+fmt.Println(a, b)`, "true true\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantOut(t, decls+tc.body, tc.want)
+		})
+	}
+}
+
+// A container slot is TYPED now, so the write that used to slip a Q into
+// a []P is reported where it happens rather than discovered later. Every
+// route into a slot goes through convertTo, which is why one check covers
+// all of them.
+func TestContainerSlotRejectsAnotherStruct(t *testing.T) {
+	decls := `type P struct {
+	X int
+}
+type Q struct {
+	A bool
+}
+`
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"append", `xs := []P{{1}}
+xs = append(xs, Q{true})`},
+		{"slice literal", `xs := []P{Q{true}}
+_ = xs`},
+		{"index assign", `xs := []P{{1}}
+xs[0] = Q{true}`},
+		{"map assign", `m := map[string]P{}
+m["k"] = Q{true}`},
+		{"map literal", `m := map[string]P{"k": Q{true}}
+_ = m`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantErr(t, decls+tc.body, "cannot use Q{A: true} (Q) as P")
+		})
+	}
+	// A nil still goes into any slot: it names no struct, and a typed nil
+	// element was always reachable.
+	wantOut(t, decls+`xs := []P{{1}}
+xs = append(xs, nil)
+fmt.Println(len(xs), xs[1] == nil)`, "2 true\n")
 }
 
 // ---- struct equality ----
@@ -770,8 +968,9 @@ delete(m, P{1})
 v, ok := m[P{1}]
 w, ok2 := m[P{2}]
 fmt.Println(len(m), v, ok, w, ok2)`, "1 0 false 20 true\n")
-	// A struct on BOTH sides: the key erases to StructKey, the value to
-	// *StructVal, and one descriptor carries both leaves.
+	// A struct on BOTH sides: the key erases to StructKey, the value takes
+	// Q's minted storage type, and one descriptor carries both leaves. The
+	// miss yields Q's zero, which the value side's minted type can name.
 	wantOut(t, `type P struct {
 	X int
 }
@@ -780,7 +979,7 @@ type Q struct {
 }
 m := map[P]Q{}
 m[P{1}] = Q{9}
-fmt.Println(m[P{1}].Y, len(m), m[P{2}])`, "9 1 <nil>\n")
+fmt.Println(m[P{1}].Y, len(m), m[P{2}])`, "9 1 Q{Y: 0}\n")
 	// make and a nil map behave like any other map.
 	wantOut(t, `type P struct {
 	X int

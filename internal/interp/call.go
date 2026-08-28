@@ -213,7 +213,7 @@ func (in *Interp) evalCall(env *Env, call *ast.CallExpr) ([]Value, error) {
 		}
 		m := reflect.ValueOf(recv).MethodByName(fn.Sel.Name)
 		if !m.IsValid() {
-			return nil, in.errAt(fn, fmt.Sprintf("unknown method %s on %T", fn.Sel.Name, recv))
+			return nil, in.errAt(fn, fmt.Sprintf("unknown method %s on %s", fn.Sel.Name, valTypeName(recv)))
 		}
 		return in.callValue(env, call, m.Interface(), fn.Sel.Name)
 
@@ -518,9 +518,30 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 		// Anything else falls through to the message at the bottom,
 		// where scriptTypeName renders the target as "struct".
 	}
+	// A script struct crossing into a CONTAINER slot becomes the type
+	// minted for its own struct. This is the sibling of the key case
+	// above and lands for the same reason: every write into a slice or
+	// map element -- a literal, an append, an index-assign, make's fill,
+	// an argument conversion -- already had to reach the element type
+	// through here.
+	//
+	// It is also where a []P stops accepting a Q. The check is against
+	// the value's OWN storage type rather than against st, so it agrees
+	// with the interning in store.go: two identical declarations of P
+	// share a storage type and are mutually acceptable, while a Q is not.
+	if st := storeOwnerOf(pt); st != nil {
+		sv, ok := v.(*StructVal)
+		if !ok {
+			return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%s) as %s", v, scriptTypeName(rv.Type()), st.Name))
+		}
+		if sv != nil && sv.Type.storeT != pt {
+			return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%s) as %s", v, sv.Type.Name, st.Name))
+		}
+		return intoStore(sv, pt), nil
+	}
 	// int → string would produce a rune-string surprise; refuse it.
 	if rv.Kind() != reflect.String && pt.Kind() == reflect.String && rv.CanInt() {
-		return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%T) as string (use strconv.Itoa)", v, v))
+		return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%s) as string (use strconv.Itoa)", v, valTypeName(v)))
 	}
 	if rv.Type().ConvertibleTo(pt) {
 		return rv.Convert(pt), nil
@@ -529,7 +550,10 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 	if rv.Kind() == reflect.Slice && pt.Kind() == reflect.Slice {
 		out := reflect.MakeSlice(pt, rv.Len(), rv.Len())
 		for i := 0; i < rv.Len(); i++ {
-			ev, err := convertTo(rv.Index(i).Interface(), pt.Elem())
+			// fromStore, not Interface: the SOURCE may itself be a
+			// container of minted values, and what crosses into the
+			// target's element type must be the script's struct.
+			ev, err := convertTo(fromStore(rv.Index(i)), pt.Elem())
 			if err != nil {
 				return reflect.Value{}, err
 			}
@@ -537,7 +561,7 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 		}
 		return out, nil
 	}
-	return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%T) as %s", v, v, scriptTypeName(pt)))
+	return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%s) as %s", v, valTypeName(v), scriptTypeName(pt)))
 }
 
 // ---- Go builtins ----
@@ -584,7 +608,7 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 			}
 			return []Value{rv.Len()}, true, nil
 		}
-		return nil, true, in.errAt(call, fmt.Sprintf("%s is not defined on %T", name, v))
+		return nil, true, in.errAt(call, fmt.Sprintf("%s is not defined on %s", name, valTypeName(v)))
 
 	case "append":
 		if len(call.Args) < 1 {
@@ -600,7 +624,7 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 		}
 		rv := reflect.ValueOf(base)
 		if rv.Kind() != reflect.Slice {
-			return nil, true, in.errAt(call, fmt.Sprintf("append target must be a slice, got %T", args[0]))
+			return nil, true, in.errAt(call, fmt.Sprintf("append target must be a slice, got %s", valTypeName(args[0])))
 		}
 		for _, a := range args[1:] {
 			ev, cerr := convertTo(a, rv.Type().Elem())
@@ -727,7 +751,10 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 			// a slice, and a nil slice IS Go's zero.
 			if elem := d.Elem(); elem.IsStruct() {
 				for i := 0; i < n0; i++ {
-					out.Index(i).Set(reflect.ValueOf(elem.ST.newZero()))
+					// intoStore, because a slot holds the minted type;
+					// newZero still gives each element a struct of its
+					// own, which is the aliasing newZero exists to stop.
+					out.Index(i).Set(intoStore(elem.ST.newZero(), d.RT.Elem()))
 				}
 			}
 			return []Value{out.Interface()}, true, nil
@@ -779,13 +806,13 @@ func (in *Interp) conversion(env *Env, name string, call *ast.CallExpr) (Value, 
 		case int:
 			return string(rune(t)), true, nil
 		}
-		return nil, true, in.errAt(call, fmt.Sprintf("cannot convert %T to string (use fmt.Sprint or strconv)", v))
+		return nil, true, in.errAt(call, fmt.Sprintf("cannot convert %s to string (use fmt.Sprint or strconv)", valTypeName(v)))
 	}
 	rv := reflect.ValueOf(v)
 	if rv.IsValid() && rv.Type().ConvertibleTo(target) && rv.Kind() != reflect.String {
 		return rv.Convert(target).Interface(), true, nil
 	}
-	return nil, true, in.errAt(call, fmt.Sprintf("cannot convert %T to %s (use strconv)", v, name))
+	return nil, true, in.errAt(call, fmt.Sprintf("cannot convert %s to %s (use strconv)", valTypeName(v), name))
 }
 
 // ---- types & composites ----
@@ -829,8 +856,10 @@ func (in *Interp) typeOf(env *Env, e ast.Expr) (TypeDesc, error) {
 			return TypeDesc{}, err
 		}
 		// ST rides up from the element: []P is a container whose leaf is
-		// the script struct P.
-		return TypeDesc{RT: reflect.SliceOf(el.RT), ST: el.ST}, nil
+		// the script struct P. storeRT is what the SLICE is built over --
+		// a script struct in a slot is its own minted type, so []P and
+		// []Q stop being the same reflect.Type here (see store.go).
+		return TypeDesc{RT: reflect.SliceOf(el.storeRT()), ST: el.ST}, nil
 	case *ast.MapType:
 		k, err := in.typeOf(env, t.Key)
 		if err != nil {
@@ -868,7 +897,7 @@ func (in *Interp) typeOf(env *Env, e ast.Expr) (TypeDesc, error) {
 		if err != nil {
 			return TypeDesc{}, err
 		}
-		return TypeDesc{RT: reflect.MapOf(keyRT, v.RT), ST: v.ST, KT: k.ST}, nil
+		return TypeDesc{RT: reflect.MapOf(keyRT, v.storeRT()), ST: v.ST, KT: k.ST}, nil
 	case *ast.InterfaceType:
 		if len(t.Methods.List) == 0 {
 			return TypeDesc{RT: typeIdents["any"]}, nil

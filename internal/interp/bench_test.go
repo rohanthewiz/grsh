@@ -334,6 +334,84 @@ _ = p`},
 	}
 }
 
+// BenchmarkStructContainer prices the boundary the minted storage types
+// added: every element read out of a slice or map of script structs goes
+// through fromStore, which is a Kind check plus -- only for struct-kind
+// values -- one lock-free map lookup.
+//
+// The native shapes are the control. They pay the Kind check and nothing
+// else, so a gap between them and the struct shapes is the boundary's
+// whole cost; a gap that moves is the map lookup getting expensive.
+func BenchmarkStructContainer(b *testing.B) {
+	shapes := []struct{ name, body string }{
+		{"slice-index-native", `xs := []int{0, 0, 0, 0}
+n := 0
+for i := 0; i < %d; i++ {
+	n = xs[i%%4]
+}
+_ = n`},
+		{"slice-index-struct", `type P struct {
+	X int
+}
+xs := []P{{1}, {2}, {3}, {4}}
+n := 0
+for i := 0; i < %d; i++ {
+	n = xs[i%%4].X
+}
+_ = n`},
+		{"map-hit-native", `m := map[string]int{"k": 1}
+n := 0
+for i := 0; i < %d; i++ {
+	n = m["k"]
+}
+_ = n`},
+		{"map-hit-struct", `type P struct {
+	X int
+}
+m := map[string]P{"k": {1}}
+n := 0
+for i := 0; i < %d; i++ {
+	n = m["k"].X
+}
+_ = n`},
+		// The miss is the case that changed BEHAVIOUR, not just storage:
+		// it used to hand back nil and now builds a zero struct, so it
+		// allocates where it did not. Priced so the cost is on the record.
+		{"map-miss-struct", `type P struct {
+	X int
+}
+m := map[string]P{"k": {1}}
+n := 0
+for i := 0; i < %d; i++ {
+	n = m["zz"].X
+}
+_ = n`},
+		{"range-slice-struct", `type P struct {
+	X int
+}
+xs := []P{{1}, {2}, {3}, {4}}
+n := 0
+for i := 0; i < %d/4; i++ {
+	for _, p := range xs {
+		n = p.X
+	}
+}
+_ = n`},
+	}
+	for _, s := range shapes {
+		b.Run(s.name, func(b *testing.B) {
+			in, fset, f := prepScript(b, fmt.Sprintf(s.body, benchIters))
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := in.Run(fset, f); err != nil {
+					b.Fatalf("run: %v", err)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*benchIters), "ns/iter")
+		})
+	}
+}
+
 // BenchmarkNewEnv isolates the cost the loop shapes pay repeatedly: an
 // Env plus its eagerly allocated map. If NewEnv ever grows a lazy map,
 // this is where the saving shows up first.

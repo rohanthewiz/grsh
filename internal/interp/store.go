@@ -1,0 +1,290 @@
+package interp
+
+import (
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+// Storage types: repairing the erasure where it actually costs something.
+//
+// reflect cannot mint a NAMED type at runtime, so every script struct is
+// held as the same *StructVal and `[]P` used to be `[]*StructVal`. That
+// erasure is invisible while a value is in hand — a *StructVal knows its
+// StructType — and expensive the moment it is NOT:
+//
+//	m["missing"]   a map miss has no value to read the type off, so the
+//	               zero could only be nil, never Go's zero struct
+//	x.([]P)        []P and []Q were the SAME reflect.Type, so a []Q
+//	               asserted to a []P and nothing could tell
+//	append(xs, q)  a Q dropped into a []P with no complaint
+//
+// All three are the same missing fact: the CONTAINER does not know what
+// it holds. So containers stop holding *StructVal and start holding a
+// type minted per struct:
+//
+//	[]P              []struct{ ScriptStruct "grsh:\"P|X:int\"" }
+//	map[string]P     map[string]struct{ ScriptStruct "grsh:\"P|X:int\"" }
+//
+// Two properties make this work where a plain wrapper would not:
+//
+//  1. reflect.StructOf DOES promote the methods of an EMBEDDED field, so
+//     the minted type is a fmt.Stringer. A script that prints a []P still
+//     sees [P{X: 1}] rather than grsh's storage, through fmt, json, and
+//     every other Go library the value reaches. This is the whole reason
+//     the design is affordable — a non-embedded wrapper field would have
+//     no methods and would print as internals everywhere.
+//
+//  2. The type is one pointer wide and pointer-shaped, so a slice of
+//     them is the same memory as the slice of pointers it replaces and
+//     boxing one into an interface still allocates nothing.
+//
+// What is embedded is ScriptStruct, NOT *StructVal, and that indirection
+// is load-bearing rather than tidy — see the warning on ScriptStruct.
+//
+// The cost is a rule with no compiler to enforce it: a minted value must
+// never reach script code. Every read out of a container goes through
+// fromStore, and every write in goes through convertTo. Those two are the
+// entire boundary.
+//
+// A type minted here is never freed — reflect.StructOf caches globally —
+// so what the tag is keyed on decides whether that is a bounded cost or a
+// leak. See structSig.
+
+// storeTagKey is the struct-tag key on a minted storage type. The tag
+// carries no information anyone reads back; it exists because
+// reflect.StructOf interns by the FULL field list, and the tag is the
+// only part of a one-embedded-field struct that can differ.
+const storeTagKey = "grsh"
+
+// ScriptStruct is the carrier a minted storage type embeds: a script
+// struct, held so that String comes along with it.
+//
+// It exists because of a hard constraint on reflect.StructOf's method
+// promotion. Promoting from an embedded type that has an UNEXPORTED
+// method — which *StructVal does, copyStruct — produces a method table
+// whose type offsets do not resolve, and the failure is not a panic that
+// a recover could turn into a script error: it is
+//
+//	fatal error: runtime: type offset base pointer out of range
+//
+// raised from itabInit the first time the value is asserted to an
+// interface, which is what fmt does to every argument. The whole process
+// dies. (Reachable only when the embedded type comes from a different
+// package than the minted type, which every runtime-minted type does.)
+//
+// So the embedded type must have NO unexported methods, and keeping
+// *StructVal free of them forever is not a promise this package can make.
+// ScriptStruct can: it is one field and one exported method, it embeds
+// nothing so it cannot inherit one, and it has no other job.
+//
+// DO NOT give this type an unexported method, and do not make it embed
+// anything. TestMintedTypePromotesExactlyOneMethod is the canary.
+type ScriptStruct struct{ SV *StructVal }
+
+// String is the only method, and the only reason the type exists: it is
+// what a minted type promotes, and therefore what fmt, json and every
+// other library finds on a []P element. *StructVal.String already answers
+// for a nil receiver, so the zero carrier renders as <nil> rather than
+// panicking inside fmt.
+func (s ScriptStruct) String() string { return s.SV.String() }
+
+// carrierType is ScriptStruct's own reflect.Type, named once because
+// minting embeds it by name: an embedded field's Name must be its type's.
+var carrierType = reflect.TypeFor[ScriptStruct]()
+
+var (
+	// storeMu guards both tables and the replacer below. It is taken only
+	// when a struct type is DECLARED, never on a read.
+	storeMu sync.Mutex
+
+	// storeTypes interns minted types by struct signature, so re-running
+	// the same `type P struct{...}` — in a loop, in a function called
+	// repeatedly, at each REPL line — reuses one type instead of leaking
+	// a fresh one per execution.
+	storeTypes = map[string]reflect.Type{}
+
+	// storeOwners maps a minted type back to the struct it stores, which
+	// is what lets a map MISS build a real zero: the slot has no value to
+	// read a StructType off, but its TYPE now names one.
+	//
+	// Copy-on-write behind an atomic pointer: writes happen once per
+	// distinct struct shape in the program, reads happen on every element
+	// pulled out of a container, and a plain map read beats any lock.
+	storeOwners atomic.Pointer[map[reflect.Type]*StructType]
+
+	// storeNames rewrites minted type names back to the script's own in
+	// any message built from a reflect.Type. Rebuilt whenever a type is
+	// minted, which is rare enough that rebuilding beats scanning.
+	storeNames atomic.Pointer[strings.Replacer]
+)
+
+// structSig is the identity a minted type is interned under: the struct's
+// name, its field names, and each field's resolved type, with a nested
+// script struct spelled out rather than named.
+//
+// Interning on the SHAPE rather than on the *StructType is what bounds
+// the leak. declareType runs every time its statement executes, so a
+// `type P struct{...}` inside a loop makes a fresh StructType per
+// iteration; keying on those would mint a type per iteration and never
+// free one. Keying on the shape means the table is bounded by the number
+// of distinct struct shapes in the SOURCE.
+//
+// The price is stated where it lands: two separately-declared but
+// identical structs share a storage type, so a []P built under one
+// declaration accepts a P built under the other. They are still distinct
+// StructTypes, so `p.(P)` and `p == q` tell them apart; only the
+// container type does not. Spelling the nested struct out — rather than
+// writing its name — is what keeps that limited to genuinely identical
+// shapes: `type P struct{I Inner}` under two different Inners does not
+// collide.
+func structSig(t *StructType) string {
+	var b strings.Builder
+	b.WriteString(t.Name)
+	b.WriteByte('|')
+	for i, f := range t.Fields {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(f)
+		b.WriteByte(':')
+		b.WriteString(t.FieldTypes[i].sig())
+	}
+	return b.String()
+}
+
+// sig renders a field's type for the signature above.
+//
+// A container needs no special casing: its element leaf is already a
+// minted type whose NAME contains that struct's own signature, so
+// reflect's rendering is exact by construction. The one edge reflect
+// cannot spell is a struct map KEY, which erases to the single StructKey
+// type — KT names it, and the substitution below puts it back.
+func (d TypeDesc) sig() string {
+	switch {
+	case d.RT == nil:
+		// A field type grsh does not model. Unresolved fields are
+		// dynamically typed anyway, so the shape they contribute is
+		// "unknown" — two structs differing only there are genuinely
+		// interchangeable as far as storage is concerned.
+		return "?"
+	case d.IsStruct():
+		return "{" + d.ST.sig + "}"
+	}
+	s := d.RT.String()
+	if d.KT != nil {
+		s = strings.ReplaceAll(s, structKeyType.String(), "{"+d.KT.sig+"}")
+	}
+	return s
+}
+
+// mintStoreType returns the type values of t take inside a container,
+// creating it on first use.
+//
+// Called from declareType, so it runs once per executed declaration and
+// never on a hot path.
+func mintStoreType(t *StructType) reflect.Type {
+	storeMu.Lock()
+	defer storeMu.Unlock()
+
+	if mt, ok := storeTypes[t.sig]; ok {
+		return mt
+	}
+	mt := reflect.StructOf([]reflect.StructField{{
+		// An embedded field must be named for its type, and being
+		// EMBEDDED is what promotes String onto the minted type.
+		Name:      carrierType.Name(),
+		Type:      carrierType,
+		Anonymous: true,
+		Tag:       reflect.StructTag(storeTagKey + `:"` + t.sig + `"`),
+	}})
+	storeTypes[t.sig] = mt
+
+	owners := map[reflect.Type]*StructType{}
+	if cur := storeOwners.Load(); cur != nil {
+		for k, v := range *cur {
+			owners[k] = v
+		}
+	}
+	owners[mt] = t
+	storeOwners.Store(&owners)
+
+	pairs := make([]string, 0, 2*len(owners))
+	for k, v := range owners {
+		pairs = append(pairs, k.String(), v.Name)
+	}
+	storeNames.Store(strings.NewReplacer(pairs...))
+	return mt
+}
+
+// storeOwnerOf reports the script struct a minted type stores, or nil for
+// any other type.
+//
+// The Kind guard is not an optimization detail worth hiding: every scalar,
+// pointer, slice and map leaves on it, so the map lookup is reached only
+// by struct-KIND values — which in a container are almost always ours.
+func storeOwnerOf(t reflect.Type) *StructType {
+	if t == nil || t.Kind() != reflect.Struct {
+		return nil
+	}
+	owners := storeOwners.Load()
+	if owners == nil {
+		return nil
+	}
+	return (*owners)[t]
+}
+
+// fromStore reads one container slot as the script must see it: a minted
+// value becomes the *StructVal it wraps, everything else is itself.
+//
+// The unwrap hands back the SAME pointer the container holds, not a copy,
+// which is what keeps xs[0].X = 1 writing through to the element. Go's
+// value semantics are applied by copyOnStore at the points where a value
+// reaches a NAME, exactly as before.
+//
+// A nil embedded pointer unwraps to a typed nil *StructVal, which is what
+// a nil element of a []P already was.
+func fromStore(rv reflect.Value) Value {
+	if rv.Kind() == reflect.Struct && storeOwnerOf(rv.Type()) != nil {
+		// Two hops: the minted type embeds the carrier, the carrier holds
+		// the struct.
+		return rv.Field(0).Field(0).Interface()
+	}
+	return rv.Interface()
+}
+
+// zeroInSlot is reflect.Zero for a container's element type, repaired for
+// a script struct.
+//
+// This is the map miss. reflect.Zero of a minted type is a wrapper around
+// a NIL *StructVal — grsh's storage detail, not Go's zero struct — but
+// the type now names its struct, so the real zero is one lookup away. The
+// answer is unwrapped because it is going to the script, not to a slot.
+func zeroInSlot(t reflect.Type) Value {
+	if st := storeOwnerOf(t); st != nil {
+		return st.newZero()
+	}
+	return reflect.Zero(t).Interface()
+}
+
+// intoStore wraps a script struct for a container slot of minted type mt.
+// It is convertTo's other half; nothing else should build one.
+func intoStore(sv *StructVal, mt reflect.Type) reflect.Value {
+	w := reflect.New(mt).Elem()
+	if sv != nil {
+		w.Field(0).Field(0).Set(reflect.ValueOf(sv))
+	}
+	return w
+}
+
+// storeReplace rewrites minted type names in s to the script's own struct
+// names. It runs before any other erasure, because a minted type's name
+// contains grsh's own carrier and would otherwise be reported piecemeal.
+func storeReplace(s string) string {
+	r := storeNames.Load()
+	if r == nil {
+		return s
+	}
+	return r.Replace(s)
+}

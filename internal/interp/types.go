@@ -75,8 +75,29 @@ type TypeDesc struct {
 // an ordinary P, and every construction path routes on this method:
 // structComposite makes the *StructVal and convertTo encodes it on the
 // way into the map.
+// A THIRD storage type counts as of the minting in store.go: inside a
+// container a struct is held as its own minted type, and TypeDesc.Elem
+// hands exactly that down. Comparing against d.ST's own storeT keeps the
+// answer exact without a registry lookup -- a minted type belonging to a
+// DIFFERENT struct is correctly not this descriptor's struct.
 func (d TypeDesc) IsStruct() bool {
-	return (d.RT == structValType || d.RT == structKeyType) && d.ST != nil
+	if d.ST == nil {
+		return false
+	}
+	return d.RT == structValType || d.RT == structKeyType || d.RT == d.ST.storeT
+}
+
+// storeRT is the reflect.Type this descriptor's values take when they sit
+// INSIDE a container, which is the only position where the erasure costs
+// something (store.go says what and why). Everywhere else -- a variable, a
+// struct field, an argument -- a script struct stays the plain *StructVal
+// it has always been, so nothing outside a container slot has to know
+// this type exists.
+func (d TypeDesc) storeRT() reflect.Type {
+	if d.RT == structValType && d.ST != nil {
+		return d.ST.storeT
+	}
+	return d.RT
 }
 
 // Elem is the element descriptor of a slice or map type. ST rides along
@@ -122,7 +143,11 @@ func (d TypeDesc) String() string {
 	if d.IsStruct() {
 		return d.ST.Name
 	}
-	s := d.RT.String()
+	// Minted names go first and unconditionally: one CONTAINS
+	// *interp.StructVal, so a pass looking for that erasure would cut a
+	// minted name in half. storeReplace turns the whole thing into the
+	// script's own name, which is what makes []P read as []P.
+	s := storeReplace(d.RT.String())
 	if d.ST != nil {
 		s = strings.ReplaceAll(s, structValType.String(), d.ST.Name)
 	}
@@ -147,8 +172,56 @@ func scriptTypeName(t reflect.Type) string {
 // the given name. Both erasures are handled together because a single
 // type can contain both: map[P]Q is map[StructKey]*StructVal.
 func eraseNames(s, name string) string {
+	// A minted container type names its struct exactly, so it is replaced
+	// with that name rather than the neutral word -- and it is replaced
+	// FIRST, for the reason TypeDesc.String gives.
+	s = storeReplace(s)
 	for _, erased := range [2]string{structValType.String(), structKeyType.String()} {
 		s = strings.ReplaceAll(s, erased, name)
 	}
 	return s
+}
+
+// keysMatch reports whether the struct KEYS actually present in v are the
+// struct this descriptor names at its key edge.
+//
+// It is the one place the erasure still has to be answered by the VALUE
+// rather than by the type. An element leaf no longer needs this: a
+// container holds its struct's own minted type, so []P and []Q are
+// different reflect.Types and AssignableTo is exact even for an empty
+// slice. A KEY leaf is not minted — a map key must be Go-comparable with
+// field-wise equality, which is what StructKey is for, and every script
+// struct erases to that one type. So map[P]int and map[Q]int ARE the same
+// reflect.Type, and the keys have to say which.
+//
+// What it cannot decide, it accepts:
+//
+//	map[P]int{}                   empty — no key names a struct
+//	m[nil] = v                    the zero StructKey names none either
+//	[]map[P]int                   Elem drops KT (see TypeDesc)
+//
+// So a container assertion is exact on its element leaf and "no key
+// contradicts it" on its key leaf.
+func (d TypeDesc) keysMatch(v Value) bool {
+	if d.KT == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() || rv.Kind() != reflect.Map {
+		return true
+	}
+	for iter := rv.MapRange(); iter.Next(); {
+		sk, ok := iter.Key().Interface().(StructKey)
+		if !ok {
+			return false
+		}
+		// Compared by STORAGE type, not by StructType pointer, so the key
+		// side draws the same line the element side does: two identical
+		// declarations of P share a storage type and are mutually
+		// acceptable (see structSig), a Q is not.
+		if sk.T != nil && sk.T.storeT != d.KT.storeT {
+			return false
+		}
+	}
+	return true
 }

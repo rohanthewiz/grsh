@@ -1,0 +1,102 @@
+# A container of script structs knows WHICH struct it holds.
+#
+# Every script struct used to erase to one storage type, so a []P and a
+# []Q were the same type to the interpreter. Three things follow from
+# giving each struct its own container-storage type, and all three are
+# below: a map miss builds the real zero, an assertion is exact, and a
+# slot refuses another struct.
+type P struct {
+	X int
+	S string
+}
+type Q struct {
+	A bool
+}
+
+# A missing key yields Go's ZERO STRUCT, not nil. It used to be nil
+# because the slot had no value to read the struct's identity off -- the
+# element TYPE names it now.
+m := map[string]P{"a": {1, "one"}}
+v, ok := m["zz"]
+fmt.Println(m["a"], m["zz"], v, ok)
+
+# The zero is a real struct: its fields read, and writing one cannot
+# reach back into the map.
+p := m["zz"]
+p.X = 7
+fmt.Println(p, m["zz"], len(m))
+
+# A non-struct element type is unaffected -- nil IS Go's zero there.
+byName := map[string][]P{"a": {{1, "one"}}}
+fmt.Println(byName["zz"] == nil, len(byName["zz"]))
+
+# An assertion is exact on the element leaf, empty containers included.
+var anyP any = []P{{1, "one"}}
+var anyEmpty any = []P{}
+_, isP := anyP.([]P)
+_, isQ := anyP.([]Q)
+_, emptyIsP := anyEmpty.([]P)
+_, emptyIsQ := anyEmpty.([]Q)
+fmt.Println(isP, isQ, emptyIsP, emptyIsQ)
+
+# Through a map value, and through a map value that is itself a slice.
+var anyMap any = map[string]P{"k": {1, "one"}}
+var anyNest any = map[string][]P{"k": {{1, "one"}}}
+_, mapIsP := anyMap.(map[string]P)
+_, mapIsQ := anyMap.(map[string]Q)
+_, nestIsP := anyNest.(map[string][]P)
+_, nestIsQ := anyNest.(map[string][]Q)
+fmt.Println(mapIsP, mapIsQ, nestIsP, nestIsQ)
+
+# A struct map KEY is still erased -- it becomes the one comparable
+# stand-in the map can hash -- so that leaf is answered by the keys
+# themselves. An empty map has no key to ask, and accepts either.
+var anyKeyed any = map[P]int{{1, "one"}: 5}
+var anyKeyedEmpty any = map[P]int{}
+_, keyIsP := anyKeyed.(map[P]int)
+_, keyIsQ := anyKeyed.(map[Q]int)
+_, emptyKeyIsQ := anyKeyedEmpty.(map[Q]int)
+fmt.Println(keyIsP, keyIsQ, emptyKeyIsQ)
+
+# Printing is unchanged at every depth: the storage type carries the
+# struct's own String with it.
+xs := []P{{1, "one"}, {2, "two"}}
+fmt.Println(xs)
+fmt.Println(map[string][]P{"g": xs})
+fmt.Printf("%v|%s\n", xs, xs)
+
+# Reading an element gives the script's own struct back, and writing
+# through it reaches the element.
+xs[0].X = 99
+fmt.Println(xs[0], xs[0].X, len(xs))
+for i, e := range xs {
+	fmt.Println(i, e, e.S)
+}
+
+# make fills with real zeros, and they are not aliased to each other.
+made := make([]P, 2)
+made[0].X = 4
+fmt.Println(made, made[0].X, made[1].X)
+
+# A nil element is still storable, and still nil.
+xs = append(xs, nil)
+fmt.Println(len(xs), xs[2] == nil, xs)
+
+# Containers held in a struct FIELD go through the same storage, so the
+# field's map miss is repaired too.
+type Box struct {
+	Items []P
+	M     map[string]P
+}
+b := Box{[]P{{1, "one"}}, map[string]P{"k": {2, "two"}}}
+fmt.Println(b.Items[0].S, b.M["k"].X, b.M["zz"])
+
+# Elements compare field-wise, the way any two structs do.
+fmt.Println(xs[0] == xs[0], xs[0] == xs[1], made[1] == P{})
+
+# A struct-keyed map still ranges as the script's own P on both sides.
+keyed := map[P]Q{{1, "one"}: {true}}
+for k, val := range keyed {
+	fmt.Println(k, k.X, val, val.A)
+}
+fmt.Println(keyed[P{1, "one"}], keyed[P{9, "nine"}])

@@ -81,17 +81,17 @@ func (in *Interp) evalExpr(env *Env, e ast.Expr) ([]Value, error) {
 		// Every script struct erases to the same *StructVal, so
 		// AssignableTo would answer yes for x.(P) whatever struct x
 		// actually holds. Compare the declared type itself instead.
-		//
-		// The erasure still shows through one level up: x.([]P) cannot
-		// tell a []P from a []Q, because both are []*StructVal and the
-		// slice carries no per-element promise. Divergence, pinned.
 		if d.IsStruct() {
 			if sv, ok := v.(*StructVal); ok && sv != nil && sv.Type == d.ST {
 				return []Value{v, true}, nil
 			}
 			return []Value{d.Zero(), false}, nil
 		}
-		if v != nil && reflect.TypeOf(v).AssignableTo(d.RT) {
+		// A container answers on its type, because its element type is
+		// minted per struct — []P and []Q are genuinely different types
+		// now. The exception is a struct map KEY, which is still erased to
+		// the one StructKey; keysMatch asks the keys themselves.
+		if v != nil && reflect.TypeOf(v).AssignableTo(d.RT) && d.keysMatch(v) {
 			return []Value{v, true}, nil
 		}
 		return []Value{d.Zero(), false}, nil
@@ -127,7 +127,7 @@ func (in *Interp) evalBool(env *Env, e ast.Expr) (bool, error) {
 	}
 	b, ok := v.(bool)
 	if !ok {
-		return false, in.errAt(e, fmt.Sprintf("condition must be bool, got %T", v))
+		return false, in.errAt(e, fmt.Sprintf("condition must be bool, got %s", valTypeName(v)))
 	}
 	return b, nil
 }
@@ -192,7 +192,7 @@ func (in *Interp) unaryOp(n ast.Node, op token.Token, v Value) (Value, error) {
 	case token.NOT:
 		b, ok := v.(bool)
 		if !ok {
-			return nil, in.errAt(n, fmt.Sprintf("operator ! requires bool, got %T", v))
+			return nil, in.errAt(n, fmt.Sprintf("operator ! requires bool, got %s", valTypeName(v)))
 		}
 		return !b, nil
 	case token.SUB:
@@ -202,7 +202,7 @@ func (in *Interp) unaryOp(n ast.Node, op token.Token, v Value) (Value, error) {
 		if f, ok := toF64(v); ok {
 			return -f, nil
 		}
-		return nil, in.errAt(n, fmt.Sprintf("operator - requires a number, got %T", v))
+		return nil, in.errAt(n, fmt.Sprintf("operator - requires a number, got %s", valTypeName(v)))
 	case token.ADD:
 		return v, nil
 	case token.XOR:
@@ -210,7 +210,7 @@ func (in *Interp) unaryOp(n ast.Node, op token.Token, v Value) (Value, error) {
 		if i, ok := toI64(v); ok {
 			return int(^i), nil
 		}
-		return nil, in.errAt(n, fmt.Sprintf("operator ^ requires an integer, got %T", v))
+		return nil, in.errAt(n, fmt.Sprintf("operator ^ requires an integer, got %s", valTypeName(v)))
 	}
 	return nil, in.errAt(n, "unary operator "+op.String()+" is not supported")
 }
@@ -586,9 +586,9 @@ func (in *Interp) assignRHS(env *Env, as *ast.AssignStmt) ([]Value, error) {
 			}
 			out := rv.MapIndex(kv)
 			if out.IsValid() {
-				return []Value{out.Interface(), true}, nil
+				return []Value{fromStore(out), true}, nil
 			}
-			return []Value{reflect.Zero(rv.Type().Elem()).Interface(), false}, nil
+			return []Value{zeroInSlot(rv.Type().Elem()), false}, nil
 		}
 	}
 
@@ -684,7 +684,7 @@ func (in *Interp) setLValue(env *Env, lhs ast.Expr, v Value) error {
 		if sv, ok := recv.(*StructVal); ok {
 			return in.setStructField(t, sv, t.Sel.Name, v)
 		}
-		return in.errAt(lhs, fmt.Sprintf("cannot assign to field of %T", recv))
+		return in.errAt(lhs, fmt.Sprintf("cannot assign to field of %s", valTypeName(recv)))
 	default:
 		return in.errAt(lhs, fmt.Sprintf("cannot assign to %T yet", lhs))
 	}
@@ -724,7 +724,7 @@ func (in *Interp) setIndexed(n ast.Node, container, idx, v Value) error {
 		rv.Index(int(i)).Set(vv)
 		return nil
 	}
-	return in.errAt(n, fmt.Sprintf("cannot index-assign into %T", container))
+	return in.errAt(n, fmt.Sprintf("cannot index-assign into %s", valTypeName(container)))
 }
 
 // ---- indexing / slicing / selectors ----
@@ -747,19 +747,13 @@ func (in *Interp) evalIndex(env *Env, n *ast.IndexExpr) (Value, error) {
 		}
 		out := rv.MapIndex(kv)
 		if !out.IsValid() {
-			// A missing entry yields the element type's zero. For a
-			// script struct that type has erased to *StructVal, which
-			// cannot say WHICH struct — so reflect.Zero would hand back
-			// a typed nil that panics on the first field access. Untyped
-			// nil is the honest answer: it prints as <nil> and compares
-			// equal to nil. Divergence from Go's zero struct, pinned;
-			// the comma-ok form is exact either way.
-			if rv.Type().Elem() == structValType {
-				return nil, nil
-			}
-			return reflect.Zero(rv.Type().Elem()).Interface(), nil
+			// A missing entry yields the element type's zero, and for a
+			// script struct that is Go's zero STRUCT -- not nil. The slot
+			// has no value to read a StructType off, so this works only
+			// because the element TYPE names one: see zeroInSlot.
+			return zeroInSlot(rv.Type().Elem()), nil
 		}
-		return out.Interface(), nil
+		return fromStore(out), nil
 	case reflect.Slice, reflect.Array, reflect.String:
 		i, ok := toI64(idx)
 		if !ok {
@@ -768,9 +762,9 @@ func (in *Interp) evalIndex(env *Env, n *ast.IndexExpr) (Value, error) {
 		if i < 0 || int(i) >= rv.Len() {
 			return nil, in.errAt(n, fmt.Sprintf("index out of range [%d] with length %d", i, rv.Len()))
 		}
-		return rv.Index(int(i)).Interface(), nil
+		return fromStore(rv.Index(int(i))), nil
 	}
-	return nil, in.errAt(n, fmt.Sprintf("cannot index %T", container))
+	return nil, in.errAt(n, fmt.Sprintf("cannot index %s", valTypeName(container)))
 }
 
 func (in *Interp) evalSlice(env *Env, n *ast.SliceExpr) (Value, error) {
@@ -780,7 +774,7 @@ func (in *Interp) evalSlice(env *Env, n *ast.SliceExpr) (Value, error) {
 	}
 	rv := reflect.ValueOf(container)
 	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.String && rv.Kind() != reflect.Array {
-		return nil, in.errAt(n, fmt.Sprintf("cannot slice %T", container))
+		return nil, in.errAt(n, fmt.Sprintf("cannot slice %s", valTypeName(container)))
 	}
 	lo, hi := 0, rv.Len()
 	if n.Low != nil {
@@ -838,7 +832,7 @@ func (in *Interp) evalSelector(env *Env, n *ast.SelectorExpr) (Value, error) {
 			return f.Interface(), nil
 		}
 	}
-	return nil, in.errAt(n, fmt.Sprintf("unknown selector %s on %T", n.Sel.Name, v))
+	return nil, in.errAt(n, fmt.Sprintf("unknown selector %s on %s", n.Sel.Name, valTypeName(v)))
 }
 
 // ---- range ----
@@ -851,7 +845,7 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
-			cont, err := iterate(i, rv.Index(i).Interface())
+			cont, err := iterate(i, fromStore(rv.Index(i)))
 			if err != nil || !cont {
 				return err
 			}
@@ -873,7 +867,7 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 			// P. The rebuilt struct is fresh each iteration, so assigning
 			// to the range variable's fields cannot reach the key inside
 			// the map.
-			cont, err := iterate(fromKeyValue(k.Interface()), rv.MapIndex(k).Interface())
+			cont, err := iterate(fromKeyValue(k.Interface()), fromStore(rv.MapIndex(k)))
 			if err != nil || !cont {
 				return err
 			}
@@ -887,7 +881,7 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 			}
 		}
 	default:
-		return in.errAt(n, fmt.Sprintf("cannot range over %T", x))
+		return in.errAt(n, fmt.Sprintf("cannot range over %s", valTypeName(x)))
 	}
 	return nil
 }

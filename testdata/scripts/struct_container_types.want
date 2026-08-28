@@ -1,0 +1,18 @@
+P{X: 1, S: one} P{X: 0, S: } P{X: 0, S: } false
+P{X: 7, S: } P{X: 0, S: } 1
+true 0
+true false true false
+true false true false
+true false true
+[P{X: 1, S: one} P{X: 2, S: two}]
+map[g:[P{X: 1, S: one} P{X: 2, S: two}]]
+[P{X: 1, S: one} P{X: 2, S: two}]|[P{X: 1, S: one} P{X: 2, S: two}]
+P{X: 99, S: one} 99 2
+0 P{X: 99, S: one} one
+1 P{X: 2, S: two} two
+[P{X: 4, S: } P{X: 0, S: }] 4 0
+3 true [P{X: 99, S: one} P{X: 2, S: two} <nil>]
+one 2 P{X: 0, S: }
+true false true
+P{X: 1, S: one} 1 Q{A: true} true
+Q{A: true} Q{A: false}
