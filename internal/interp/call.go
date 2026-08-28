@@ -517,7 +517,7 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 		}
 		return out, nil
 	}
-	return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%T) as %s", v, v, pt))
+	return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%T) as %s", v, v, scriptTypeName(pt)))
 }
 
 // ---- Go builtins ----
@@ -660,7 +660,7 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 		if len(call.Args) < 1 {
 			return nil, true, in.errAt(call, "make expects a type")
 		}
-		t, err := in.typeOf(call.Args[0])
+		d, err := in.typeOf(env, call.Args[0])
 		if err != nil {
 			return nil, true, err
 		}
@@ -696,11 +696,23 @@ func (in *Interp) goBuiltin(env *Env, name string, call *ast.CallExpr) ([]Value,
 		if n1 < n0 {
 			return nil, true, in.errAt(call, "make: length larger than capacity")
 		}
-		switch t.Kind() {
+		switch d.RT.Kind() {
 		case reflect.Slice:
-			return []Value{reflect.MakeSlice(t, n0, n1).Interface()}, true, nil
+			out := reflect.MakeSlice(d.RT, n0, n1)
+			// Go's zero for a struct element is a zero STRUCT. Once the
+			// element type has erased to *StructVal, reflect.MakeSlice
+			// leaves nil pointers there instead — so make([]P, 3) would
+			// hand back three nils that panic on the first field access.
+			// Fill them. make([][]P, 3) is NOT this case: its element is
+			// a slice, and a nil slice IS Go's zero.
+			if elem := d.Elem(); elem.IsStruct() {
+				for i := 0; i < n0; i++ {
+					out.Index(i).Set(reflect.ValueOf(elem.ST.newZero()))
+				}
+			}
+			return []Value{out.Interface()}, true, nil
 		case reflect.Map:
-			return []Value{reflect.MakeMap(t).Interface()}, true, nil
+			return []Value{reflect.MakeMap(d.RT).Interface()}, true, nil
 		}
 		return nil, true, in.errAt(call, "make supports slices and maps (not yet channels)")
 	}
@@ -770,40 +782,70 @@ var typeIdents = map[string]reflect.Type{
 	"error":   reflect.TypeFor[error](),
 }
 
-func (in *Interp) typeOf(e ast.Expr) (reflect.Type, error) {
+// typeOf resolves a type expression to the descriptor the rest of the
+// interpreter builds values from.
+//
+// It takes an env because script struct types are ordinary bindings:
+// `type P struct{...}` defines P in the scope it appears in, so a type
+// name resolves by the same lookup — and obeys the same shadowing — as
+// any other identifier. Native type names are checked first, so a script
+// cannot redefine `int` out from under a literal.
+func (in *Interp) typeOf(env *Env, e ast.Expr) (TypeDesc, error) {
 	switch t := e.(type) {
 	case *ast.Ident:
 		if rt, ok := typeIdents[t.Name]; ok {
-			return rt, nil
+			return TypeDesc{RT: rt}, nil
 		}
-		return nil, in.errAt(e, "unknown type "+t.Name)
+		if st, ok := lookupStructType(env, t); ok {
+			return TypeDesc{RT: structValType, ST: st}, nil
+		}
+		return TypeDesc{}, in.errAt(e, "unknown type "+t.Name)
 	case *ast.ArrayType:
 		if t.Len != nil {
-			return nil, in.errAt(e, "fixed-size arrays are not supported (use a slice)")
+			return TypeDesc{}, in.errAt(e, "fixed-size arrays are not supported (use a slice)")
 		}
-		el, err := in.typeOf(t.Elt)
+		el, err := in.typeOf(env, t.Elt)
 		if err != nil {
-			return nil, err
+			return TypeDesc{}, err
 		}
-		return reflect.SliceOf(el), nil
+		// ST rides up from the element: []P is a container whose leaf is
+		// the script struct P.
+		return TypeDesc{RT: reflect.SliceOf(el.RT), ST: el.ST}, nil
 	case *ast.MapType:
-		k, err := in.typeOf(t.Key)
+		k, err := in.typeOf(env, t.Key)
 		if err != nil {
-			return nil, err
+			return TypeDesc{}, err
 		}
-		v, err := in.typeOf(t.Value)
+		// A script struct erases to a POINTER, and a pointer is
+		// comparable — so map[P]V would build happily and then compare
+		// identities instead of field values, making every lookup with a
+		// freshly built key miss. Refusing it is the only honest answer
+		// until struct values have real equality.
+		if k.ST != nil {
+			return TypeDesc{}, in.errAt(t.Key, "a script struct cannot be a map key yet",
+				"hint", "key by one of its fields, or use a slice")
+		}
+		// reflect.MapOf PANICS on a key type that is not comparable, so
+		// the check has to happen before the call. `map[[]int]int{}`
+		// used to reach it and surface through the top-level recover as
+		// an unpositioned "grsh internal error"; it is an ordinary
+		// positioned script error now.
+		if !k.RT.Comparable() {
+			return TypeDesc{}, in.errAt(t.Key, "invalid map key type "+k.String())
+		}
+		v, err := in.typeOf(env, t.Value)
 		if err != nil {
-			return nil, err
+			return TypeDesc{}, err
 		}
-		return reflect.MapOf(k, v), nil
+		return TypeDesc{RT: reflect.MapOf(k.RT, v.RT), ST: v.ST}, nil
 	case *ast.InterfaceType:
 		if len(t.Methods.List) == 0 {
-			return typeIdents["any"], nil
+			return TypeDesc{RT: typeIdents["any"]}, nil
 		}
 	case *ast.ParenExpr:
-		return in.typeOf(t.X)
+		return in.typeOf(env, t.X)
 	}
-	return nil, in.errAt(e, fmt.Sprintf("unsupported type %T yet", e))
+	return TypeDesc{}, in.errAt(e, fmt.Sprintf("unsupported type %T yet", e))
 }
 
 // evalComposite builds a composite literal that spells its own type.
@@ -820,14 +862,11 @@ func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
 		// routes through elidedElem instead.
 		return nil, in.errAt(n, "composite literal needs an explicit type here")
 	}
-	if st, ok := lookupStructType(env, n.Type); ok {
-		return in.structComposite(env, st, n)
-	}
-	t, err := in.typeOf(n.Type)
+	d, err := in.typeOf(env, n.Type)
 	if err != nil {
 		return nil, err
 	}
-	return in.compositeOf(env, t, n)
+	return in.compositeOf(env, d, n)
 }
 
 // compositeOf builds a literal of a type already resolved by the caller.
@@ -837,16 +876,23 @@ func (in *Interp) evalComposite(env *Env, n *ast.CompositeLit) (Value, error) {
 // with no type of its own is built against what it was handed. The
 // recursion needs no depth limit of its own -- it is bounded by the
 // nesting the parser already accepted.
-func (in *Interp) compositeOf(env *Env, t reflect.Type, n *ast.CompositeLit) (Value, error) {
-	switch t.Kind() {
+func (in *Interp) compositeOf(env *Env, d TypeDesc, n *ast.CompositeLit) (Value, error) {
+	// A script struct reaches this through exactly the same door as a
+	// slice or a map, which is what makes []P{{1, 2}} work: elidedElem
+	// hands the element descriptor down without caring which kind it is.
+	if d.IsStruct() {
+		return in.structComposite(env, d.ST, n)
+	}
+	switch d.RT.Kind() {
 	case reflect.Slice:
-		out := reflect.MakeSlice(t, 0, len(n.Elts))
+		out := reflect.MakeSlice(d.RT, 0, len(n.Elts))
+		elem := d.Elem()
 		for _, el := range n.Elts {
-			v, err := in.elidedElem(env, el, t.Elem())
+			v, err := in.elidedElem(env, el, elem)
 			if err != nil {
 				return nil, err
 			}
-			ev, cerr := convertTo(copyOnStore(v), t.Elem())
+			ev, cerr := convertTo(copyOnStore(v), elem.RT)
 			if cerr != nil {
 				return nil, in.wrapAt(el, cerr)
 			}
@@ -854,7 +900,8 @@ func (in *Interp) compositeOf(env *Env, t reflect.Type, n *ast.CompositeLit) (Va
 		}
 		return out.Interface(), nil
 	case reflect.Map:
-		out := reflect.MakeMapWithSize(t, len(n.Elts))
+		out := reflect.MakeMapWithSize(d.RT, len(n.Elts))
+		key, elem := d.Key(), d.Elem()
 		for _, el := range n.Elts {
 			kv, ok := el.(*ast.KeyValueExpr)
 			if !ok {
@@ -862,22 +909,23 @@ func (in *Interp) compositeOf(env *Env, t reflect.Type, n *ast.CompositeLit) (Va
 			}
 			// The key routes through elidedElem for symmetry with the
 			// value, but no composite type can currently BE a map key
-			// here: arrays are unsupported by typeOf, and slices and maps
-			// are not comparable. So this is uniform rather than useful,
-			// and it becomes useful the day arrays land.
-			k, err := in.elidedElem(env, kv.Key, t.Key())
+			// here: arrays are unsupported by typeOf, script structs are
+			// refused there outright, and slices and maps are not
+			// comparable. So this is uniform rather than useful, and it
+			// becomes useful the day arrays land.
+			k, err := in.elidedElem(env, kv.Key, key)
 			if err != nil {
 				return nil, err
 			}
-			v, err := in.elidedElem(env, kv.Value, t.Elem())
+			v, err := in.elidedElem(env, kv.Value, elem)
 			if err != nil {
 				return nil, err
 			}
-			rk, cerr := convertTo(k, t.Key())
+			rk, cerr := convertTo(k, key.RT)
 			if cerr != nil {
 				return nil, in.wrapAt(kv.Key, cerr)
 			}
-			rv, cerr := convertTo(copyOnStore(v), t.Elem())
+			rv, cerr := convertTo(copyOnStore(v), elem.RT)
 			if cerr != nil {
 				return nil, in.wrapAt(kv.Value, cerr)
 			}
@@ -893,22 +941,23 @@ func (in *Interp) compositeOf(env *Env, t reflect.Type, n *ast.CompositeLit) (Va
 //
 //	[][]int{{1, 2}}          want = []int      -- built here
 //	[][]int{[]int{1, 2}}     want ignored      -- the node names its type
+//	[]P{{1, 2}}              want = P          -- built here too
 //	[]int{1, 2}              not a literal     -- ordinary evaluation
 //
 // Anything that is not an untyped literal takes the ordinary path, so
 // this costs one type switch per element and changes nothing else.
-func (in *Interp) elidedElem(env *Env, e ast.Expr, want reflect.Type) (Value, error) {
+func (in *Interp) elidedElem(env *Env, e ast.Expr, want TypeDesc) (Value, error) {
 	lit, ok := e.(*ast.CompositeLit)
 	if !ok || lit.Type != nil {
 		return in.eval1(env, e)
 	}
-	if want == nil {
+	if want.RT == nil {
 		return nil, in.errAt(e, "composite literal needs an explicit type here")
 	}
 	// `[]any{{1}}` lands here: an interface element type says nothing
 	// about what to build, and Go rejects it for the same reason. Naming
 	// the type is the fix in both languages, so say so.
-	if k := want.Kind(); k != reflect.Slice && k != reflect.Map && k != reflect.Array {
+	if k := want.RT.Kind(); !want.IsStruct() && k != reflect.Slice && k != reflect.Map && k != reflect.Array {
 		return nil, in.errAt(e, fmt.Sprintf("composite literal needs an explicit type here: %s is not a composite type", want))
 	}
 	return in.compositeOf(env, want, lit)

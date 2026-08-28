@@ -16,12 +16,18 @@ type StructType struct {
 	Zero   []Value // zero value per field (nil when the type is exotic)
 	Index  map[string]int
 
-	// FieldTypes is the resolved type per field, parallel to Fields, and
-	// nil at any position typeOf could not resolve (another script
-	// struct, or a type grsh does not model). It exists so a field's
-	// literal can elide its type the way a slice element's can:
-	// P{Tags: {"a"}} needs to know Tags is a []string.
-	FieldTypes []reflect.Type
+	// FieldTypes is the resolved type per field, parallel to Fields, with
+	// a nil RT at any position typeOf could not resolve (a type grsh does
+	// not model). It exists so a field's literal can elide its type the
+	// way a slice element's can: P{Tags: {"a"}} needs to know Tags is a
+	// []string, and P{In: {1}} needs to know In is an Inner.
+	FieldTypes []TypeDesc
+
+	// structFields records whether any Zero entry is itself a *StructVal.
+	// Zero is shared by every instance, so those entries have to be
+	// duplicated in newZero rather than aliased — and the flag keeps the
+	// ordinary all-scalar struct out of that loop entirely.
+	structFields bool
 }
 
 // StructVal is an instance of a script-declared struct.
@@ -31,6 +37,12 @@ type StructVal struct {
 }
 
 func (sv *StructVal) String() string {
+	// A nil instance is reachable now that []P exists: append(xs, nil)
+	// converts nil to a typed nil element. Print it rather than panic
+	// inside fmt, which would report the panic instead of the value.
+	if sv == nil {
+		return "<nil>"
+	}
 	var b strings.Builder
 	b.WriteString(sv.Type.Name)
 	b.WriteByte('{')
@@ -59,27 +71,60 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 		// dynamically typed, so the field simply starts nil and works.
 		// The resolved type is kept rather than discarded after the zero
 		// is taken, because an elided nested literal needs it later.
-		rt, err := in.typeOf(f.Type)
+		//
+		// A struct-typed field resolves like any other one, which is what
+		// makes `type Outer struct { In Inner }` zero to a real Inner{}.
+		// It cannot recurse forever: a field type must already be
+		// declared when the struct is (env.Define runs last, below), so
+		// the type graph is a DAG by construction — `type N struct { Next
+		// N }` leaves Next unresolved rather than looping.
+		d, err := in.typeOf(env, f.Type)
 		var zero Value
 		if err == nil {
-			zero = reflect.Zero(rt).Interface()
+			zero = d.Zero()
 		} else {
-			rt = nil
+			d = TypeDesc{}
+		}
+		if _, nested := zero.(*StructVal); nested {
+			t.structFields = true
 		}
 		for _, n := range f.Names {
 			t.Index[n.Name] = len(t.Fields)
 			t.Fields = append(t.Fields, n.Name)
 			t.Zero = append(t.Zero, zero)
-			t.FieldTypes = append(t.FieldTypes, rt)
+			t.FieldTypes = append(t.FieldTypes, d)
 		}
 	}
 	env.Define(ts.Name.Name, t)
 	return nil
 }
 
+// newZero builds a fresh instance with every field at its zero, and its
+// contract is that the result shares nothing with the TYPE.
+//
+// The plain copy is the whole job for a struct of scalars. A
+// struct-TYPED field is the exception: its zero in t.Zero is one
+// *StructVal held by the type, so copying the slice alone would hand
+// every instance that same nested struct.
+//
+// Most callers would survive without the duplication, because their
+// result reaches a name through copyOnStore, which descends and isolates
+// it anyway. `make([]Out, 2)` is the caller that would not: its fill
+// writes each instance STRAIGHT into the slice, so without this the two
+// elements share one In and xs[0].I.N = 7 sets xs[1].I.N too. Tested.
+//
+// The flag keeps the loop off the common path, and copyStruct's descent
+// terminates for the reason declareType records: the type graph is a DAG.
 func (t *StructType) newZero() *StructVal {
 	vals := make([]Value, len(t.Fields))
 	copy(vals, t.Zero)
+	if t.structFields {
+		for i, v := range vals {
+			if sv, ok := v.(*StructVal); ok {
+				vals[i] = sv.copyStruct()
+			}
+		}
+	}
 	return &StructVal{Type: t, Vals: vals}
 }
 
@@ -143,7 +188,10 @@ func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) 
 // majority of calls are one type assertion and a return.
 func copyOnStore(v Value) Value {
 	sv, ok := v.(*StructVal)
-	if !ok {
+	// A TYPED nil arrives from convertTo whenever nil is stored into a
+	// []P or a map[K]P slot. There is nothing to duplicate, and
+	// copyStruct would dereference it.
+	if !ok || sv == nil {
 		return v
 	}
 	return sv.copyStruct()
@@ -213,6 +261,9 @@ func methodHasPtrRecv(cl *Closure) bool {
 // callStructMethod dispatches sv.Method(args...). Pointer receivers share
 // the instance; value receivers get a shallow copy.
 func (in *Interp) callStructMethod(env *Env, call *ast.CallExpr, sv *StructVal, name string) ([]Value, error) {
+	if sv == nil {
+		return nil, in.errAt(call, "cannot call "+name+" on a nil struct")
+	}
 	cl, ok := in.lookupMethod(sv.Type.Name, name)
 	if !ok {
 		// Native methods on the value itself (e.g. String) still work.
@@ -238,6 +289,9 @@ func (in *Interp) callStructMethod(env *Env, call *ast.CallExpr, sv *StructVal, 
 
 // structField reads sv.Field.
 func (in *Interp) structField(n ast.Node, sv *StructVal, field string) (Value, error) {
+	if sv == nil {
+		return nil, in.errAt(n, "nil struct has no field "+field)
+	}
 	idx, ok := sv.Type.Index[field]
 	if !ok {
 		if _, isMethod := in.lookupMethod(sv.Type.Name, field); isMethod {
@@ -257,6 +311,9 @@ func (in *Interp) structField(n ast.Node, sv *StructVal, field string) (Value, e
 // test could tell the difference. The store site owns the copy, and there
 // is exactly one store site.
 func (in *Interp) setStructField(n ast.Node, sv *StructVal, field string, v Value) error {
+	if sv == nil {
+		return in.errAt(n, "nil struct has no field "+field)
+	}
 	idx, ok := sv.Type.Index[field]
 	if !ok {
 		return in.errAt(n, fmt.Sprintf("unknown field %s in %s", field, sv.Type.Name))

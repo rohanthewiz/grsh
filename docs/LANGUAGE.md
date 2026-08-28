@@ -290,6 +290,15 @@ captures buffer output.
 - Types: `bool`, `int`, `int64`, `float64`, `string`, `byte`, `rune`,
   `any`, `error`; slices `[]T`; maps `map[K]V`; struct **types**
   (declaration, literals, field get/set — no embedding yet)
+- A declared struct type works **in type position** like any other:
+  `[]Item`, `map[string]Item`, `[][]Item`, `var it Item`,
+  `make([]Item, 3)` (elements are zero structs, not nils), a
+  struct-typed **field** (`type Order struct { Head Item }`, whose zero
+  is a real `Item`), and `v.(Item)`. Nested literals elide their type
+  the same way Go's do: `[]Item{{"nut", 2}}`, `Order{Head: {"crate", 1}}`.
+  Two limits: a struct type cannot be a **map key** (grsh has no struct
+  equality yet), and `m[missing]` on a struct-valued map yields `nil`
+  rather than the zero struct — use the comma-ok form, which is exact.
 - **Struct methods**: top-level `func (p Point) Norm() float64 {...}`
   and `func (p *Point) Scale(f float64) {...}`. Go semantics: a value
   receiver sees a copy, a pointer receiver mutates the instance.

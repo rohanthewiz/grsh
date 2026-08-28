@@ -74,14 +74,27 @@ func (in *Interp) evalExpr(env *Env, e ast.Expr) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		t, err := in.typeOf(n.Type)
+		d, err := in.typeOf(env, n.Type)
 		if err != nil {
 			return nil, err
 		}
-		if v != nil && reflect.TypeOf(v).AssignableTo(t) {
+		// Every script struct erases to the same *StructVal, so
+		// AssignableTo would answer yes for x.(P) whatever struct x
+		// actually holds. Compare the declared type itself instead.
+		//
+		// The erasure still shows through one level up: x.([]P) cannot
+		// tell a []P from a []Q, because both are []*StructVal and the
+		// slice carries no per-element promise. Divergence, pinned.
+		if d.IsStruct() {
+			if sv, ok := v.(*StructVal); ok && sv != nil && sv.Type == d.ST {
+				return []Value{v, true}, nil
+			}
+			return []Value{d.Zero(), false}, nil
+		}
+		if v != nil && reflect.TypeOf(v).AssignableTo(d.RT) {
 			return []Value{v, true}, nil
 		}
-		return []Value{reflect.Zero(t).Interface(), false}, nil
+		return []Value{d.Zero(), false}, nil
 
 	default:
 		return nil, in.errAt(e, fmt.Sprintf("%T expression is not supported yet", e))
@@ -642,6 +655,16 @@ func (in *Interp) evalIndex(env *Env, n *ast.IndexExpr) (Value, error) {
 		}
 		out := rv.MapIndex(kv)
 		if !out.IsValid() {
+			// A missing entry yields the element type's zero. For a
+			// script struct that type has erased to *StructVal, which
+			// cannot say WHICH struct — so reflect.Zero would hand back
+			// a typed nil that panics on the first field access. Untyped
+			// nil is the honest answer: it prints as <nil> and compares
+			// equal to nil. Divergence from Go's zero struct, pinned;
+			// the comma-ok form is exact either way.
+			if rv.Type().Elem() == structValType {
+				return nil, nil
+			}
 			return reflect.Zero(rv.Type().Elem()).Interface(), nil
 		}
 		return out.Interface(), nil
@@ -813,15 +836,14 @@ func (in *Interp) evalDecl(env *Env, ds *ast.DeclStmt) error {
 						return err
 					}
 				case vs.Type != nil:
-					if st, ok := lookupStructType(env, vs.Type); ok {
-						v = st.newZero()
-						break
-					}
-					t, err := in.typeOf(vs.Type)
+					// TypeDesc.Zero covers `var p P` and `var xs []P`
+					// alike: a script struct zeroes to a fresh instance,
+					// a container holding one to reflect's own zero.
+					d, err := in.typeOf(env, vs.Type)
 					if err != nil {
 						return err
 					}
-					v = reflect.Zero(t).Interface()
+					v = d.Zero()
 				default:
 					return in.errAt(name, "declaration needs a type or a value")
 				}

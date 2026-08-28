@@ -372,3 +372,193 @@ func TestFieldWithAnUnresolvableTypeZeroesToNil(t *testing.T) {
 var p P
 fmt.Println(p.Fn == nil, p.Name == "")`, "true true\n")
 }
+
+// ---- script struct types in TYPE position ----
+//
+// A script struct has no reflect.Type of its own, so `[]P` is stored as
+// `[]*StructVal` and TypeDesc.ST carries the identity reflect dropped.
+// These cover what that erasure has to reconstruct.
+
+// make must FILL a struct-element slice: reflect.MakeSlice leaves nil
+// pointers behind, where Go's zero for a struct element is a struct.
+func TestMakeSliceOfStructZeroes(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+	S string
+}
+xs := make([]P, 2)
+fmt.Println(xs[0], xs[1].X)`, "P{X: 0, S: } 0\n")
+	// The element of make([][]P, n) is a SLICE, and a nil slice already
+	// is Go's zero -- so this must NOT be filled with anything.
+	wantOut(t, `type P struct {
+	X int
+}
+g := make([][]P, 2)
+g[1] = append(g[1], P{3})
+fmt.Println(len(g[0]), len(g[1]), g[1][0].X)`, "0 1 3\n")
+	// A map needs no fill at all; a missing key is a separate question.
+	wantOut(t, `type P struct {
+	X int
+}
+m := make(map[string]P)
+m["a"] = P{4}
+fmt.Println(m["a"].X, len(m))`, "4 1\n")
+}
+
+// A struct-typed FIELD now resolves, so its zero is a real nested struct
+// rather than nil. That zero lives on the StructType and is shared by
+// every instance, which is what newZero's copy is for: without it, two
+// zero values of the outer struct would share one inner struct.
+func TestStructTypedFieldZeroIsPerInstance(t *testing.T) {
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+a := Out{}
+b := Out{}
+a.I.N = 7
+fmt.Println(a.I.N, b.I.N)`, "7 0\n")
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+var o Out
+fmt.Println(o)`, "Out{I: In{N: 0}}\n")
+	// make's fill is the caller that RELIES on newZero duplicating the
+	// type's nested zero: it writes each instance straight into the
+	// slice, with no store site in between to isolate it.
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+xs := make([]Out, 2)
+xs[0].I.N = 7
+fmt.Println(xs[0].I.N, xs[1].I.N)`, "7 0\n")
+	// The field's type also drives elision, the same as a []string field.
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+o := Out{I: {5}}
+fmt.Println(o.I.N)`, "5\n")
+}
+
+// A self-referential field is left unresolved rather than looping:
+// declareType defines the name only after every field is resolved, so a
+// field type must already exist and the type graph is a DAG.
+func TestSelfReferentialFieldDoesNotLoop(t *testing.T) {
+	wantOut(t, `type N struct {
+	Next N
+	V    int
+}
+n := N{V: 1}
+fmt.Println(n.V, n.Next == nil)`, "1 true\n")
+}
+
+// Value semantics reach through the new container types: a slice element
+// is a store site on the way IN and a place on the way OUT, exactly as
+// the scalar cases already pinned.
+func TestStructSliceValueSemantics(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+xs := []P{{1}, {2}}
+p := xs[0]
+p.X = 99
+xs[1].X = 5
+for _, e := range xs {
+	e.X = 100
+}
+fmt.Println(xs[0].X, xs[1].X, p.X)`, "1 5 99\n")
+	// A pointer receiver reached through an element must see the element
+	// itself, not a copy. Spelled in the post-transform form, as the
+	// other method cases above are.
+	wantOut(t, `type P struct {
+	X int
+}
+__m_P_Bump := func(p *P) {
+	p.X = p.X + 1
+}
+xs := []P{{1}}
+xs[0].Bump()
+fmt.Println(xs[0].X)`, "2\n")
+}
+
+// A script struct is refused as a map KEY. The erasure makes it a
+// pointer, and a pointer IS comparable -- so reflect.MapOf would build
+// the map happily and then compare identities, making every lookup with
+// a freshly built key miss. A non-comparable key type used to reach
+// reflect.MapOf and surface as an unpositioned internal error; it is a
+// positioned script error now.
+func TestMapKeyTypesRefused(t *testing.T) {
+	wantErr(t, `type P struct {
+	X int
+}
+m := map[P]int{}
+_ = m`, "script struct cannot be a map key")
+	wantErr(t, `m := map[[]int]int{}
+_ = m`, "invalid map key type []int")
+}
+
+// KNOWN DIVERGENCE, pinned.
+//
+// A missing entry in a struct-valued map yields nil, where Go yields the
+// zero struct. The element type has erased to *StructVal, which cannot
+// say WHICH struct, so reflect.Zero would hand back a typed nil that
+// panics on the first field access. Untyped nil is the honest answer,
+// and the comma-ok form is exact either way.
+func TestStructMapMissYieldsNil(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[string]P{"a": {1}}
+v, ok := m["nope"]
+fmt.Println(m["nope"] == nil, v, ok)`, "true <nil> false\n")
+	// A nil element is reachable the same way through a slice, and every
+	// path that could dereference it reports instead of panicking.
+	wantErr(t, `type P struct {
+	X int
+}
+var xs []P
+xs = append(xs, nil)
+fmt.Println(xs)
+fmt.Println(xs[0].X)`, "nil struct has no field X")
+}
+
+// KNOWN DIVERGENCE, pinned.
+//
+// x.(P) is exact -- the declared struct type is compared, not the erased
+// storage type, or every struct would satisfy every assertion. One level
+// up the erasure still shows: []P and []Q are both []*StructVal, and the
+// slice carries no per-element promise to check.
+func TestTypeAssertionOnScriptStruct(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+type Q struct {
+	X int
+}
+var v any = P{1}
+_, okP := v.(P)
+_, okQ := v.(Q)
+z, _ := v.(Q)
+fmt.Println(okP, okQ, z)`, "true false Q{X: 0}\n")
+	// The divergence, stated as a test so it cannot change silently.
+	wantOut(t, `type P struct {
+	X int
+}
+type Q struct {
+	X int
+}
+var v any = []P{{1}}
+_, ok := v.([]Q)
+fmt.Println(ok)`, "true\n")
+}

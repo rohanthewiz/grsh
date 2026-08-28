@@ -286,6 +286,54 @@ _ = p`},
 	}
 }
 
+// BenchmarkStructZero prices what resolving a struct-TYPED field costs at
+// CONSTRUCTION, which is the one place this change adds work.
+//
+// Before script struct types resolved in type position, `In Inner` had no
+// resolvable type, so the field's zero was nil and a literal paid nothing
+// for it. The zero is a real Inner now, and t.Zero is shared by the type,
+// so newZero has to duplicate it -- every Outer literal allocates one
+// level down, whether or not the literal then overwrites the field.
+//
+// That is Go's own order (zero the struct, then assign the fields), and
+// it is what makes `var o Outer` have a usable o.In at all. The flat
+// shape is the control: a struct of scalars still takes the bare copy.
+func BenchmarkStructZero(b *testing.B) {
+	shapes := []struct{ name, body string }{
+		{"flat", `type P struct {
+	X int
+}
+p := P{0}
+for i := 0; i < %d; i++ {
+	p = P{i}
+}
+_ = p`},
+		{"nested", `type In struct {
+	X int
+}
+type Out struct {
+	I In
+}
+p := Out{In{0}}
+for i := 0; i < %d; i++ {
+	p = Out{In{i}}
+}
+_ = p`},
+	}
+	for _, s := range shapes {
+		b.Run(s.name, func(b *testing.B) {
+			in, fset, f := prepScript(b, fmt.Sprintf(s.body, benchIters))
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := in.Run(fset, f); err != nil {
+					b.Fatalf("run: %v", err)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*benchIters), "ns/iter")
+		})
+	}
+}
+
 // BenchmarkNewEnv isolates the cost the loop shapes pay repeatedly: an
 // Env plus its eagerly allocated map. If NewEnv ever grows a lazy map,
 // this is where the saving shows up first.

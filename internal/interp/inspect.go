@@ -48,6 +48,9 @@ func inspectValue(name string, v Value) string {
 	case *Closure:
 		return name + " = " + t.String() + signatureOf(t)
 	case *StructVal:
+		if t == nil {
+			return name + " = nil"
+		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "%s: %s {\n", name, t.Type.Name)
 		w := maxWidth(t.Type.Fields)
@@ -66,7 +69,7 @@ func inspectValue(name string, v Value) string {
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
 		var b strings.Builder
-		fmt.Fprintf(&b, "%s: %T (len %d) [\n", name, v, rv.Len())
+		fmt.Fprintf(&b, "%s: %s (len %d) [\n", name, displayType(v), rv.Len())
 		n := rv.Len()
 		if n > inspectMaxItems {
 			n = inspectMaxItems
@@ -87,7 +90,7 @@ func inspectValue(name string, v Value) string {
 		}
 		sort.Sort(&keySorter{strs, keys})
 		var b strings.Builder
-		fmt.Fprintf(&b, "%s: %T (len %d) {\n", name, v, rv.Len())
+		fmt.Fprintf(&b, "%s: %s (len %d) {\n", name, displayType(v), rv.Len())
 		w := maxWidth(strs)
 		n := len(keys)
 		if n > inspectMaxItems {
@@ -102,7 +105,70 @@ func inspectValue(name string, v Value) string {
 		b.WriteString("}")
 		return b.String()
 	}
-	return fmt.Sprintf("%s: %T = %v", name, v, v)
+	return fmt.Sprintf("%s: %s = %v", name, displayType(v), v)
+}
+
+// displayType names a value's type the way the script spells it.
+//
+// A script struct has no reflect.Type of its own (see TypeDesc), so a
+// []Job arrives here as []*interp.StructVal — grsh's own internals, which
+// a variable view must never print. The name is recovered from an
+// ELEMENT, since every instance carries its StructType; an empty
+// container is the one case where nothing on the value knows, and it
+// falls back to the neutral word.
+//
+// One level of nesting is handled, because that is what the inspector
+// prints a header for. A [][]Job still falls through to %T: deeper
+// shapes are rendered row by row below, where each row is a value that
+// does know its own name.
+func displayType(v Value) string {
+	if sv, ok := v.(*StructVal); ok {
+		if sv == nil {
+			return "struct"
+		}
+		return sv.Type.Name
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		if rv.Type().Elem() == structValType {
+			return "[]" + structNameIn(rv)
+		}
+	case reflect.Map:
+		if rv.Type().Elem() == structValType {
+			return "map[" + rv.Type().Key().String() + "]" + structNameIn(rv)
+		}
+	}
+	return fmt.Sprintf("%T", v)
+}
+
+// structNameIn reads the struct type's name off the first non-nil entry
+// of a container whose element type has erased to *StructVal.
+func structNameIn(rv reflect.Value) string {
+	elems := func(yield func(reflect.Value) bool) {
+		if rv.Kind() == reflect.Map {
+			for _, k := range rv.MapKeys() {
+				if !yield(rv.MapIndex(k)) {
+					return
+				}
+			}
+			return
+		}
+		for i := 0; i < rv.Len(); i++ {
+			if !yield(rv.Index(i)) {
+				return
+			}
+		}
+	}
+	name := "struct"
+	elems(func(e reflect.Value) bool {
+		if sv, ok := e.Interface().(*StructVal); ok && sv != nil {
+			name = sv.Type.Name
+			return false
+		}
+		return true
+	})
+	return name
 }
 
 // signatureOf renders a closure's parameter list from its AST.

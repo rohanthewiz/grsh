@@ -1,0 +1,41 @@
+# Script struct types in TYPE position: slice and map elements, make,
+# struct-typed fields, and the elision that falls out of all three.
+type Item struct {
+    Name  string
+    Count int
+}
+type Order struct {
+    Head  Item
+    Lines []Item
+}
+
+# A slice element type: the inner literals elide their type.
+items := []Item{{"nut", 2}, {"bolt", 5}, Item{"washer", 9}}
+total := 0
+for _, it := range items {
+    total = total + it.Count
+}
+fmt.Println("items:", len(items), "total:", total)
+
+# make fills struct elements with real zeros, not nils.
+blanks := make([]Item, 2)
+blanks[0].Name = "first"
+fmt.Println("blanks:", blanks[0], blanks[1])
+
+# A map value type, keyed the ordinary way.
+byName := map[string]Item{"nut": {"nut", 2}}
+byName["bolt"] = Item{"bolt", 5}
+fmt.Println("map:", byName["nut"].Count, byName["bolt"].Count, len(byName))
+
+# A struct-typed field zeroes to a real struct and elides like any other.
+o := Order{Head: {"crate", 1}, Lines: {{"nut", 2}}}
+fmt.Println("order:", o.Head.Name, o.Lines[0].Count)
+var empty Order
+fmt.Println("zero order:", empty)
+
+# Value semantics hold through the containers: a store copies, a place
+# does not.
+first := items[0]
+first.Count = 99
+items[1].Count = 50
+fmt.Println("copy on store:", items[0].Count, items[1].Count, first.Count)

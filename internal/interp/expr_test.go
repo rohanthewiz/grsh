@@ -345,28 +345,37 @@ p := P{{"x"}}
 fmt.Println(p.Tags[0])`, "x\n")
 }
 
-// KNOWN GAP, pinned as it stands.
+// Elision needs an element type to build against, and ONE position still
+// cannot supply one: []any{{1}}, where an interface element type says
+// nothing about what to construct. Go rejects it for the same reason, so
+// the message says that rather than repeating the generic one.
 //
-// Elision needs an element type to build against, and two positions
-// cannot supply one:
+// `[]P{{1}}` used to be listed here too. It is now the case immediately
+// below: script struct types resolve in TYPE position, so a script struct
+// is an element type like any other.
 //
-//   - []any{{1}} -- an interface element type says nothing about what to
-//     construct. Go rejects this too, for the same reason.
-//   - []P{{1}} where P is a script struct -- typeOf models only native
-//     types, so `[]P` does not resolve as a type at all. This is the
-//     larger gap (script struct types are second-class in TYPE position,
-//     not just in literals); elision inherits it rather than causing it.
-//
-// A bare `{1, 2}` in expression position keeps the original message,
-// because there nothing outside it could ever supply a type.
+// The map-KEY position cannot supply one either, but it is unreachable
+// by a different route -- typeOf refuses the type outright -- so it is
+// tested with the other type-position refusals, not here.
 func TestElisionNeedsATypeToBuildAgainst(t *testing.T) {
 	wantErr(t, `xs := []any{{1}}
 _ = xs`, "not a composite type")
-	wantErr(t, `type P struct {
-	X int
 }
-xs := []P{{1}}
-_ = xs`, "unknown type P")
+
+// Script struct types resolve in TYPE position: as a slice element, a map
+// value, a `var` type, and at any nesting depth. Elision then falls out
+// of it -- []P{{1}} builds a P because P IS the element type, which is
+// the same mechanism [][]int{{1}} already used.
+func TestScriptStructInTypePosition(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+	Y int
+}
+xs := []P{{1, 2}, P{3, 4}}
+m := map[string]P{"a": {5, 6}}
+grid := [][]P{{{7, 8}}}
+var solo P
+fmt.Println(xs[0].X, xs[1].Y, m["a"].X, grid[0][0].Y, solo.X)`, "1 4 5 8 0\n")
 }
 
 // ---- type assertions ----

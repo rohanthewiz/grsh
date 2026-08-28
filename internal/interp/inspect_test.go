@@ -344,3 +344,44 @@ func assertRowsWithinBudget(t *testing.T, got string) {
 		}
 	}
 }
+
+// A container of script structs must not print grsh's own internals.
+// []P is stored as []*interp.StructVal, so %T would leak the erasure
+// into the one surface whose whole job is describing a value.
+func TestInspectNamesScriptStructContainers(t *testing.T) {
+	got := inspect(t, `type Job struct {
+	Name string
+}
+xs := []Job{{"a"}, {"b"}}`, "xs")
+	if !strings.HasPrefix(got, "xs: []Job (len 2) [") {
+		t.Errorf("slice header = %q, want a []Job header", firstLine(got))
+	}
+	got = inspect(t, `type Job struct {
+	Name string
+}
+m := map[string]Job{"k": {"a"}}`, "m")
+	if !strings.HasPrefix(got, "m: map[string]Job (len 1) {") {
+		t.Errorf("map header = %q, want a map[string]Job header", firstLine(got))
+	}
+	// An EMPTY container has no element to read the name off, which is
+	// the one case the neutral word is for.
+	got = inspect(t, `type Job struct {
+	Name string
+}
+xs := []Job{}`, "xs")
+	if !strings.HasPrefix(got, "xs: []struct (len 0) [") {
+		t.Errorf("empty slice header = %q, want the neutral []struct", firstLine(got))
+	}
+	// Nothing else moved: a native container still renders through %T.
+	got = inspect(t, `xs := []int{1}`, "xs")
+	if !strings.HasPrefix(got, "xs: []int (len 1) [") {
+		t.Errorf("native slice header = %q", firstLine(got))
+	}
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}

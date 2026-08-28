@@ -1,0 +1,6 @@
+items: 3 total: 16
+blanks: Item{Name: first, Count: 0} Item{Name: , Count: 0}
+map: 2 5 2
+order: crate 2
+zero order: Order{Head: Item{Name: , Count: 0}, Lines: []}
+copy on store: 2 50 99
