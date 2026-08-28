@@ -185,13 +185,13 @@ func (k StructKey) structVal() *StructVal {
 // struct's fields all nil rather than panicking, which is the same answer
 // the field loop would give for an array of nil interfaces.
 func decodeKeyArr(t *StructType, arr reflect.Value) *StructVal {
-	vals := make([]Value, len(t.Fields))
+	sv := newStructVal(t, len(t.Fields))
 	if arr.IsValid() {
-		for i := range vals {
-			vals[i] = fromKeyValue(arr.Index(i).Interface())
+		for i := range sv.Vals {
+			sv.Vals[i] = fromKeyValue(arr.Index(i).Interface())
 		}
 	}
-	return &StructVal{Type: t, Vals: vals}
+	return sv
 }
 
 // keyArrFanout is the field count up to which structKeyOf builds the key
@@ -389,6 +389,167 @@ type StructVal struct {
 	Vals []Value
 }
 
+// valBlock fuses a StructVal with the backing array of its Vals slice, so
+// that building one instance costs ONE allocation instead of two.
+//
+// A is always a [N]Value. It is a type parameter only because N cannot be
+// one: an array's length is part of its type, and Go has no way to name a
+// type whose length is a variable. Instantiating it per length at the use
+// site is what lets the array be sliced -- inside a generic function
+// `vals[:]` would not compile, but at each case below A is concrete.
+//
+// sv sits at offset 0, so the pointer handed back is the block's own base
+// pointer and Vals points just past it, into the same object. That is an
+// ordinary interior pointer: it keeps the block alive exactly as long as
+// the StructVal is reachable, which is the lifetime it had anyway when
+// the two were separate objects.
+type valBlock[A any] struct {
+	sv   StructVal
+	vals A
+}
+
+// valBlockFanout is the field count up to which newStructVal fuses, and
+// it is the enumeration's CONTRACT rather than an input to it: the cases
+// below are written out one per length, and
+// TestStructValFusesUpToTheFanout walks 1..valBlockFanout asserting each
+// one actually costs a single allocation. Raise the constant without
+// adding a case and that test fails, which is the only way the two can be
+// kept in step -- nothing in the switch itself can see the constant.
+//
+// It is a threshold for keyArrFanout's reason one level along: an
+// enumeration is the only way to name a fixed-size array whose length is
+// chosen at runtime. Every length past the last case falls through to the
+// two-allocation form, which is correct for any length, so the constant
+// moves in the safe direction only for SPEED.
+//
+// WHERE IT IS SET. Fused against unfused at every arity, both in one
+// binary so they share a code layout and an allocator, minimum of five
+// runs at a fixed iteration count, Apple M3. Bytes are identical on both
+// paths at every arity -- a StructVal is 32 bytes and 32+16n lands in the
+// same size class as 32 and 16n did apart -- so the whole difference is
+// one trip through the allocator:
+//
+//	fields     1     2     4     6     8    10    12    14    16
+//	saved   6.6   9.8  10.2   5.5  14.2   6.9   9.3   4.1  11.0  ns
+//
+// There is no crossover to look for and no per-call tax to trade against:
+// unlike keyArrFanout, whose cases share one buffer that every call zeroes
+// whole, the cases here are independent and the switch compiles to a jump
+// table. So the only cost of a case is BINARY SIZE, and cases 9 through 16
+// cost 976 bytes together -- 0.009% -- while buying the ten-field key
+// decode 19.8% (95.1ns to 76.3ns). The one-field decode did not move
+// (29.8ns to 30.2ns, inside the noise), which is the measurement that says
+// the extra cases are free to the arities scripts actually write.
+//
+// 16 is where it stops for want of a reason to go further, not for a cost:
+// a script struct with seventeen fields is rare enough that ~122 bytes of
+// binary each is no longer obviously worth it.
+const valBlockFanout = 16
+
+// newStructVal returns a *StructVal with n field slots, all nil.
+//
+// The two-allocation form it replaces -- make([]Value, n) then
+// &StructVal{} -- is what every construction of a script struct used to
+// pay: newZero on every literal and every make() element, copyStruct on
+// every store, and decodeKeyArr on every key a range loop yields. The
+// fused block costs the SAME BYTES (a StructVal is 32 bytes and lands in
+// the same size class fused as the two did apart, at every arity here)
+// and one fewer trip through the allocator.
+//
+// n is passed rather than read off t.Fields because copyStruct sizes
+// itself from the INSTANCE: a malformed value with more Vals than its
+// type has fields is copied as it is, not silently truncated.
+//
+// WHAT A SCRIPT FEELS, two interleaved builds differing only in this
+// function, six runs each, and note that the shapes divide cleanly by
+// whether their loop BUILDS a struct at all:
+//
+//	StructZero/nested       -11.1%   allocs -25.3%
+//	StructCopy/nested        -8.9%   allocs -20.2%
+//	StructZero/flat          -6.6%   allocs -15.7%
+//	StructCopy/flat          -5.7%   allocs -12.7%
+//	range-slice-struct       -3.5%   allocs  -8.9%
+//	range-map-key-struct     -3.4%   allocs -10.5%
+//	map-miss-struct          -2.2%   allocs  -7.3%
+//	map-hit-struct           +0.4%   allocs   ~0
+//	slice-index-struct       +0.4%   allocs   ~0
+//
+// The two that got slower construct nothing in their loops -- they read
+// fields out of structs that already exist, and their allocation counts
+// did not move -- so that 0.4% is code layout, not this change.
+func newStructVal(t *StructType, n int) *StructVal {
+	// Each case RETURNS, so the fallthrough below covers every length
+	// without a case -- including 0, which needs no fusing: a zero-length
+	// make allocates nothing, so that shape already costs one allocation.
+	switch n {
+	case 1:
+		b := &valBlock[[1]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 2:
+		b := &valBlock[[2]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 3:
+		b := &valBlock[[3]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 4:
+		b := &valBlock[[4]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 5:
+		b := &valBlock[[5]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 6:
+		b := &valBlock[[6]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 7:
+		b := &valBlock[[7]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 8:
+		b := &valBlock[[8]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 9:
+		b := &valBlock[[9]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 10:
+		b := &valBlock[[10]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 11:
+		b := &valBlock[[11]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 12:
+		b := &valBlock[[12]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 13:
+		b := &valBlock[[13]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 14:
+		b := &valBlock[[14]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 15:
+		b := &valBlock[[15]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	case 16:
+		b := &valBlock[[16]Value]{sv: StructVal{Type: t}}
+		b.sv.Vals = b.vals[:]
+		return &b.sv
+	}
+	return &StructVal{Type: t, Vals: make([]Value, n)}
+}
+
 func (sv *StructVal) String() string {
 	// A nil instance is reachable now that []P exists: append(xs, nil)
 	// converts nil to a typed nil element. Print it rather than panic
@@ -489,16 +650,16 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 // The flag keeps the loop off the common path, and copyStruct's descent
 // terminates for the reason declareType records: the type graph is a DAG.
 func (t *StructType) newZero() *StructVal {
-	vals := make([]Value, len(t.Fields))
-	copy(vals, t.Zero)
+	out := newStructVal(t, len(t.Fields))
+	copy(out.Vals, t.Zero)
 	if t.structFields {
-		for i, v := range vals {
+		for i, v := range out.Vals {
 			if sv, ok := v.(*StructVal); ok {
-				vals[i] = sv.copyStruct()
+				out.Vals[i] = sv.copyStruct()
 			}
 		}
 	}
-	return &StructVal{Type: t, Vals: vals}
+	return out
 }
 
 // structComposite builds Point{X: 1} or Point{1, 2}.
@@ -597,11 +758,11 @@ func copyOnStoreAll(vs []Value) {
 // caller: a method with a value receiver could reach through one and
 // mutate the instance it was supposed to be insulated from.
 func (sv *StructVal) copyStruct() *StructVal {
-	vals := make([]Value, len(sv.Vals))
+	out := newStructVal(sv.Type, len(sv.Vals))
 	for i, v := range sv.Vals {
-		vals[i] = copyOnStore(v)
+		out.Vals[i] = copyOnStore(v)
 	}
-	return &StructVal{Type: sv.Type, Vals: vals}
+	return out
 }
 
 // structEqual is `a == b` for two script structs, compared FIELD-WISE the

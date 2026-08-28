@@ -1552,3 +1552,101 @@ func TestKeyEncodingAcceptsAShortInstance(t *testing.T) {
 		}
 	}
 }
+
+// TestStructValFusesUpToTheFanout is what keeps valBlockFanout honest.
+//
+// The enumeration in newStructVal cannot see the constant -- the cases
+// are written out one per length, because an array length cannot be a
+// variable -- so nothing but this test stops the two from drifting. A
+// constant raised without a case would silently put those arities back on
+// the two-allocation path and cost nothing visible; here it fails.
+//
+// The assertion is on ALLOCATION COUNT rather than on time, because the
+// count is what the fusing is: same bytes, one object instead of two.
+func TestStructValFusesUpToTheFanout(t *testing.T) {
+	for n := 1; n <= valBlockFanout; n++ {
+		st := &StructType{Name: "P", Fields: make([]string, n)}
+		var sink *StructVal
+		got := testing.AllocsPerRun(200, func() {
+			sink = newStructVal(st, n)
+		})
+		if got != 1 {
+			t.Errorf("newStructVal(%d fields) allocates %.0f times, want 1: valBlockFanout is %d but the switch has no case for this length", n, got, valBlockFanout)
+		}
+		if sink == nil || len(sink.Vals) != n || cap(sink.Vals) != n {
+			t.Errorf("newStructVal(%d fields) gave Vals len %d cap %d, want %d and %d", n, len(sink.Vals), cap(sink.Vals), n, n)
+		}
+	}
+}
+
+// TestStructValsDoNotShareABlock is the hazard the fusing introduces and
+// has to be shown not to have.
+//
+// Vals now points INTO the same object as the StructVal it belongs to, so
+// a mistake in the enumeration -- a case slicing the wrong block, or two
+// instances handed the same one -- would make two script structs share
+// their fields, and every test that writes one field and reads it back on
+// the same instance would still pass. This writes through one and reads
+// the other.
+func TestStructValsDoNotShareABlock(t *testing.T) {
+	for n := 1; n <= valBlockFanout+2; n++ { // +2 to cover the fallthrough
+		st := &StructType{Name: "P", Fields: make([]string, n)}
+		a, b := newStructVal(st, n), newStructVal(st, n)
+		for i := range a.Vals {
+			a.Vals[i] = i + 1
+		}
+		for i, v := range b.Vals {
+			if v != nil {
+				t.Fatalf("%d fields: writing one instance set slot %d of another to %v; the two share a block", n, i, v)
+			}
+		}
+	}
+}
+
+// TestFusedStructValSurvivesGC forces a collection while only the
+// StructVal pointer is held.
+//
+// &b.sv is the block's base pointer, so the block stays reachable through
+// it -- but the fields live PAST that pointer, and a layout the collector
+// read differently (a block whose sv were not at offset 0, say) would let
+// them be swept while the struct is still live. Values are heap strings
+// rather than small ints so a freed slot shows up as garbage rather than
+// as a still-valid small-int box.
+func TestFusedStructValSurvivesGC(t *testing.T) {
+	const n = 6
+	st := &StructType{Name: "P", Fields: make([]string, n)}
+	sv := newStructVal(st, n)
+	for i := range sv.Vals {
+		sv.Vals[i] = fmt.Sprintf("field-%d-%s", i, strings.Repeat("x", 32))
+	}
+	runtime.GC()
+	runtime.GC()
+	for i, v := range sv.Vals {
+		want := fmt.Sprintf("field-%d-%s", i, strings.Repeat("x", 32))
+		if v != want {
+			t.Fatalf("slot %d is %q after GC, want %q", i, v, want)
+		}
+	}
+}
+
+// TestCopyStructSizesFromTheInstance pins the reason newStructVal takes
+// an n rather than reading t.Fields.
+//
+// copyStruct is the one constructor whose length comes from the VALUE:
+// an instance carrying more Vals than its type has fields is malformed,
+// and the copy has to reproduce it rather than truncate it -- truncating
+// would turn a detectable bad value into a plausible good one, and
+// structKeyOf's oversize check (which panics on exactly this shape) would
+// then never see it.
+func TestCopyStructSizesFromTheInstance(t *testing.T) {
+	st := declare(t, "type P struct {\n\tA int\n}", "P")
+	sv := &StructVal{Type: st, Vals: []Value{1, 2, 3}}
+	got := sv.copyStruct()
+	if len(got.Vals) != 3 {
+		t.Fatalf("copying a 3-Val instance of a 1-field type gave %d Vals, want 3", len(got.Vals))
+	}
+	got.Vals[0] = 9
+	if sv.Vals[0] != 1 {
+		t.Fatal("the copy shares its Vals with the original")
+	}
+}
