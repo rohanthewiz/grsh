@@ -512,6 +512,38 @@ for i := 0; i < %d/4; i++ {
 	}
 }
 _ = n`},
+		// The DECODE counterpart to map-key-struct-hit-10, and the only
+		// shape in this file whose cost is dominated by reading a key
+		// back rather than by building one. Decoding is per-field work
+		// and the one-field shape above cannot show that: a change to
+		// the per-field cost moves this by several times what it moves
+		// its narrow neighbour, which is the difference between a slope
+		// and a number.
+		{"range-map-key-struct-10", `type P struct {
+	A int
+	B int
+	C int
+	D int
+	E int
+	F int
+	G int
+	H int
+	I int
+	J int
+}
+m := map[P]int{
+	{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}: 1,
+	{2, 2, 3, 4, 5, 6, 7, 8, 9, 10}: 2,
+	{3, 2, 3, 4, 5, 6, 7, 8, 9, 10}: 3,
+	{4, 2, 3, 4, 5, 6, 7, 8, 9, 10}: 4,
+}
+n := 0
+for i := 0; i < %d/4; i++ {
+	for k := range m {
+		n = k.A
+	}
+}
+_ = n`},
 	}
 	for _, s := range shapes {
 		b.Run(s.name, func(b *testing.B) {

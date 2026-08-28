@@ -1411,7 +1411,7 @@ func TestWideKeysSurviveGC(t *testing.T) {
 		// Decoding reads the array THROUGH the box, which is what a
 		// range loop does, so a data word pointing somewhere stale shows
 		// as the wrong fields rather than as an inequality.
-		if got := decodeKeyArr(k.T, reflect.ValueOf(k.F)); got.String() != sv.String() {
+		if got := decodeKeyArr(k.T, k.F); got.String() != sv.String() {
 			t.Fatalf("key %d decodes to %s, want %s", i, got, sv)
 		}
 	}
@@ -1479,6 +1479,105 @@ func TestKeyArrayBoxAliasesRatherThanCopies(t *testing.T) {
 		if got := reflect.ValueOf(boxed).Index(0).Interface(); got != any("changed") {
 			t.Errorf("%d: the box copied the array instead of aliasing it", n)
 		}
+	}
+}
+
+// decodeKeyArr reads the key's fields through an alias rather than
+// through reflect, and an alias cannot bounds-check. What stands in for
+// the bounds check is the type word: an array type's LENGTH is part of
+// its identity, so comparing the box's type word against the one cached
+// in keyArrZero settles length and element type in one pointer compare.
+//
+// The wrong-length case here is deliberately a LONGER array, so that
+// both answers are defined: with the guard the fields come back nil,
+// without it they come back 1, 2, 3. A shorter array would distinguish
+// the two only by reading past the end, which is the thing being
+// prevented and not a thing to demonstrate.
+//
+// The element type is checked the same way and cannot be probed the same
+// way -- reading a [3]int as three interface words is exactly the misread
+// the guard exists to stop -- so what this asserts about it is that the
+// two type words differ, which is what the compare acts on.
+func TestDecodeGuardsOnTheKeyArrayType(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+	C int
+}`, "P")
+
+	// The positive case first: a real key must still decode, or every
+	// assertion below would pass for the wrong reason.
+	k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{1, 2, 3}})
+	if err != nil {
+		t.Fatalf("encoding: %v", err)
+	}
+	if got := decodeKeyArr(st, k.F).String(); got != "P{A: 1, B: 2, C: 3}" {
+		t.Fatalf("a genuine key decoded to %s; the guard rejects what it must accept", got)
+	}
+
+	allNil := func(name string, a any) {
+		t.Helper()
+		sv := decodeKeyArr(st, a)
+		if sv == nil || len(sv.Vals) != len(st.Fields) {
+			t.Fatalf("%s: decoded to %v, want a %d-field struct", name, sv, len(st.Fields))
+		}
+		for i, v := range sv.Vals {
+			if v != nil {
+				t.Errorf("%s: field %d is %v, want nil -- the guard let a foreign array through", name, i, v)
+			}
+		}
+	}
+	// The reachable case: the zero StructKey, which `m[nil] = 1` puts in
+	// a map, carries a nil F whose type word is nil.
+	allNil("a nil field array", nil)
+	// An array of the right element type and the wrong length.
+	allNil("a [5]any", [5]any{1, 2, 3, 4, 5})
+
+	intTyp, _ := unboxKeyArr([3]int{1, 2, 3})
+	keyTyp, _ := unboxKeyArr(st.keyArrZero)
+	if intTyp == keyTyp {
+		t.Error("[3]int and [3]any share a type word; the guard cannot tell element types apart")
+	}
+}
+
+// The decoded struct must own its values, and the alias is what makes
+// that worth pinning: decodeKeyArr now reads the words of the key sitting
+// INSIDE the map, so a version that passed those words on by reference
+// rather than copying them out would hand a script a window into the
+// map's own memory. Mutating a range variable would then change the key
+// a live entry is hashed under, and the entry would become unfindable by
+// the value it was stored with.
+//
+// TestStructMapKeysComeBack says the same thing from a script; this says
+// it against the map key itself, where a shared backing array is visible
+// directly rather than only through its consequences.
+func TestDecodedKeyDoesNotAliasTheMapKey(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{1, 2}})
+	if err != nil {
+		t.Fatalf("encoding: %v", err)
+	}
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(7))
+	// From MapKeys, not from intoKeyStore: a key read out of the map is
+	// the one a range loop yields, and it is the map's own memory.
+	inMap := mp.MapKeys()[0]
+
+	first := decodeMintedKey(inMap)
+	first.Vals[0] = 99
+
+	second := decodeMintedKey(inMap)
+	if got := second.String(); got != "P{A: 1, B: 2}" {
+		t.Errorf("after writing to a decoded key, the next decode reads %s; the decode aliases the map's key", got)
+	}
+	if &first.Vals[0] == &second.Vals[0] {
+		t.Error("two decodes of one key share a backing array")
+	}
+	if got := mp.MapIndex(intoKeyStore(k, st.keyT)); !got.IsValid() || got.Int() != 7 {
+		t.Errorf("the entry is no longer findable by the key it was stored with (%v)", got)
 	}
 }
 

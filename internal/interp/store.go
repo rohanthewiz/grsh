@@ -411,8 +411,8 @@ func zeroInSlot(t reflect.Type) Value {
 // lifting the whole StructKey out with Interface(). A three-word struct
 // does not fit in an interface word, so boxing one out of an ADDRESSABLE
 // field copies it to the heap first; reading the fields separately never
-// does, because a pointer unboxes for free and Elem() reads the field
-// array out of its `any` field in place.
+// does, because a pointer unboxes for free and the field array comes out
+// of its `any` field as the two words already sitting there.
 func decodeMintedKey(rv reflect.Value) *StructVal {
 	// Two hops, like fromStore: the minted type embeds the carrier, the
 	// carrier holds the encoding.
@@ -423,7 +423,12 @@ func decodeMintedKey(rv reflect.Value) *StructVal {
 		// answers a typed nil for it and so must this.
 		return nil
 	}
-	return decodeKeyArr(t, sk.Field(1).Elem())
+	// Interface() on an interface-kind Value is not the boxing case: it
+	// hands back the eface already in the field rather than building a
+	// new one, so this costs a two-word load and the array is not copied.
+	// It is what lets decodeKeyArr take a plain `any` and so serve this
+	// path and StructKey.structVal from one body.
+	return decodeKeyArr(t, sk.Field(1).Interface())
 }
 
 // intoStore wraps a script struct for a container slot of minted type mt.
@@ -500,6 +505,26 @@ func boxKeyArr(zero any, p unsafe.Pointer) any {
 	return *(*any)(unsafe.Pointer(&e))
 }
 
+// unboxKeyArr takes a boxed [N]any apart into the two words an interface
+// is made of: the type word that says WHICH [N]any it is, and a pointer
+// to the array itself. Nothing is copied, and nothing is written.
+//
+// It is boxKeyArr's inverse, and it exists for the decode side of the
+// same problem. reflect can read the array back -- arr.Index(i) then
+// Interface() -- but it pays a Value construction and a call per field,
+// ~5.5ns each, where reading the words directly is a load and a store.
+// See decodeKeyArr for the measurement and for what the type word is
+// then used for.
+//
+// The read is safe in a way boxKeyArr's write is not: it produces no new
+// reference the collector has to be told about, so there is no write
+// barrier to skip. What it DOES claim is the layout -- two words, type
+// then data -- and mintKeyArrZero probes exactly that at declaration.
+func unboxKeyArr(a any) (typ, data unsafe.Pointer) {
+	e := *(*eface)(unsafe.Pointer(&a))
+	return e.typ, e.data
+}
+
 // mintKeyArrZero returns the boxed zero of arr for boxKeyArr to borrow a
 // type word from, having first confirmed on this very type that the
 // borrow works.
@@ -509,6 +534,11 @@ func boxKeyArr(zero any, p unsafe.Pointer) any {
 // data word is wrong, or if an interface ever stops being two words in
 // this order. It runs once per declared struct, on the declaration path,
 // which is cold.
+//
+// It probes the DECODE direction on the same box, because unboxKeyArr
+// makes the same claim about the same layout and decodeKeyArr reads a
+// live map key through it. Checking both here means one failing check
+// wherever the claim stops holding, rather than a silent misread.
 func mintKeyArrZero(arr reflect.Type) any {
 	zero := reflect.Zero(arr).Interface()
 	probe := reflect.New(arr)
@@ -522,6 +552,17 @@ func mintKeyArrZero(arr reflect.Type) any {
 	}
 	if arr.Len() > 0 && reflect.ValueOf(boxed).Index(0).Interface() != any(mark) {
 		panic("grsh: aliasing a " + arr.String() + " did not read back the array it was given; boxKeyArr's view of an interface is wrong")
+	}
+	// The way back. decodeKeyArr identifies a key's array by comparing
+	// its type word against the one carried here, so the two boxes must
+	// agree on that word, and it then reads the fields straight off the
+	// data word.
+	typ, data := unboxKeyArr(boxed)
+	if zeroTyp, _ := unboxKeyArr(zero); typ != zeroTyp {
+		panic("grsh: unboxing a " + arr.String() + " did not recover the type word it was boxed with; unboxKeyArr's view of an interface is wrong")
+	}
+	if arr.Len() > 0 && unsafe.Slice((*any)(data), arr.Len())[0] != any(mark) {
+		panic("grsh: unboxing a " + arr.String() + " did not read back the array it was given; unboxKeyArr's view of an interface is wrong")
 	}
 	return zero
 }
