@@ -492,18 +492,16 @@ xs[0].Bump()
 fmt.Println(xs[0].X)`, "2\n")
 }
 
-// A script struct is refused as a map KEY. The erasure makes it a
-// pointer, and a pointer IS comparable -- so reflect.MapOf would build
-// the map happily and then compare identities, making every lookup with
-// a freshly built key miss. A non-comparable key type used to reach
-// reflect.MapOf and surface as an unpositioned internal error; it is a
-// positioned script error now.
+// A key type Go itself would refuse is refused here, with the same
+// verdict `==` uses so the two answers cannot drift apart. A
+// non-comparable key type used to reach reflect.MapOf and surface as an
+// unpositioned internal error; it is a positioned script error now.
 func TestMapKeyTypesRefused(t *testing.T) {
 	wantErr(t, `type P struct {
-	X int
+	Tags []string
 }
 m := map[P]int{}
-_ = m`, "script struct cannot be a map key")
+_ = m`, "invalid map key type P: field Tags has type []string")
 	wantErr(t, `m := map[[]int]int{}
 _ = m`, "invalid map key type []int")
 }
@@ -729,4 +727,258 @@ fmt.Println(P{[]int{1}} == P{[]int{1}})`, "cannot compare a field holding []int"
 	wantOut(t, `xs := []int{1}
 ys := []int{1}
 fmt.Println(xs == ys)`, "false\n")
+}
+
+// ---- struct map keys ----
+//
+// A struct key does not go into the map as itself: reflect.Map hashes
+// with Go's own equality, which would compare the erased *StructVal
+// POINTERS. It is encoded to a StructKey on the way in and decoded back
+// on the way out, and these cover both directions.
+
+func TestStructMapKeys(t *testing.T) {
+	// The case the erasure used to make impossible: a lookup with a
+	// FRESHLY BUILT key, which shares no identity with the stored one.
+	wantOut(t, `type P struct {
+	X int
+	S string
+}
+m := map[P]int{}
+m[P{1, "a"}] = 10
+m[P{2, "b"}] = 20
+fmt.Println(m[P{1, "a"}], m[P{2, "b"}], len(m))`, "10 20 2\n")
+	// A copy is a different instance and still finds its entry.
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[P]int{{1}: 10}
+k := P{1}
+k2 := k
+fmt.Println(m[k2])`, "10\n")
+	// A key literal elides its type, as Go's does.
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[P]string{P{1}: "one", {2}: "two"}
+fmt.Println(m[P{1}], m[P{2}], len(m))`, "one two 2\n")
+	// delete and the comma-ok read take the same encoding path.
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[P]int{{1}: 10, {2}: 20}
+delete(m, P{1})
+v, ok := m[P{1}]
+w, ok2 := m[P{2}]
+fmt.Println(len(m), v, ok, w, ok2)`, "1 0 false 20 true\n")
+	// A struct on BOTH sides: the key erases to StructKey, the value to
+	// *StructVal, and one descriptor carries both leaves.
+	wantOut(t, `type P struct {
+	X int
+}
+type Q struct {
+	Y int
+}
+m := map[P]Q{}
+m[P{1}] = Q{9}
+fmt.Println(m[P{1}].Y, len(m), m[P{2}])`, "9 1 <nil>\n")
+	// make and a nil map behave like any other map.
+	wantOut(t, `type P struct {
+	X int
+}
+m := make(map[P]int, 4)
+m[P{1}] = 1
+var n map[P]int
+fmt.Println(len(m), len(n), n[P{1}])`, "1 0 0\n")
+}
+
+// The key travels BACK: range yields the script's own struct, not the
+// storage, and printing renders it the same way.
+func TestStructMapKeysComeBack(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[P]int{{2}: 20, {1}: 10}
+for k, v := range m {
+	fmt.Println(k.X, v, k)
+}`, "1 10 P{X: 1}\n2 20 P{X: 2}\n")
+	wantOut(t, `type P struct {
+	X int
+	S string
+}
+m := map[P]int{{1, "a"}: 10}
+fmt.Println(m)`, "map[P{X: 1, S: a}:10]\n")
+	// The rebuilt key is FRESH each iteration, so writing to the range
+	// variable cannot reach the key inside the map and corrupt its
+	// hashing.
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[P]int{{1}: 10}
+for k := range m {
+	k.X = 99
+}
+fmt.Println(m[P{1}], len(m))`, "10 1\n")
+}
+
+// Identity is part of the key, so two struct types never collide however
+// alike their fields are -- the same answer `==` gives.
+func TestStructMapKeysDoNotCollideAcrossTypes(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+type Q struct {
+	X int
+}
+m := map[P]int{{1}: 10}
+fmt.Println(m[Q{1}], len(m))`, "0 1\n")
+}
+
+// A nested struct FIELD is encoded recursively -- without that it would
+// sit in the key as a *StructVal and be compared by identity again, one
+// level deeper.
+func TestStructMapKeysNestedField(t *testing.T) {
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+	T string
+}
+m := map[Out]int{}
+m[Out{In{1}, "a"}] = 7
+fmt.Println(m[Out{In{1}, "a"}], m[Out{In{2}, "a"}], m)`,
+		"7 0 map[Out{I: In{N: 1}, T: a}:7]\n")
+}
+
+// A field declared `any` is statically comparable and dynamically
+// anything -- Go's own runtime-panic case. Values that ARE comparable
+// work, including different dynamic types under the same field; one that
+// is not reports instead of panicking inside the map's hash.
+func TestStructMapKeysDynamicField(t *testing.T) {
+	wantOut(t, `type P struct {
+	V any
+}
+m := map[P]int{{1}: 10, {"a"}: 20}
+fmt.Println(m[P{1}], m[P{"a"}], len(m))`, "10 20 2\n")
+	wantErr(t, `type P struct {
+	V any
+}
+m := map[P]int{}
+m[P{[]int{1}}] = 1`, "cannot use []int as part of a map key")
+}
+
+// KNOWN DIVERGENCE, pinned.
+//
+// TypeDesc carries ONE key leaf, so a map nested inside another container
+// arrives knowing its key is a struct but not WHICH. Only ELISION is
+// lost; naming the type works, and so does the map itself.
+func TestStructMapKeyElisionNeedsTheTypeWhenNested(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+xs := []map[P]int{{P{1}: 2}}
+fmt.Println(xs[0][P{1}])`, "2\n")
+	wantErr(t, `type P struct {
+	X int
+}
+xs := []map[P]int{{{1}: 2}}
+_ = xs`, "a struct map key must name its type here")
+}
+
+// KNOWN DIVERGENCE, pinned.
+//
+// nil is a usable struct key, where Go rejects `m[nil]` for a struct key
+// type outright. grsh has real typed-nil structs (append(xs, nil) makes
+// one), so the zero StructKey is their honest encoding and nil finds nil.
+func TestStructMapKeyNil(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+m := map[P]int{}
+m[nil] = 5
+fmt.Println(m[nil], len(m), m)`, "5 1 map[<nil>:5]\n")
+}
+
+// The inspector reads the key's name off a KEY for the same reason it
+// reads the element's off an element: every script struct erases to the
+// one StructKey type, so only an instance knows which struct it was.
+func TestInspectStructKeyedMap(t *testing.T) {
+	got := inspect(t, `type P struct {
+	X int
+}
+type Q struct {
+	Y int
+}
+g := map[P]Q{{1}: {2}}`, "g")
+	for _, want := range []string{"map[P]Q", "P{X: 1}: Q{Y: 2}"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("inspect = %q, want it to contain %q", got, want)
+		}
+	}
+	// An empty map has no key to read the name off, so it falls back to
+	// the neutral word rather than printing grsh's own StructKey.
+	if got := inspect(t, `type P struct {
+	X int
+}
+g := map[P]int{}`, "g"); !strings.Contains(got, "map[struct]int") {
+		t.Errorf("inspect of an empty struct-keyed map = %q", got)
+	}
+}
+
+// A typed nil struct is a usable key too, and it reaches the encoder
+// where a bare `m[nil]` does not: convertTo answers an untyped nil with
+// the key type's ZERO and never calls it. Both routes must agree, or a
+// nil stored one way would be invisible to the other.
+func TestStructMapKeyTypedNil(t *testing.T) {
+	wantOut(t, `type P struct {
+	X int
+}
+var xs []P
+xs = append(xs, nil)
+m := map[P]int{}
+m[xs[0]] = 5
+fmt.Println(m[nil], m[xs[0]], len(m))`, "5 5 1\n")
+}
+
+// The decode has to run at every DEPTH, not only at the top: a nested
+// struct field went into the key as its own StructKey, and a range
+// variable whose .I is still one of those is not a struct the script can
+// use.
+func TestStructMapKeyNestedFieldComesBack(t *testing.T) {
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+m := map[Out]int{{In{7}}: 1}
+for k := range m {
+	fmt.Println(k.I.N, k.I, k)
+}`, "7 In{N: 7} Out{I: In{N: 7}}\n")
+}
+
+// The erasure must not reach a script-facing message, at any of the three
+// places that render a type: the key of a map that IS one, a map type
+// whose key struct the descriptor still names, and one whose key struct
+// it no longer can.
+func TestStructKeyTypeNamesInMessages(t *testing.T) {
+	// convertTo sees only the storage type and says the neutral word.
+	wantErr(t, `type P struct {
+	X int
+}
+m := map[P]int{}
+m[5] = 1`, "cannot use 5 (int) as struct")
+	// The descriptor still holds KT here, so it names P.
+	wantErr(t, `type P struct {
+	X int
+}
+m := map[map[P]int]string{}
+_ = m`, "invalid map key type map[P]int")
+	// Elem dropped KT on the way through the slice, so the struct cannot
+	// be named -- but it still must not print as interp.StructKey.
+	wantErr(t, `type P struct {
+	X int
+}
+m := map[[]map[P]int]string{}
+_ = m`, "invalid map key type []map[struct]int")
 }

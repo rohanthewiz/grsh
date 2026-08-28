@@ -5,6 +5,8 @@ import (
 	"go/ast"
 	"reflect"
 	"strings"
+
+	"github.com/rohanthewiz/serr"
 )
 
 // StructType is a script-declared struct type. Field types are advisory
@@ -28,6 +30,12 @@ type StructType struct {
 	// duplicated in newZero rather than aliased — and the flag keeps the
 	// ordinary all-scalar struct out of that loop entirely.
 	structFields bool
+
+	// keyArr is the [len(Fields)]any array type a value of this struct
+	// encodes into when it is used as a MAP KEY -- see StructKey. It is
+	// built once at declaration rather than on demand, so nothing mutates
+	// a StructType after env.Define publishes it.
+	keyArr reflect.Type
 
 	// noCmp names the field that makes this type incomparable, or is nil
 	// when == is allowed. Go decides comparability from the STATIC field
@@ -88,6 +96,126 @@ func compareDefect(name string, d TypeDesc, e ast.Expr) *cmpDefect {
 		return &cmpDefect{Path: name, Type: d.String()}
 	}
 	return nil
+}
+
+// StructKey is the comparable stand-in a script struct becomes when it
+// crosses into a map's KEY position.
+//
+// The interpreter owns the == operator and made it field-wise, but it
+// does NOT own the map: reflect.Map hashes and compares keys with Go's
+// own runtime equality, which this package cannot reach into. A map keyed
+// on the erased *StructVal would therefore compare POINTERS, and every
+// lookup made with a freshly built key would miss. The fix is not to
+// teach the map about structs -- it is to hand it a key whose Go-native
+// equality is already the answer we want.
+//
+//	T   the struct type, so P{1} and Q{1} never collide
+//	F   a [len(T.Fields)]any ARRAY of the field values, which Go compares
+//	    element-wise, recursively, exactly as structEqual does
+//
+// An array rather than an encoded string, because the key has to travel
+// BACK: `range m` yields keys, and the script must get its P returned,
+// not grsh's storage. Holding the values as themselves makes the return
+// trip a copy instead of a parse -- so there is no decoder that could
+// ever disagree with the encoder, and no ambiguity about whether a field
+// held an int or a rune.
+//
+// The whole type is unreachable from script code. It exists only between
+// convertTo and the map.
+type StructKey struct {
+	T *StructType
+	F any // [len(T.Fields)]any
+}
+
+// String renders the key as the struct the script wrote, which is what
+// puts `map[P{X: 1}:v]` rather than grsh's internals in front of anyone
+// who prints a struct-keyed map. fmt finds this on the key values
+// themselves, so every printing path gets it without knowing about it.
+func (k StructKey) String() string {
+	sv := k.structVal()
+	if sv == nil {
+		return "<nil>"
+	}
+	return sv.String()
+}
+
+// structVal rebuilds the script's struct from the key.
+//
+// The result is FRESH on every call, which is what makes it safe to hand
+// a range variable to the script: mutating it cannot reach the key inside
+// the map, so `for k := range m { k.X = 9 }` cannot corrupt m's hashing.
+func (k StructKey) structVal() *StructVal {
+	// The zero StructKey is what a nil struct key encodes to, and it is
+	// reachable: `m[nil] = 1` converts nil to the key type's zero.
+	if k.T == nil {
+		return nil
+	}
+	vals := make([]Value, len(k.T.Fields))
+	if arr := reflect.ValueOf(k.F); arr.IsValid() {
+		for i := range vals {
+			vals[i] = fromKeyValue(arr.Index(i).Interface())
+		}
+	}
+	return &StructVal{Type: k.T, Vals: vals}
+}
+
+// structKeyOf encodes a struct value into the key the map actually holds.
+//
+// Recursion terminates for copyStruct's reason: a struct value cannot
+// contain itself, because every store takes a copy first.
+func structKeyOf(sv *StructVal) (StructKey, error) {
+	// A typed nil is an ordinary value in grsh, and the zero StructKey is
+	// its encoding -- so a nil stored under one name is found by a nil
+	// looked up under another.
+	if sv == nil {
+		return StructKey{}, nil
+	}
+	arr := reflect.New(sv.Type.keyArr).Elem()
+	for i, v := range sv.Vals {
+		ev, err := keyValue(v)
+		if err != nil {
+			return StructKey{}, err
+		}
+		// A nil field stays the array element's own zero: reflect.ValueOf
+		// of a nil Value is invalid and Set would panic on it.
+		if ev == nil {
+			continue
+		}
+		arr.Index(i).Set(reflect.ValueOf(ev))
+	}
+	return StructKey{T: sv.Type, F: arr.Interface()}, nil
+}
+
+// keyValue encodes one field value on its way into a key, and is where
+// the erasure gets undone one level down: a struct-typed field would
+// otherwise sit in the array as a *StructVal and be compared by identity
+// again, defeating the whole point one level deeper.
+//
+// The comparability check is not redundant with the noCmp gate typeOf
+// applies to the key type. noCmp is static, and an `any` field is
+// statically comparable and dynamically anything -- Go's own
+// runtime-panic case. Reporting beats the panic Go's map would raise
+// while hashing.
+func keyValue(v Value) (Value, error) {
+	if sv, ok := v.(*StructVal); ok {
+		return structKeyOf(sv)
+	}
+	if v == nil {
+		return nil, nil
+	}
+	if t := reflect.TypeOf(v); !t.Comparable() {
+		return nil, serr.New("cannot use " + scriptTypeName(t) + " as part of a map key")
+	}
+	return v, nil
+}
+
+// fromKeyValue is keyValue's inverse, and the only thing the decode side
+// needs: every other value went in as itself.
+func fromKeyValue(v Value) Value {
+	if k, ok := v.(StructKey); ok {
+		return k.structVal()
+	}
+	return v
 }
 
 // StructVal is an instance of a script-declared struct.
@@ -161,6 +289,7 @@ func (in *Interp) declareType(env *Env, ts *ast.TypeSpec) error {
 			}
 		}
 	}
+	t.keyArr = reflect.ArrayOf(len(t.Fields), anyType)
 	env.Define(ts.Name.Name, t)
 	return nil
 }

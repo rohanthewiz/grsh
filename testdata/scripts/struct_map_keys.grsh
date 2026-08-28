@@ -1,0 +1,46 @@
+# Struct map keys: a struct goes into the map as a comparable stand-in
+# (Go's map hashes with its own equality, which would compare the erased
+# pointers) and comes back out as the script's own struct.
+type Coord struct {
+    X int
+    Y int
+}
+type Cell struct {
+    At   Coord
+    Kind string
+}
+
+# The case identity comparison made impossible: a lookup with a key built
+# fresh, sharing nothing with the stored one.
+grid := map[Coord]string{}
+grid[Coord{0, 0}] = "origin"
+grid[Coord{1, 2}] = "corner"
+fmt.Println("lookup:", grid[Coord{1, 2}], len(grid))
+
+# A key literal elides its type, as Go's does.
+seen := map[Coord]int{{0, 0}: 1, Coord{3, 4}: 2}
+fmt.Println("elided:", seen[Coord{0, 0}], seen[Coord{3, 4}])
+
+# range yields Coord, and grsh sorts struct keys so scripts are
+# deterministic.
+for k, v := range grid {
+    fmt.Println("range:", k.X, k.Y, v)
+}
+
+# delete and comma-ok take the same encoding path.
+delete(grid, Coord{0, 0})
+_, ok := grid[Coord{0, 0}]
+fmt.Println("after delete:", len(grid), ok)
+
+# A nested struct field is encoded recursively, so it compares by value
+# too, not by the identity of the inner struct.
+cells := map[Cell]int{}
+cells[Cell{Coord{1, 1}, "wall"}] = 7
+fmt.Println("nested:", cells[Cell{Coord{1, 1}, "wall"}], cells[Cell{Coord{9, 9}, "wall"}])
+
+# Printing renders the key as the script wrote it.
+fmt.Println("printed:", cells)
+
+# Struct keys compose with the shell side.
+kind := $(echo wall)
+fmt.Println("from shell:", cells[Cell{Coord{1, 1}, kind}])

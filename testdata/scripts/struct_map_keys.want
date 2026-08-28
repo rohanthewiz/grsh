@@ -1,0 +1,8 @@
+lookup: corner 2
+elided: 1 2
+range: 0 0 origin
+range: 1 2 corner
+after delete: 1 false
+nested: 7 0
+printed: map[Cell{At: Coord{X: 1, Y: 1}, Kind: wall}:7]
+from shell: 7

@@ -498,6 +498,26 @@ func convertTo(v Value, pt reflect.Type) (reflect.Value, error) {
 	if rv.Type().AssignableTo(pt) {
 		return rv, nil
 	}
+	// A script struct crossing into a map's KEY position becomes the
+	// comparable stand-in the map can actually hash.
+	//
+	// This is the ONE hook the feature needs, and that is not luck: every
+	// key crossing in the interpreter — a read, the comma-ok read, a
+	// write, delete, and a map literal — already routed through convertTo
+	// to reach the map's key type. Sitting after the AssignableTo check
+	// above means a StructKey handed back in (nothing does today) passes
+	// through rather than being encoded twice.
+	if pt == structKeyType {
+		if sv, ok := v.(*StructVal); ok {
+			k, err := structKeyOf(sv)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			return reflect.ValueOf(k), nil
+		}
+		// Anything else falls through to the message at the bottom,
+		// where scriptTypeName renders the target as "struct".
+	}
 	// int → string would produce a rune-string surprise; refuse it.
 	if rv.Kind() != reflect.String && pt.Kind() == reflect.String && rv.CanInt() {
 		return reflect.Value{}, serr.New(fmt.Sprintf("cannot use %v (%T) as string (use strconv.Itoa)", v, v))
@@ -816,33 +836,39 @@ func (in *Interp) typeOf(env *Env, e ast.Expr) (TypeDesc, error) {
 		if err != nil {
 			return TypeDesc{}, err
 		}
-		// A script struct erases to a POINTER, and a pointer is
-		// comparable — so map[P]V would build happily and then compare
-		// identities instead of field values, making every lookup with a
-		// freshly built key miss.
-		//
-		// Field-wise `==` does NOT lift this. The interpreter owns the ==
-		// operator, but it does not own the map: reflect.Map hashes and
-		// compares the erased *StructVal with Go's own runtime, which
-		// this package cannot reach into. Keying by struct would need a
-		// hashable encoding of the value, which is a different feature.
+		// A script struct key does NOT go into the map as itself. It
+		// erases to a POINTER, and a pointer is comparable — so map[P]V
+		// would build happily and then compare identities instead of
+		// field values, making every lookup with a freshly built key
+		// miss. StructKey is the comparable stand-in Go's own map
+		// equality already gets right, and convertTo does the swap.
+		keyRT := k.RT
 		if k.ST != nil {
-			return TypeDesc{}, in.errAt(t.Key, "a script struct cannot be a map key yet",
-				"hint", "key by one of its fields, or use a slice")
+			// Go refuses a map key type that is not comparable, and a
+			// struct with a slice, map or func field is exactly that.
+			// The verdict already exists — it is the one `==` uses — so
+			// the two answers cannot drift apart.
+			if c := k.ST.noCmp; c != nil {
+				return TypeDesc{}, in.errAt(t.Key,
+					fmt.Sprintf("invalid map key type %s: field %s has type %s", k.ST.Name, c.Path, c.Type),
+					"hint", "key by one of its fields, or use a slice")
+			}
+			keyRT = structKeyType
 		}
 		// reflect.MapOf PANICS on a key type that is not comparable, so
 		// the check has to happen before the call. `map[[]int]int{}`
 		// used to reach it and surface through the top-level recover as
 		// an unpositioned "grsh internal error"; it is an ordinary
-		// positioned script error now.
-		if !k.RT.Comparable() {
+		// positioned script error now. StructKey passes it, which is the
+		// point of StructKey.
+		if !keyRT.Comparable() {
 			return TypeDesc{}, in.errAt(t.Key, "invalid map key type "+k.String())
 		}
 		v, err := in.typeOf(env, t.Value)
 		if err != nil {
 			return TypeDesc{}, err
 		}
-		return TypeDesc{RT: reflect.MapOf(k.RT, v.RT), ST: v.ST}, nil
+		return TypeDesc{RT: reflect.MapOf(keyRT, v.RT), ST: v.ST, KT: k.ST}, nil
 	case *ast.InterfaceType:
 		if len(t.Methods.List) == 0 {
 			return TypeDesc{RT: typeIdents["any"]}, nil
@@ -962,6 +988,14 @@ func (in *Interp) elidedElem(env *Env, e ast.Expr, want TypeDesc) (Value, error)
 	// `[]any{{1}}` lands here: an interface element type says nothing
 	// about what to build, and Go rejects it for the same reason. Naming
 	// the type is the fix in both languages, so say so.
+	// A struct map key whose identity did not survive the trip: TypeDesc
+	// carries ONE key leaf, so a map nested inside another container
+	// arrives knowing its key is a struct but not WHICH. The literal has
+	// to name it. Only elision is lost -- `[]map[P]int{{P{1}: 2}}` works.
+	if want.RT == structKeyType && want.ST == nil {
+		return nil, in.errAt(e, "a struct map key must name its type here",
+			"hint", "write P{...} instead of {...}: a map nested in another container does not carry its key type down")
+	}
 	if k := want.RT.Kind(); !want.IsStruct() && k != reflect.Slice && k != reflect.Map && k != reflect.Array {
 		return nil, in.errAt(e, fmt.Sprintf("composite literal needs an explicit type here: %s is not a composite type", want))
 	}

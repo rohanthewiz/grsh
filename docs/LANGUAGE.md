@@ -296,8 +296,11 @@ captures buffer output.
   struct-typed **field** (`type Order struct { Head Item }`, whose zero
   is a real `Item`), and `v.(Item)`. Nested literals elide their type
   the same way Go's do: `[]Item{{"nut", 2}}`, `Order{Head: {"crate", 1}}`.
-  One limit: `m[missing]` on a struct-valued map yields `nil` rather
-  than the zero struct — use the comma-ok form, which is exact.
+  A struct works as a **map key** too (`map[Coord]string`): keys compare
+  and hash by their FIELDS, `range` yields the struct back, and grsh
+  sorts struct keys so ranging is deterministic. One limit: `m[missing]`
+  on a struct-valued map yields `nil` rather than the zero struct — use
+  the comma-ok form, which is exact.
 - **Struct equality**: `p == q` compares **field-wise**, as Go does, so
   a copy equals its original and two separately built literals with the
   same fields are equal. It recurses into struct-typed fields, works in
@@ -305,8 +308,8 @@ captures buffer output.
   rejects that at compile time; grsh has no compile time). A struct with
   a slice, map or func field is refused with the offending field named,
   the way Go refuses it — comparing one is an error, not a `false`.
-  A struct still cannot be a **map key**: the map is Go's, and it would
-  hash the instance rather than the fields.
+  The same verdict decides map keys: `map[P]V` is refused for exactly
+  the P that `==` refuses.
 - **Struct methods**: top-level `func (p Point) Norm() float64 {...}`
   and `func (p *Point) Scale(f float64) {...}`. Go semantics: a value
   receiver sees a copy, a pointer receiver mutates the instance.

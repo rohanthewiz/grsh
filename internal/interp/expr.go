@@ -817,7 +817,12 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 		keys := rv.MapKeys()
 		sortMapKeys(keys)
 		for _, k := range keys {
-			cont, err := iterate(k.Interface(), rv.MapIndex(k).Interface())
+			// fromKeyValue undoes the key erasure: a struct-keyed map
+			// stores a StructKey, and the script must range over its own
+			// P. The rebuilt struct is fresh each iteration, so assigning
+			// to the range variable's fields cannot reach the key inside
+			// the map.
+			cont, err := iterate(fromKeyValue(k.Interface()), rv.MapIndex(k).Interface())
 			if err != nil || !cont {
 				return err
 			}
@@ -837,12 +842,25 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 }
 
 func sortMapKeys(keys []reflect.Value) {
-	if len(keys) == 0 || keys[0].Kind() != reflect.String {
+	if len(keys) == 0 {
 		return
 	}
 	strs := make([]string, len(keys))
-	for i, k := range keys {
-		strs[i] = k.String()
+	switch {
+	case keys[0].Kind() == reflect.String:
+		for i, k := range keys {
+			strs[i] = k.String()
+		}
+	case keys[0].Type() == structKeyType:
+		// A struct key holds a *StructType POINTER, so any ordering Go
+		// would derive from the key itself varies run to run. Sorting on
+		// the rendered struct — the same text the script would print —
+		// is both stable and the order a reader expects.
+		for i, k := range keys {
+			strs[i] = k.Interface().(StructKey).String()
+		}
+	default:
+		return
 	}
 	// insertion sort keeps this dependency-free
 	for i := 1; i < len(keys); i++ {

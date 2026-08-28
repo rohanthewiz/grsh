@@ -11,6 +11,13 @@ import (
 // error/inspector rendering below.
 var structValType = reflect.TypeFor[*StructVal]()
 
+// structKeyType is the storage type a script struct erases to in map-KEY
+// position, and anyType is the element type of the array inside it.
+var (
+	structKeyType = reflect.TypeFor[StructKey]()
+	anyType       = reflect.TypeFor[any]()
+)
+
 // TypeDesc is a resolved type in TYPE position: the reflect.Type values
 // of it are stored as, plus the script struct that reflect.Type cannot
 // name.
@@ -28,33 +35,58 @@ var structValType = reflect.TypeFor[*StructVal]()
 //	map[string][]P    RT map[string][]*StructVal  ST P
 //	[]int             RT []int                    ST nil
 //
-// ONE leaf is enough, and that is a property typeOf enforces rather than
-// a hope: a script struct is rejected in map-KEY position (erasure would
-// make every lookup compare pointers instead of fields), so the element
-// and key edges can never fork toward two different structs. Elem and Key
-// therefore carry ST down unchanged, and it is consulted only where RT
-// bottoms out at *StructVal — which is exactly what IsStruct tests.
+// A map KEY is the second place a struct can sit, and it needs its own
+// field. Struct map keys used to be REFUSED, and that refusal was exactly
+// what made one leaf enough; allowing them buys the feature back at the
+// price of the word it saved. KT names the struct at the key edge, and a
+// map is the only type that has one:
 //
-// The whole descriptor is two words and travels by value: resolving a
-// type allocates nothing, so the composite-literal path costs what it
-// cost when it was a bare reflect.Type.
+//	map[P]int         RT map[StructKey]int          ST nil  KT P
+//	map[string][]P    RT map[string][]*StructVal    ST P    KT nil
+//	map[P]Q           RT map[StructKey]*StructVal   ST Q    KT P
+//
+// TWO leaves is still a bounded claim rather than the start of a general
+// tree, and typeOf enforces it: a key must be comparable, which rules out
+// a map or slice inside a key, so a key edge is always one hop and never
+// leads to another key. A struct NESTED as a field of a key is not a leaf
+// here at all — the value encoder handles it (see StructKey), not the
+// type descriptor.
+//
+// Elem drops KT, because whatever sits at the element edge has its own
+// key edge or none. The cost of that is stated where it shows: a map
+// nested inside another container loses the identity of its key struct,
+// so `[]map[P]int{{{1}: 2}}` cannot ELIDE the key literal and wants
+// `[]map[P]int{{P{1}: 2}}` instead. Only elision is affected; the map
+// itself works at any depth.
+//
+// The descriptor is three words and travels by value: resolving a type
+// still allocates nothing.
 type TypeDesc struct {
 	RT reflect.Type // storage type; nil only for a type that did not resolve
-	ST *StructType  // the script struct at RT's leaf, if any
+	ST *StructType  // the script struct at RT's element leaf, if any
+	KT *StructType  // the script struct at RT's key leaf, if any
 }
 
 // IsStruct reports whether this descriptor IS a script struct — not a
 // container holding one.
-func (d TypeDesc) IsStruct() bool { return d.RT == structValType && d.ST != nil }
+//
+// Both storage types count. A key descriptor says StructKey because that
+// is what the MAP holds, but what the script builds for that position is
+// an ordinary P, and every construction path routes on this method:
+// structComposite makes the *StructVal and convertTo encodes it on the
+// way into the map.
+func (d TypeDesc) IsStruct() bool {
+	return (d.RT == structValType || d.RT == structKeyType) && d.ST != nil
+}
 
 // Elem is the element descriptor of a slice or map type. ST rides along
-// because the leaf it names is reached through element edges.
+// because the leaf it names is reached through element edges; KT does not,
+// because a key edge belongs to one map only.
 func (d TypeDesc) Elem() TypeDesc { return TypeDesc{RT: d.RT.Elem(), ST: d.ST} }
 
-// Key is the key descriptor of a map type. ST rides along for uniformity
-// and is inert: typeOf refuses a script struct as a key, so RT here never
-// bottoms out at *StructVal.
-func (d TypeDesc) Key() TypeDesc { return TypeDesc{RT: d.RT.Key(), ST: d.ST} }
+// Key is the key descriptor of a map type, and KT becomes its ST: from
+// here down, the key's struct is the one that matters.
+func (d TypeDesc) Key() TypeDesc { return TypeDesc{RT: d.RT.Key(), ST: d.KT} }
 
 // Zero builds the value a `var x T` or an unset slot starts at.
 //
@@ -62,6 +94,11 @@ func (d TypeDesc) Key() TypeDesc { return TypeDesc{RT: d.RT.Key(), ST: d.ST} }
 // the nil that reflect.Zero would hand back for the erased *StructVal —
 // which is the whole reason this is a method and not a reflect call at
 // each site.
+//
+// A KEY descriptor would return a *StructVal here rather than the
+// StructKey its RT names. Nothing asks: a map key has no zero-valued slot
+// to fill, so the callers (var, a struct field's zero, make's fill) never
+// hold one.
 func (d TypeDesc) Zero() Value {
 	switch {
 	case d.RT == nil:
@@ -79,10 +116,23 @@ func (d TypeDesc) String() string {
 	if d.RT == nil {
 		return "?"
 	}
-	if d.ST != nil {
-		return strings.ReplaceAll(d.RT.String(), structValType.String(), d.ST.Name)
+	// A descriptor that IS a struct answers with the name directly, which
+	// also settles the key case: ST names it whichever storage type RT
+	// happens to be.
+	if d.IsStruct() {
+		return d.ST.Name
 	}
-	return d.RT.String()
+	s := d.RT.String()
+	if d.ST != nil {
+		s = strings.ReplaceAll(s, structValType.String(), d.ST.Name)
+	}
+	if d.KT != nil {
+		s = strings.ReplaceAll(s, structKeyType.String(), d.KT.Name)
+	}
+	// Any erasure the descriptor could not name — the key of a map that
+	// reached here through a container, which dropped KT — still must not
+	// print as grsh's internals.
+	return eraseNames(s, "struct")
 }
 
 // scriptTypeName renders a reflect.Type for a script-facing message where
@@ -90,9 +140,15 @@ func (d TypeDesc) String() string {
 // which sees only the storage type. The neutral word "struct" is all that
 // is honest there; naming grsh's internal *interp.StructVal is not.
 func scriptTypeName(t reflect.Type) string {
-	s := t.String()
-	if !strings.Contains(s, structValType.String()) {
-		return s
+	return eraseNames(t.String(), "struct")
+}
+
+// eraseNames replaces every storage type a script struct erases to with
+// the given name. Both erasures are handled together because a single
+// type can contain both: map[P]Q is map[StructKey]*StructVal.
+func eraseNames(s, name string) string {
+	for _, erased := range [2]string{structValType.String(), structKeyType.String()} {
+		s = strings.ReplaceAll(s, erased, name)
 	}
-	return strings.ReplaceAll(s, structValType.String(), "struct")
+	return s
 }
