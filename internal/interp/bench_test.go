@@ -883,10 +883,33 @@ func BenchmarkSortMapKeys(b *testing.B) {
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
 		})
 	}
+
+	// The int row is the one that used to cost nothing because it did
+	// nothing: an int-keyed map was left in the map's own order. It is
+	// here to price what ordering one costs now, and to be read against
+	// the string row -- same shape, same sort, one Int() load against one
+	// String() header load -- rather than against the struct rows, which
+	// carry a decode.
+	for _, nk := range counts {
+		im := make(map[int]int, nk)
+		for j := 0; j < nk; j++ {
+			im[j*7919%nk] = j
+		}
+		keys := reflect.ValueOf(im).MapKeys()
+		work := make([]reflect.Value, len(keys))
+		b.Run(fmt.Sprintf("int/k%d", nk), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				copy(work, keys)
+				sortSink = sortMapKeys(work)
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
+		})
+	}
 }
 
-// sortSink keeps sortMapKeys' result live; it is nil for the string row,
-// which is itself part of what that row asserts.
+// sortSink keeps sortMapKeys' result live; it is nil for the scalar rows,
+// which is itself part of what those rows assert.
 var sortSink []*StructVal
 
 // BenchmarkAppendSliceValue prices appendValue's slice cases against the

@@ -2919,6 +2919,173 @@ func TestADeclinedMapRangesInRenderedTextOrder(t *testing.T) {
 	}
 }
 
+// EVERY SCALAR KEY KIND, against fmt, over randomised maps.
+//
+// A range used to leave all of these in the map's own randomised order --
+// only string and struct keys were ordered at all -- so `for k := range m`
+// over a map[int]V visited its entries differently on every run while
+// fmt.Println(m) printed them in numeric order. This is the test that
+// says the two agree now.
+//
+// The comparison is the whole map text rebuilt out of the order the RANGE
+// would visit, held against what fmt prints for the same map, which is
+// the same shape TestARangeVisitsAStructKeyedMapInFmtsOrder uses and for
+// the same reason: fmt's map printing is the fixed point, and rebuilding
+// its text is what turns "the same order" into a byte comparison.
+//
+// The kinds run past what a script can spell -- typeIdents has no uint32
+// -- because a map handed back by a stdlib call is ranged by the same
+// function, and fmtsort orders those too.
+func TestAScalarKeyedMapRangesInFmtsOrder(t *testing.T) {
+	const seed = 20260829
+	rng := rand.New(rand.NewSource(seed))
+	cases := []struct {
+		name string
+		kt   reflect.Type
+		key  func() reflect.Value
+	}{
+		{"int", reflect.TypeFor[int](), func() reflect.Value {
+			return reflect.ValueOf(rng.Intn(200) - 100)
+		}},
+		{"int64", reflect.TypeFor[int64](), func() reflect.Value {
+			return reflect.ValueOf(int64(rng.Intn(200) - 100))
+		}},
+		{"rune", reflect.TypeFor[rune](), func() reflect.Value {
+			return reflect.ValueOf(rune('a' + rng.Intn(26)))
+		}},
+		{"byte", reflect.TypeFor[byte](), func() reflect.Value {
+			return reflect.ValueOf(byte(rng.Intn(256)))
+		}},
+		{"uint32", reflect.TypeFor[uint32](), func() reflect.Value {
+			// Past 1<<31, where a signed comparison of the same bits
+			// would order them the other way round.
+			return reflect.ValueOf(uint32(rng.Uint32()))
+		}},
+		{"float64", reflect.TypeFor[float64](), func() reflect.Value {
+			// NaN sorts below every other float, under fmtsort and here,
+			// and is the only tie two distinct scalar keys can produce.
+			if rng.Intn(12) == 0 {
+				return reflect.ValueOf(math.NaN())
+			}
+			return reflect.ValueOf(float64(rng.Intn(400)-200) / 4)
+		}},
+		{"bool", reflect.TypeFor[bool](), func() reflect.Value {
+			return reflect.ValueOf(rng.Intn(2) == 0)
+		}},
+		{"string", reflect.TypeFor[string](), func() reflect.Value {
+			return reflect.ValueOf([]string{"", "a", "b", "zz", "A", "10", "2"}[rng.Intn(7)])
+		}},
+		{"any of one type", reflect.TypeFor[any](), func() reflect.Value {
+			// One dynamic type throughout: fmtsort's type-by-address step
+			// ties, so it goes on to the values and IS reproducible.
+			return reflect.ValueOf(any(rng.Intn(50) - 25))
+		}},
+	}
+	intT := reflect.TypeFor[int]()
+	for _, c := range cases {
+		for _, n := range []int{2, 3, 7, 40} {
+			for trial := 0; trial < 20; trial++ {
+				m := reflect.MakeMap(reflect.MapOf(c.kt, intT))
+				for i := 0; i < n; i++ {
+					k := reflect.New(c.kt).Elem()
+					k.Set(c.key())
+					// EVERY VALUE IS 1, and that is forced by the NaN
+					// key: NaN does not equal itself, so MapIndex cannot
+					// find one and a distinct value per entry could not
+					// be read back to rebuild the text. Nothing is lost
+					// -- a scalar key is not paired with a decoded slice
+					// the way a struct key is, so there is no pairing
+					// here for a distinct value to catch.
+					m.SetMapIndex(k, reflect.ValueOf(1))
+				}
+				keys := m.MapKeys()
+				if decoded := sortMapKeys(keys); decoded != nil {
+					t.Fatalf("%s: a scalar key was decoded; the caller reads the map's own keys", c.name)
+				}
+				b := []byte("map[")
+				for i, k := range keys {
+					if i > 0 {
+						b = append(b, ' ')
+					}
+					b = appendValue(b, k.Interface())
+					b = append(b, ':', '1')
+				}
+				b = append(b, ']')
+				if got, want := string(b), fmt.Sprintf("%v", m.Interface()); got != want {
+					t.Fatalf("seed %d, %s keys, n=%d, trial %d:\n ranged %s\n fmt    %s",
+						seed, c.name, n, trial, got, want)
+				}
+			}
+		}
+	}
+}
+
+// A map[any]V holding two different dynamic types is fmt's address rule
+// again, one level up from a struct key's field, and it declines for the
+// same reason: which of int and string was linked at the lower address is
+// not something to reproduce.
+//
+// So the assertion is DETERMINISM, and specifically the rendered-text
+// order -- "1" before "3" before "a" -- which is neither fmt's answer nor
+// a numeric one, and so could only come from the fallback having run.
+func TestAnInterfaceKeyedMapDeclinesToTextOrder(t *testing.T) {
+	m := reflect.ValueOf(map[any]int{3: 1, "b": 2, 1: 3, "a": 4, true: 5})
+	want := []string{"1", "3", "a", "b", "true"}
+	for run := 0; run < 10; run++ {
+		keys := m.MapKeys()
+		if decoded := sortMapKeys(keys); decoded != nil {
+			t.Fatal("an interface key was decoded")
+		}
+		got := make([]string, len(keys))
+		for i, k := range keys {
+			got[i] = string(appendValue(nil, k.Interface()))
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("run %d ranged as %v, want %v -- the text-order fallback did not run", run, got, want)
+		}
+	}
+}
+
+// The script-level half of the scalar story: an int-keyed map ranged and
+// printed by the same script, which is how a user meets the disagreement
+// and the only place the whole path -- rangeOver, sortMapKeys, and Go's
+// own fmt on a bare map -- is exercised together.
+func TestAScriptRangesAnIntKeyedMapLikeFmtPrintsIt(t *testing.T) {
+	out, err := eval(t, `m := map[int]string{}
+for i := -3; i < 12; i++ {
+	m[i] = "v"
+}
+for k := range m {
+	fmt.Print(k, " ")
+}
+fmt.Println()
+fmt.Println(m)
+`, nil)
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want a ranged line and a printed line, got:\n%s", out)
+	}
+	want := make([]string, 0, 15)
+	for i := -3; i < 12; i++ {
+		want = append(want, strconv.Itoa(i))
+	}
+	if got := strings.Fields(lines[0]); !slices.Equal(got, want) {
+		t.Errorf("ranged\n  %s\nwant\n  %s", strings.Join(got, " "), strings.Join(want, " "))
+	}
+	// What fmt itself printed, read back out of the map text.
+	var printed []string
+	for _, mm := range regexp.MustCompile(`(-?\d+):v`).FindAllStringSubmatch(lines[1], -1) {
+		printed = append(printed, mm[1])
+	}
+	if got := strings.Fields(lines[0]); !slices.Equal(got, printed) {
+		t.Errorf("the range visited\n  %s\nbut fmt printed the same map as\n  %s",
+			strings.Join(got, " "), strings.Join(printed, " "))
+	}
+}
+
 // String keys take their own branch -- no decode, no render, and the keys
 // sorted in place -- so they need their own order test. The map is big
 // enough to be past anything a small-n shortcut could cover.
