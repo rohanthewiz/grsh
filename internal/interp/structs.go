@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"reflect"
-	"strings"
+	"strconv"
 	"unsafe"
 
 	"github.com/rohanthewiz/serr"
@@ -602,8 +602,8 @@ func newStructVal(t *StructType, n int) *StructVal {
 	return &StructVal{Type: t, Vals: make([]Value, n)}
 }
 
-// keyArena carves the *StructVals for one map's decoded keys out of two
-// slabs instead of allocating each of them on its own.
+// keyArena carves the *StructVals for one map's decoded keys out of a
+// pair of slabs instead of allocating each of them on its own.
 //
 // A range over a struct-keyed map decodes EVERY key before the loop body
 // runs -- sortMapKeys has to render each one to order them -- so all n
@@ -613,6 +613,11 @@ func newStructVal(t *StructType, n int) *StructVal {
 //
 //	per key   [StructVal|[N]Value] [StructVal|[N]Value] ...   n allocations
 //	arena     [StructVal StructVal ...] [Value Value ...]     2 allocations
+//
+// -- two per CHUNK, to be exact; see keyChunkVals, which caps how many
+// keys one pair of slabs serves so that a retained key cannot pin the
+// whole map. Every map small enough to fit one chunk, which is every map
+// a shell is likely to range, gets exactly the two above.
 //
 // WHAT IT SAVES is BenchmarkMapKeyArena, minimum of twelve runs at a
 // fixed iteration count, Apple M3, ns PER KEY:
@@ -625,12 +630,13 @@ func newStructVal(t *StructType, n int) *StructVal {
 //	  per key   31.9  33.0  34.4  41.4  38.6  38.2
 //	  arena     49.4  36.4  33.6  35.0  28.4  24.5
 //
-// Allocations go from n to 2 and STAY at 2, and that is the whole
-// mechanism: past a couple of keys a decode is paying the allocator, not
-// the fields. So the saving grows with the key count and shrinks with the
-// field count -- 45% of a one-field decode at sixteen keys, 26% of a
-// ten-field one -- because what it removes is per-KEY floor sitting
-// underneath per-FIELD work it does not touch.
+// Allocations go from n to 2 and stay there as n grows -- stepping to 4,
+// 6 and so on only at the chunk boundaries the retention cap puts in --
+// and that is the whole mechanism: past a couple of keys a decode is
+// paying the allocator, not the fields. So the saving grows with the key
+// count and shrinks with the field count -- 45% of a one-field decode at
+// sixteen keys, 26% of a ten-field one -- because what it removes is
+// per-KEY floor sitting underneath per-FIELD work it does not touch.
 //
 // SMALL MAPS ARE THE EXCEPTION, and are why sortMapKeys checks the length
 // before building one. Two slabs are two allocations where newStructVal's
@@ -645,36 +651,147 @@ func newStructVal(t *StructType, n int) *StructVal {
 // counting allocations across the bound measures the compiler's inlining
 // as much as this function.
 //
-// THE TRADE IS RETENTION. A key that outlives its loop -- `for k := range
-// m { found = k }` -- holds the whole slab alive, where a fused block
-// would have held only itself. Two things bound that: the slab is sized
-// by the map that was just ranged, and it is SMALLER than the []string of
-// rendered keys sortMapKeys already builds and holds for the same n. So
-// the arena is not a new order of memory, only a longer-lived one in a
-// shape that has to keep a key. Chunking the slab to cap it was built and
-// measured, and cost 2-8% at every arity to guard something no script has
-// hit; the cap can go in if one ever does.
+// THE TRADE IS RETENTION, and keyChunkVals is what bounds it. A key that
+// outlives its loop -- `for k := range m { found = k }` -- holds the slab
+// it was carved from alive, where a fused block would have held only
+// itself. Sizing that slab by the MAP made the bound n, which for a large
+// map is an unbounded leak wearing a small function's clothes; sizing it
+// by keyChunkVals makes the bound a constant. See keyChunkVals for what
+// the cap costs and why 1024 slots.
 type keyArena struct {
+	t    *StructType
 	svs  []StructVal
 	vals []Value
+	left int // keys not yet carved that no slab has been cut for
 }
 
-// newKeyArena sizes an arena for n keys of struct type t.
+// keyChunkVals caps how many FIELD SLOTS one pair of slabs holds, and so
+// caps what a single retained key can hold alive.
+//
+// THIS CONSTANT IS THE RETENTION BOUND and nothing else. `for k := range
+// m { found = k }` keeps one decoded key past its loop, and that key
+// points into the slab it was carved from, so an unchunked arena let one
+// key of a 100,000-entry map hold the whole map's worth of StructVals.
+// Cutting a fresh pair of slabs every chunk means the bound is a constant
+// instead of the map's size.
+//
+// THE CAP IS IN SLOTS RATHER THAN IN KEYS because slots are what the
+// memory is: a chunk of 64 keys is 3KB for a one-field struct and 12KB
+// for a ten-field one, so a key count that bounds the wide struct
+// over-charges the narrow one for nothing. keyChunkFor divides instead,
+// charging each key for its fields AND its header, which holds both slabs
+// together at 1024 slots -- 16KB -- at every arity, and leaves narrow
+// structs far enough under the cap that the maps a shell ranges are
+// effectively unchunked.
+//
+// WHAT IT COSTS is more allocations for maps bigger than a chunk, and
+// nothing at all for maps smaller -- which is every map whose keys fit in
+// 1024 slots, about 340 one-field keys or 85 ten-field ones.
+// BenchmarkMapKeyArena, 256 keys of a ten-field struct, minimum of twelve
+// runs at a fixed iteration count, Apple M3, against an arena with no cap
+// at all:
+//
+//	slots/chunk   keys/chunk   chunks   ns/key   vs uncapped
+//	   128            10         26      30.51     +23.7%
+//	   256            21         13      27.15     +10.1%
+//	   512            42          7      25.64      +4.0%
+//	  1024            85          4      25.26      +2.4%
+//	  2048           170          2      25.16      +2.0%
+//	 uncapped        256          1      24.66       0.0%
+//
+// The refill is a fixed cost paid once per chunk, so halving the chunk
+// doubles how often it is paid, and the top of the table is that doubling
+// -- but the bottom of it does NOT go to zero. Two chunks still cost 2%,
+// which is the branch every carve now runs to notice an empty slab; that
+// part is paid whatever the cap is and is why raising it further buys
+// almost nothing.
+//
+// 1024 slots is the knee, and it is 16KB: past it the curve is flat and
+// the bound grows without limit, below it the bound tightens for a cost
+// that is climbing fast. A script that holds a key past its loop pins
+// 16KB it cannot notice, and the maps a shell actually ranges never cut a
+// second chunk.
+const keyChunkVals = 1024
+
+// svSlots is what one StructVal costs in the same unit a field slot is
+// measured in, so that one divisor can bound both slabs at once.
+//
+// unsafe.Sizeof is a COMPILE-TIME CONSTANT, not a pointer
+// reinterpretation -- it reads a type's width and nothing else. The five
+// unsafe expressions this package accounts for are the ones that alias
+// memory (the NewAt in intoKeyStore, and the unsafe.Slice plus eface pair
+// on each of the encode and decode paths); this is not a sixth, and
+// writing 2 here instead would be the same arithmetic with the reason
+// left out and a silent error waiting for whoever adds a field to
+// StructVal.
+const svSlots = int(unsafe.Sizeof(StructVal{}) / unsafe.Sizeof(Value(nil)))
+
+// keyChunkFor is how many keys the next chunk serves: as many as fit in
+// keyChunkVals slots once each key is charged for BOTH slabs it occupies
+// -- its nf field slots and the svSlots its StructVal header costs --
+// never more than are left to carve.
+//
+// Charging for the header is what makes the bound uniform instead of
+// merely finite. A one-field key is 1 field slot and 2 header slots, so
+// the header is TWICE the memory the fields are; capping on fields alone
+// would let a narrow struct retain three times what a wide one does for
+// the same cap. Dividing by nf+svSlots holds every arity at the same
+// number of bytes.
+//
+// It also removes both edge cases a field-only divisor needed: nf is zero
+// for `type P struct{}`, which is a legal script type and a perfectly
+// good map key, and the quotient could round to zero for a struct wider
+// than the whole cap. Adding svSlots makes the divisor at least 2 and the
+// quotient at least 1 for any struct narrower than the cap itself; the
+// floor still guards the pathological width, where one key IS the bound
+// and a chunk per key is the right answer.
+func keyChunkFor(nf, left int) int {
+	c := keyChunkVals / (nf + svSlots)
+	if c < 1 {
+		c = 1
+	}
+	if c > left {
+		c = left
+	}
+	return c
+}
+
+// newKeyArena sizes an arena for n keys of struct type t, cutting the
+// first chunk immediately.
 //
 // It inlines at its one call site, so the keyArena header itself costs no
-// allocation there and the two slabs are the whole price — which is what
+// allocation there and the slabs are the whole price — which is what
 // TestRangingAMapDecodesItsKeysIntoOneArena's count of exactly two rests
-// on.
+// on. That is why the first chunk is cut HERE rather than by calling
+// refill: refill's two makes would push this body past the inline budget
+// and put the header on the heap, turning every arena's cost from two
+// allocations into three.
 //
 // One type for all n is the map's own invariant -- a minted key type is
 // minted per *StructType, so every key in a map decodes to the same
-// struct -- which is what lets the field slab be one flat n*len(Fields)
-// block rather than n separate ones.
+// struct -- which is what lets each field slab be one flat block rather
+// than one per key, and what lets the arena keep t for its later chunks.
 func newKeyArena(t *StructType, n int) *keyArena {
+	c := keyChunkFor(len(t.Fields), n)
 	return &keyArena{
-		svs:  make([]StructVal, n),
-		vals: make([]Value, n*len(t.Fields)),
+		t:    t,
+		left: n - c,
+		svs:  make([]StructVal, c),
+		vals: make([]Value, c*len(t.Fields)),
 	}
+}
+
+// refill cuts the next chunk once the current one is spent.
+//
+// It is deliberately NOT inlined into newKeyArena (see there), and it is
+// reached only once a whole chunk of keys is spent, so its cost is
+// amortised over that chunk rather than paid per key.
+func (a *keyArena) refill() {
+	nf := len(a.t.Fields)
+	c := keyChunkFor(nf, a.left)
+	a.left -= c
+	a.svs = make([]StructVal, c)
+	a.vals = make([]Value, c*nf)
 }
 
 // structVal hands out the next StructVal, allocating a fresh one instead
@@ -689,7 +806,16 @@ func newKeyArena(t *StructType, n int) *keyArena {
 // three functions away.
 func (a *keyArena) structVal(t *StructType) *StructVal {
 	nf := len(t.Fields)
-	if a == nil || len(a.svs) == 0 || len(a.vals) < nf {
+	if a == nil {
+		return newStructVal(t, nf)
+	}
+	if len(a.svs) == 0 && a.left > 0 {
+		// The chunk is spent and the map has keys left: cut the next one.
+		// This is the only place a second chunk comes from, so a map
+		// whose keys fit in one chunk never reaches it.
+		a.refill()
+	}
+	if len(a.svs) == 0 || len(a.vals) < nf {
 		return newStructVal(t, nf)
 	}
 	sv := &a.svs[0]
@@ -704,23 +830,81 @@ func (a *keyArena) structVal(t *StructType) *StructVal {
 }
 
 func (sv *StructVal) String() string {
-	// A nil instance is reachable now that []P exists: append(xs, nil)
-	// converts nil to a typed nil element. Print it rather than panic
-	// inside fmt, which would report the panic instead of the value.
+	// One allocation: appendTo sizes nothing, so the only copy is the
+	// string conversion at the end. The old body went through a
+	// strings.Builder and an fmt.Fprintf PER FIELD, which is where this
+	// path's four-allocations-at-one-field came from.
+	return string(sv.appendTo(nil))
+}
+
+// appendTo renders sv into b and returns the extended buffer, producing
+// byte for byte what String returns -- String is written in terms of it.
+//
+// IT EXISTS FOR THE ORDERING PASS. sortMapKeys renders every key of a map
+// and throws the text away again, so a render that allocates is pure sort
+// cost: at one field the old String cost 4 allocations and ~160ns a key,
+// at ten fields 16 and ~700ns, against a decode of ~20ns. Appending into
+// a caller's buffer lets that pass keep ONE slab for a whole map -- the
+// same move keyArena made for the StructVals themselves.
+//
+// A nil instance is reachable now that []P exists: append(xs, nil)
+// converts nil to a typed nil element. Render it rather than panic inside
+// fmt, which would report the panic instead of the value.
+func (sv *StructVal) appendTo(b []byte) []byte {
 	if sv == nil {
-		return "<nil>"
+		return append(b, "<nil>"...)
 	}
-	var b strings.Builder
-	b.WriteString(sv.Type.Name)
-	b.WriteByte('{')
+	b = append(b, sv.Type.Name...)
+	b = append(b, '{')
 	for i, f := range sv.Type.Fields {
 		if i > 0 {
-			b.WriteString(", ")
+			b = append(b, ',', ' ')
 		}
-		fmt.Fprintf(&b, "%s: %v", f, sv.Vals[i])
+		b = append(b, f...)
+		b = append(b, ':', ' ')
+		b = appendValue(b, sv.Vals[i])
 	}
-	b.WriteByte('}')
-	return b.String()
+	return append(b, '}')
+}
+
+// appendValue writes v the way fmt's %v verb would.
+//
+// THE SWITCH IS A FAST PATH, NOT A SECOND DEFINITION of how a value
+// prints. Every case has to produce exactly what fmt produces for that
+// type, and TestAppendValueMatchesFmt holds each of them against fmt
+// itself rather than against a hand-written expectation. Anything not
+// listed falls through to fmt, so a Value kind this does not know about
+// renders slowly, never wrongly.
+//
+// The cases are the types a script can put in a field: the four literal
+// kinds evalExpr produces (int, float64, string, rune), bool, an unset
+// field's nil, a nested struct, and the int64 a stdlib call can hand
+// back.
+func appendValue(b []byte, v Value) []byte {
+	switch x := v.(type) {
+	case nil:
+		return append(b, "<nil>"...)
+	case string:
+		return append(b, x...)
+	case int:
+		return strconv.AppendInt(b, int64(x), 10)
+	case bool:
+		return strconv.AppendBool(b, x)
+	case rune: // int32, which is what a char literal evaluates to
+		return strconv.AppendInt(b, int64(x), 10)
+	case int64:
+		return strconv.AppendInt(b, x, 10)
+	case float64:
+		// %v on a float is %g at the shortest precision that round-trips,
+		// which is exactly this call -- including the +Inf/NaN spellings.
+		return strconv.AppendFloat(b, x, 'g', -1, 64)
+	case *StructVal:
+		// Recursing rather than calling String saves the nested struct's
+		// allocation too, and keeps a nil nested field printing "<nil>"
+		// the way fmt would by reaching the same nil check.
+		return x.appendTo(b)
+	}
+	return fmt.Appendf(b, "%v", v)
 }
 
 // declareType handles `type Name struct { ... }`.

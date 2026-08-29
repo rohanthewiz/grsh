@@ -2,8 +2,10 @@ package interp
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"unsafe"
@@ -1720,14 +1722,34 @@ func TestRangingAMapDecodesItsKeysIntoOneArena(t *testing.T) {
 	var sink []Value
 	sorted := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys) })
 	control := testing.AllocsPerRun(50, func() {
-		strs := make([]string, len(keys))
+		// The control has to mirror sortMapKeys' CURRENT render, not the
+		// one it had when this test was written. It used to build a
+		// []string with a String() per key; when the render became one
+		// appended slab the control kept the old shape, and the gap
+		// silently grew from "the arena" to "the arena plus the render" --
+		// a floor assertion that still passed while measuring something
+		// else. Everything but the source of the StructVals is copied
+		// from sortMapKeys deliberately, so that it all cancels.
+		ord := make([][]byte, len(keys))
+		bounds := make([]int, len(keys)+1)
+		var buf []byte
 		out := make([]Value, len(keys))
 		for i, k := range keys {
 			sv := decodeMintedKey(k, nil)
 			out[i] = sv
-			strs[i] = sv.String()
+			buf = sv.appendTo(buf)
+			bounds[i+1] = len(buf)
+			if i == 0 {
+				buf = growForRest(buf, len(keys))
+			}
 		}
-		_ = strs
+		for i := range ord {
+			ord[i] = buf[bounds[i]:bounds[i+1]]
+		}
+		// keys is permuted in place, exactly as sortMapKeys permutes
+		// it; copying it first would put an allocation in the control
+		// that the thing under test does not have.
+		sort.Sort(&keyOrder{ord: ord, keys: keys, decoded: out})
 		sink = out
 	})
 	// The gap, not either number: what the two runs do differently is
@@ -1995,5 +2017,357 @@ func TestCopyStructSizesFromTheInstance(t *testing.T) {
 	got.Vals[0] = 9
 	if sv.Vals[0] != 1 {
 		t.Fatal("the copy shares its Vals with the original")
+	}
+}
+
+// ---- rendering into a caller's buffer ----
+
+// appendValue's type switch is a FAST PATH for what fmt would print, so
+// every case has to be held against fmt itself rather than against a
+// hand-written string. A case that drifts from %v does not fail loudly:
+// it silently changes what a script prints, and -- because the same
+// render decides map key order -- silently reorders a range.
+//
+// The table is every case in the switch plus a fallthrough, and each
+// value is checked both bare and as a struct field, because appendTo and
+// appendValue are separately capable of getting the surrounding text
+// wrong.
+func TestAppendValueMatchesFmt(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+}`, "P")
+	nested := &StructVal{Type: st, Vals: []Value{7}}
+	vals := []Value{
+		nil,
+		"a string",
+		"",
+		0,
+		-1,
+		1 << 40,
+		true,
+		false,
+		'x',        // rune, which is int32
+		int64(-99), // what a stdlib call hands back
+		3.5,
+		0.1,
+		1e21,
+		-0.0,
+		math.Inf(1),
+		math.Inf(-1),
+		math.NaN(),
+		nested,
+		(*StructVal)(nil),  // a nil struct field, which []P makes reachable
+		[]string{"x", "y"}, // no fast path: must fall through to fmt
+		map[string]int{"k": 1},
+	}
+	for _, v := range vals {
+		if got, want := string(appendValue(nil, v)), fmt.Sprintf("%v", v); got != want {
+			t.Errorf("appendValue(%#v) = %q, fmt says %q", v, got, want)
+		}
+		// The same value in a field, where appendTo supplies the frame.
+		sv := &StructVal{Type: st, Vals: []Value{v}}
+		if got, want := sv.String(), fmt.Sprintf("P{A: %v}", v); got != want {
+			t.Errorf("rendering a field holding %#v gives %q, want %q", v, got, want)
+		}
+	}
+}
+
+// appendTo has to APPEND, which is the whole reason it exists: sortMapKeys
+// renders a map's keys end to end into one slab, so a render that ignored
+// the buffer it was handed would still pass every test that only ever
+// calls String.
+func TestAppendToExtendsItsBuffer(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+}`, "P")
+	buf := []byte("before:")
+	buf = (&StructVal{Type: st, Vals: []Value{1}}).appendTo(buf)
+	buf = (&StructVal{Type: st, Vals: []Value{2}}).appendTo(buf)
+	if got, want := string(buf), "before:P{A: 1}P{A: 2}"; got != want {
+		t.Errorf("two renders into one buffer gave %q, want %q", got, want)
+	}
+}
+
+// ---- ordering a whole map ----
+
+// The claim sortMapKeys' rewrite rests on is that its cost is PER MAP,
+// not per key: one slab for the rendered text and one sort, where before
+// there were four allocations per key at one field and sixteen at ten.
+//
+// So the assertion is on the SHAPE, not on a number. Doubling the key
+// count must not double the allocations -- it may add one or two, since
+// the slabs themselves grow -- and a per-key render would show up here as
+// a count that tracks nk. Pinning an exact count instead would report the
+// compiler's inlining decisions, for the reasons written out in
+// TestRangingAMapDecodesItsKeysIntoOneArena.
+func TestOrderingAMapAllocatesPerMapNotPerKey(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	count := func(nk int) float64 {
+		mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+		for i := 0; i < nk; i++ {
+			k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i, i * 10}})
+			if err != nil {
+				t.Fatalf("encoding: %v", err)
+			}
+			mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+		}
+		keys := mp.MapKeys()
+		var sink []Value
+		n := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys) })
+		if len(sink) != nk {
+			t.Fatalf("ordering %d keys returned %d", nk, len(sink))
+		}
+		return n
+	}
+	small, large := count(16), count(32)
+	// A per-key render would put the gap at 16 * (a render's allocations);
+	// four is loose enough to absorb one more slab growth step and tight
+	// enough that any per-key cost fails it.
+	if gap := large - small; gap > 4 {
+		t.Errorf("ordering 32 keys allocates %.0f times against %.0f for 16, a gap of %.0f: "+
+			"the cost is tracking the key count, so something in the ordering pass is per-key again",
+			large, small, gap)
+	}
+}
+
+// The three slices sortMapKeys sorts have to move TOGETHER: ord decides
+// the order, keys is what the caller reads the map with, and decoded is
+// what it hands the script as the range variable. A Swap that moved two
+// of the three would still produce sorted output -- and would pair every
+// key with another key's value.
+//
+// Ranging the map through the interpreter is what makes that visible, so
+// this drives a script rather than sortMapKeys directly.
+func TestOrderedKeysStayPairedWithTheirValues(t *testing.T) {
+	out, err := eval(t, `type P struct {
+	N int
+}
+m := map[P]string{}
+for i := 0; i < 40; i++ {
+	m[P{N: i}] = fmt.Sprintf("v%d", i)
+}
+for k, v := range m {
+	if v != fmt.Sprintf("v%d", k.N) {
+		fmt.Println("MISPAIRED", k, v)
+	}
+}
+fmt.Println("done")
+`, nil)
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "MISPAIRED") {
+		t.Errorf("a key was paired with another key's value:\n%s", out)
+	}
+	if !strings.Contains(out, "done") {
+		t.Errorf("the range did not finish:\n%s", out)
+	}
+}
+
+// Forty keys is past every threshold in the ordering pass -- the one-key
+// shortcut, the two-key arena bound, and insertion sort's old reach -- so
+// this is the case that pins the ORDER itself. It is the text order, not
+// a numeric one: P{N: 10} sorts before P{N: 2} because "1" < "2", which
+// is exactly what the previous implementation did and what the rewrite
+// had to preserve.
+func TestAMapRangesInRenderedTextOrder(t *testing.T) {
+	out, err := eval(t, `type P struct {
+	N int
+}
+m := map[P]int{}
+for i := 0; i < 40; i++ {
+	m[P{N: i}] = i
+}
+for k := range m {
+	fmt.Print(k.N, " ")
+}
+fmt.Println()
+`, nil)
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	// The expectation is built by rendering each key exactly as the
+	// interpreter does and sorting THAT, which is the point of the test:
+	// the order comes from the whole rendered struct, closing brace
+	// included, so P{N: 10} sorts before P{N: 1} ("0" < "}") and 10..19
+	// arrive before 1. Sorting the bare numbers as text gives a different
+	// answer, and that wrong expectation is what this comment is here to
+	// stop the next reader from restoring.
+	rendered := make([]string, 40)
+	for i := range rendered {
+		rendered[i] = fmt.Sprintf("P{N: %d}", i)
+	}
+	sort.Strings(rendered)
+	want := make([]string, len(rendered))
+	for i, r := range rendered {
+		want[i] = strings.TrimSuffix(strings.TrimPrefix(r, "P{N: "), "}")
+	}
+	if got := strings.TrimSpace(out); got != strings.Join(want, " ") {
+		t.Errorf("a 40-key map ranged as\n  %s\nwant\n  %s", got, strings.Join(want, " "))
+	}
+}
+
+// String keys take their own branch -- no decode, no render, and the keys
+// sorted in place -- so they need their own order test. The map is big
+// enough to be past anything a small-n shortcut could cover.
+func TestAStringKeyedMapRangesInOrder(t *testing.T) {
+	out, err := eval(t, `m := map[string]int{}
+for i := 0; i < 40; i++ {
+	m[fmt.Sprintf("k%d", i)] = i
+}
+for k := range m {
+	fmt.Print(k, " ")
+}
+fmt.Println()
+`, nil)
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	want := make([]string, 40)
+	for i := range want {
+		want[i] = fmt.Sprintf("k%d", i)
+	}
+	sort.Strings(want)
+	if got := strings.TrimSpace(out); got != strings.Join(want, " ") {
+		t.Errorf("a 40-key string map ranged as\n  %s\nwant\n  %s", got, strings.Join(want, " "))
+	}
+}
+
+// ---- the retention cap ----
+
+// keyChunkFor is arithmetic with two ends that are easy to get wrong and
+// impossible to notice: a zero divisor for a fieldless struct, and a
+// quotient that rounds to zero for a struct wider than the whole cap.
+// Both would be a panic or an infinite carve of empty chunks rather than
+// a wrong answer, so they are pinned here rather than left to a script to
+// find.
+func TestKeyChunkForCoversEveryArity(t *testing.T) {
+	const many = 1 << 20
+	cases := []struct{ nf, left, want int }{
+		{0, many, keyChunkVals / svSlots},         // type P struct{}
+		{1, many, keyChunkVals / (1 + svSlots)},   // the common case
+		{10, many, keyChunkVals / (10 + svSlots)}, //
+		{keyChunkVals, many, 1},                   // exactly as wide as the cap
+		{keyChunkVals * 4, many, 1},               // wider than the cap: one key per chunk
+		{2, 3, 3},                                 // fewer keys left than fit
+		{2, 0, 0},                                 // nothing left to carve
+	}
+	for _, c := range cases {
+		if got := keyChunkFor(c.nf, c.left); got != c.want {
+			t.Errorf("keyChunkFor(nf=%d, left=%d) = %d, want %d", c.nf, c.left, got, c.want)
+		}
+	}
+	// The bound the constant is FOR: whatever the arity, one chunk holds
+	// about the same number of slots, counting each key's header. The
+	// slack is the rounding in the division, which is a whole key's worth
+	// at wide arities.
+	for _, nf := range []int{0, 1, 2, 5, 10, 40, 200} {
+		slots := keyChunkFor(nf, 1<<20) * (nf + svSlots)
+		if slots > keyChunkVals || slots < keyChunkVals-(nf+svSlots) {
+			t.Errorf("a chunk of %d-field keys holds %d slots, want within one key of %d -- "+
+				"the retention bound is not uniform across arities", nf, slots, keyChunkVals)
+		}
+	}
+}
+
+// THE CAP'S ONLY OBSERVABLE EFFECT is that a big map is served by several
+// slabs instead of one, and that is exactly what bounds retention: a key
+// that outlives its loop pins the chunk it was carved from, so as long as
+// there is more than one chunk, one key cannot pin the whole map.
+//
+// The assertion is therefore on the allocation count, which is the only
+// place the chunking surfaces -- two per chunk, ceil(n/chunk) chunks.
+// Nothing a script can read changes, which is why this test exists at
+// all.
+func TestABigMapsKeysComeFromSeveralChunks(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	per := keyChunkFor(len(st.Fields), 1<<20)
+	// Three chunks and a bit, so the count catches both an off-by-one in
+	// the refill and a cap that quietly stopped applying.
+	nk := per*3 + 1
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for i := 0; i < nk; i++ {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i, i * 10}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+	}
+	keys := mp.MapKeys()
+
+	var sink *StructVal
+	got := testing.AllocsPerRun(20, func() {
+		a := newKeyArena(st, len(keys))
+		for _, k := range keys {
+			sink = decodeMintedKey(k, a)
+		}
+	})
+	want := float64(2 * 4) // four chunks, two slabs each
+	if got != want {
+		t.Errorf("decoding %d keys (%d per chunk) allocates %.0f times, want %.0f -- "+
+			"two slabs for each of four chunks", nk, per, got, want)
+	}
+	if sink == nil || len(sink.Vals) != 2 {
+		t.Fatalf("the last decoded key is %v, want a two-field P", sink)
+	}
+	// Without the cap this is 2 for any n, which is the leak the cap
+	// exists to close: one retained key would hold all nk StructVals.
+	if want <= 2 {
+		t.Fatal("the test is not crossing a chunk boundary, so it proves nothing")
+	}
+}
+
+// Keys carved from DIFFERENT chunks must be as independent as keys carved
+// from the same one. TestArenaKeysDoNotShareFields makes the point within
+// a chunk; the hazard here is the other one -- a refill that reused the
+// old slab, or advanced the wrong slice -- which no small map can reach.
+func TestKeysFromDifferentChunksDoNotShareFields(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	per := keyChunkFor(len(st.Fields), 1<<20)
+	nk := per + 2 // just over the boundary: the last two are a new chunk
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for i := 0; i < nk; i++ {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i, i * 10}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+	}
+	keys := mp.MapKeys()
+
+	a := newKeyArena(st, len(keys))
+	svs := make([]*StructVal, len(keys))
+	want := make([]string, len(keys))
+	for i, k := range keys {
+		svs[i] = decodeMintedKey(k, a)
+		want[i] = svs[i].String()
+	}
+	// Only the keys either side of the boundary are swept against every
+	// other key: the within-chunk case is already covered, and sweeping
+	// all of them against all of them is quadratic in a chunk.
+	for _, i := range []int{per - 1, per, per + 1} {
+		for f := range svs[i].Vals {
+			orig := svs[i].Vals[f]
+			svs[i].Vals[f] = "sentinel"
+			for j := range svs {
+				if j == i {
+					continue
+				}
+				if got := svs[j].String(); got != want[j] {
+					t.Fatalf("writing field %d of key %d (chunk boundary at %d) changed key %d to %s, want %s: "+
+						"a refill handed out memory another chunk was already using", f, i, per, j, got, want[j])
+				}
+			}
+			svs[i].Vals[f] = orig
+		}
 	}
 }

@@ -660,6 +660,9 @@ func BenchmarkKeyCrossing(b *testing.B) {
 // two, so this benchmark is the thing to re-run before moving that bound.
 // 64 is well past any map a script is likely to range and shows where the
 // curve flattens -- the saving is bounded by the allocator, not the map.
+// 256 CROSSES CHUNK BOUNDARIES: past keyChunk keys an arena cuts a fresh
+// pair of slabs, so this is the row that prices the retention cap, and
+// the one to re-run before moving keyChunk.
 //
 // Field counts 1 and 10 bracket the same way BenchmarkKeyCrossing's do: a
 // decode is per-field work sitting on a per-KEY floor, and the arena only
@@ -683,7 +686,7 @@ func BenchmarkMapKeyArena(b *testing.B) {
 		}
 		st := v.(*StructType)
 
-		for _, nk := range []int{1, 2, 3, 4, 16, 64} {
+		for _, nk := range []int{1, 2, 3, 4, 16, 64, 256} {
 			mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
 			for j := 0; j < nk; j++ {
 				vals := make([]Value, nf)
@@ -783,3 +786,99 @@ var (
 	envSink *Env
 	valSink Value
 )
+
+// BenchmarkSortMapKeys prices the ORDERING of a whole map's keys, which
+// is what a range over a map pays before its body runs once.
+//
+// It is a different unit again from BenchmarkMapKeyArena. That one prices
+// the DECODE of n keys, which is linear in n; this one prices decode plus
+// render plus sort, and the sort is the part whose shape is not linear.
+// The key counts run to 1024 for exactly that reason: a quadratic term
+// hiding under a linear one is invisible until the counts are far enough
+// apart to separate them, and ns/key is what makes that visible -- a
+// linear cost holds its ns/key flat as n grows, a quadratic one does not.
+//
+// EACH ITERATION RE-SCRAMBLES, by copying a fixed unsorted permutation
+// over the working slice. sortMapKeys sorts in place, so without the copy
+// every iteration after the first would sort an already-sorted slice,
+// which is insertion sort's BEST case -- the benchmark would report O(n)
+// for an O(n^2) loop. The copyonly row prices that copy so it can be
+// subtracted rather than assumed small.
+//
+// The string row is the other half of the function: no decode and no
+// render, just the sort, so it isolates the sort's own shape from the
+// per-key work the struct row stacks on top of it.
+func BenchmarkSortMapKeys(b *testing.B) {
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+	counts := []int{4, 16, 64, 256, 1024}
+
+	for _, nf := range []int{1, 10} {
+		src := "type P struct {\n"
+		for i := 0; i < nf; i++ {
+			src += "\t" + names[i] + " int\n"
+		}
+		src += "}\n_ = map[P]int{}\n"
+		in, fset, f := prepScript(b, src)
+		if err := in.Run(fset, f); err != nil {
+			b.Fatalf("declaring P: %v", err)
+		}
+		v, ok := in.globals.Get("P")
+		if !ok {
+			b.Fatal("P was not defined")
+		}
+		st := v.(*StructType)
+
+		for _, nk := range counts {
+			mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+			for j := 0; j < nk; j++ {
+				vals := make([]Value, nf)
+				for i := range vals {
+					vals[i] = j*100 + i
+				}
+				k, err := structKeyOf(&StructVal{Type: st, Vals: vals})
+				if err != nil {
+					b.Fatalf("encoding a key: %v", err)
+				}
+				mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(j))
+			}
+			keys := mp.MapKeys()
+			work := make([]reflect.Value, len(keys))
+
+			b.Run(fmt.Sprintf("struct/f%d/k%d", nf, nk), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					copy(work, keys)
+					sortSink = sortMapKeys(work)
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
+			})
+			b.Run(fmt.Sprintf("copyonly/f%d/k%d", nf, nk), func(b *testing.B) {
+				for b.Loop() {
+					copy(work, keys)
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
+			})
+		}
+	}
+
+	for _, nk := range counts {
+		sm := make(map[string]int, nk)
+		for j := 0; j < nk; j++ {
+			sm[fmt.Sprintf("key-%06d", j*7919%nk)] = j
+		}
+		keys := reflect.ValueOf(sm).MapKeys()
+		work := make([]reflect.Value, len(keys))
+		b.Run(fmt.Sprintf("string/k%d", nk), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				copy(work, keys)
+				sortSink = sortMapKeys(work)
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
+		})
+	}
+}
+
+// sortSink keeps sortMapKeys' result live; it is nil for the string row,
+// which is itself part of what that row asserts.
+var sortSink []Value

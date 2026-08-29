@@ -1,11 +1,15 @@
 package interp
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"reflect"
+	"slices"
+	"sort"
 	"strconv"
+	"strings"
 )
 
 // evalExpr evaluates an expression to its values (calls and __capture are
@@ -906,66 +910,201 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 // one piece of work: ordering needs every key rendered, rendering needs
 // it decoded, and the decoded struct is exactly what the range variable
 // must be. Kept apart, every key of every range was decoded twice.
+//
+// EVERYTHING HERE IS PER MAP, NOT PER KEY, which is what the shape of the
+// cost demanded. BenchmarkSortMapKeys, ns per key, Apple M3:
+//
+//	keys              4      16      64     256    1024
+//	 struct, 1 field
+//	  before      187.5   177.8   196.2   322.7  1005.0
+//	  after        87.2    79.2    62.1    66.3    82.4
+//	  allocs      19->8   67->9  259->9 1027->10 4099->16
+//	 struct, 10 fields
+//	  before      806.0   749.9   780.6   981.3  1834.0
+//	  after       186.2   161.9   166.7   190.4   211.1
+//	  allocs     67->12 259->12 1027->12 4099->18 16387->36
+//	 string
+//	  before       14.4    16.9    54.4   204.6   789.1
+//	  after         9.5    15.7    26.0    36.9    51.6
+//	  allocs       1->0    1->0    1->0     1->0     1->0
+//
+// Two costs sat on top of each other and both are gone. The RENDER was
+// four allocations a key at one field and sixteen at ten -- a
+// strings.Builder plus an fmt.Fprintf per FIELD -- for text that is
+// thrown away as soon as the order is fixed; it now appends into one slab
+// for the whole map, which is what turns a per-key allocation count into
+// a per-MAP one. The SORT was insertion sort, quadratic, invisible at
+// four keys and most of the cost at a thousand; the flat ns/key of the
+// "after" rows is the shape that changed, not merely the height.
+//
+// The counts that still grow -- 9 to 16 at a thousand one-field keys --
+// are keyArena cutting a fresh chunk every keyChunkVals slots, which is
+// the retention cap and not a per-key cost: they step, they do not
+// track n.
+//
+// WHAT IS DELIBERATELY UNCHANGED is the ORDER itself: keys are compared
+// as the text they render to, so `P{X: 10}` still sorts before `P{X: 2}`.
+// The sort is no longer stable, and that costs nothing here, because ties
+// are keys with identical text and distinct contents (an int 1 and a
+// string "1" in the same field) -- their relative order was already the
+// map's own randomised iteration order, which stability preserved rather
+// than fixed.
 func sortMapKeys(keys []reflect.Value) []Value {
-	if len(keys) == 0 {
+	n := len(keys)
+	if n == 0 {
 		return nil
 	}
-	strs := make([]string, len(keys))
-	// decoded stays nil for every key kind that is already the script's
-	// own value, which is the signal the caller reads.
-	var decoded []Value
 	// The type is asked, not the value: every key in a map shares one
-	// type, so one lookup settles the whole slice. It is hoisted out of
-	// the switch because the struct case now needs the type itself and
-	// not merely the fact that there is one; a non-struct key kind leaves
+	// type, so one lookup settles the whole slice. It is hoisted above
+	// the render because the struct case needs the type itself and not
+	// merely the fact that there is one; a non-struct key kind leaves
 	// keyOwnerOf on its first line, so the hoist costs the string case
 	// nothing.
 	kt := keyOwnerOf(keys[0].Type())
-	switch {
-	case keys[0].Kind() == reflect.String:
-		for i, k := range keys {
-			strs[i] = k.String()
-		}
-	case kt != nil:
-		// A struct key holds a *StructType POINTER, so any ordering Go
-		// would derive from the key itself varies run to run. Sorting on
-		// the rendered struct — the same text the script would print —
-		// is both stable and the order a reader expects.
-		decoded = make([]Value, len(keys))
-		// One arena for the whole map. Every key is decoded HERE, before
-		// the caller's loop body runs even once, so all of them are alive
-		// together whether they came from an arena or not — the slab
-		// changes where they live, not for how long.
-		//
-		// Maps of one or two keys ask for none: two slabs cost more than
-		// the one or two fused blocks they would replace, and there is
-		// too little to amortise them over. Three is where it turns, and
-		// BenchmarkMapKeyArena is where that was measured.
-		var arena *keyArena
-		if len(keys) > 2 {
-			arena = newKeyArena(kt, len(keys))
-		}
-		for i, k := range keys {
-			sv := decodeMintedKey(k, arena)
-			// Held as the *StructVal it is, so a nil key stays the typed
-			// nil the script sees everywhere else. String answers for it.
-			decoded[i] = sv
-			strs[i] = sv.String()
-		}
-	default:
+	strKeys := keys[0].Kind() == reflect.String
+	if !strKeys && kt == nil {
+		// No order this function can give, and nothing to decode.
 		return nil
 	}
-	// insertion sort keeps this dependency-free
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && strs[j] < strs[j-1]; j-- {
-			strs[j], strs[j-1] = strs[j-1], strs[j]
-			keys[j], keys[j-1] = keys[j-1], keys[j]
-			if decoded != nil {
-				decoded[j], decoded[j-1] = decoded[j-1], decoded[j]
-			}
+	// A MAP OF ONE KEY IS ALREADY ORDERED. Everything below exists to
+	// establish an order, so a single key skips the render entirely --
+	// which for a struct key was the most expensive thing here, ~190ns at
+	// one field and ~740ns at ten for text nothing would have read.
+	if n == 1 {
+		if kt != nil {
+			return []Value{decodeMintedKey(keys[0], nil)}
+		}
+		return nil
+	}
+
+	if strKeys {
+		// A STRING KEY IS ALREADY THE TEXT IT SORTS BY. There is nothing
+		// to render, nothing to memoise and nothing to keep in step, so
+		// this branch sorts the keys THEMSELVES and touches no memory at
+		// all -- reflect.Value.String on a string key is a header load.
+		//
+		// Two other shapes were written first. All three in one binary,
+		// minimum of eight runs at a fixed iteration count, Apple M3, ns
+		// per key:
+		//
+		//	keys                            4    16    64    256    1024
+		//	 insertion sort on a []string 10.3  22.3  58.2  179.5   779.9   1 alloc
+		//	 sort.Sort on a []string      16.3  16.1  27.1   34.4    46.7   2 allocs
+		//	 this                          6.4  12.9  25.9   34.8    51.5   0 allocs
+		//
+		// The []string wins at a thousand keys because it calls String
+		// once per key where this calls it n log n times -- but it pays
+		// an allocation for the slice and another for the sorter, which
+		// escapes into sort.Sort's interface, and those two ARE what a
+		// four-key map costs. Small string-keyed maps are the common case
+		// in a shell. One allocation-free path that leads everywhere up
+		// to 256 keys and trails by 10% at 1024 beat two paths and a
+		// threshold between them.
+		//
+		// The struct branch below cannot make this trade: its sort text
+		// costs a render, so it has to be memoised whatever the key count.
+		slices.SortFunc(keys, func(a, b reflect.Value) int {
+			return strings.Compare(a.String(), b.String())
+		})
+		// nil: the script's keys are the map's own, so the caller has
+		// nothing to read here.
+		return nil
+	}
+
+	// A struct key holds a *StructType POINTER, so any ordering Go would
+	// derive from the key itself varies run to run. Sorting on the
+	// rendered struct -- the same text the script would print -- is both
+	// reproducible across runs and the order a reader expects.
+	//
+	// ord holds one VIEW per key of that text; buf holds all of it end to
+	// end. Views cannot be taken while buf is still growing -- an append
+	// that reallocates would leave them pointing at the old array -- so
+	// the render records bounds and the views are cut once, after.
+	ord := make([][]byte, n)
+	bounds := make([]int, n+1)
+	var buf []byte
+	decoded := make([]Value, n)
+	// One arena for the whole map. Every key is decoded HERE, before the
+	// caller's loop body runs even once, so all of them are alive
+	// together whether they came from an arena or not -- the slab changes
+	// where they live, not for how long.
+	//
+	// Maps of two keys ask for none: two slabs cost more than the two
+	// fused blocks they would replace, and there is too little to
+	// amortise them over. Three is where it turns, and BenchmarkMapKeyArena
+	// is where that was measured.
+	var arena *keyArena
+	if n > 2 {
+		arena = newKeyArena(kt, n)
+	}
+	for i, k := range keys {
+		sv := decodeMintedKey(k, arena)
+		// Held as the *StructVal it is, so a nil key stays the typed nil
+		// the script sees everywhere else. appendTo answers for it
+		// exactly as String does.
+		decoded[i] = sv
+		buf = sv.appendTo(buf)
+		bounds[i+1] = len(buf)
+		if i == 0 {
+			buf = growForRest(buf, n)
 		}
 	}
+	for i := range ord {
+		ord[i] = buf[bounds[i]:bounds[i+1]]
+	}
+	sort.Sort(&keyOrder{ord: ord, keys: keys, decoded: decoded})
 	return decoded
+}
+
+// growForRest sizes the render slab from its first entry, so a map of a
+// thousand keys grows its buffer once instead of ten times.
+//
+// The first key is a good estimator for the rest and a harmless one when
+// it is not: its one caller renders n instances of ONE struct type, so
+// the only spread is in how many digits a field takes, and a guess that
+// comes up short simply falls back on append's own doubling. The eighth
+// is headroom for that spread; over-guessing costs a slab that is dropped
+// when the sort returns.
+func growForRest(buf []byte, n int) []byte {
+	return slices.Grow(buf, (n-1)*len(buf)+len(buf)/8+16)
+}
+
+// keyOrder orders the three parallel slices sortMapKeys builds for a
+// struct-keyed map: the rendered text that decides the order, the map's
+// own keys, and the decoded structs the range variable will be. All three
+// have to move together, which is why this is a sort.Interface rather
+// than one of the slices helpers.
+//
+// It is deliberately not inspect.go's keySorter. That one sorts two
+// slices by a []string it keeps and PRINTS afterwards; this one sorts
+// three by text that is scratch, so the text lives as views into one slab
+// and is dropped on return. Merging them would force one caller to carry
+// the other's cost -- a third slice to swap, or n string allocations.
+//
+// The receiver is a POINTER so Less and Swap do not copy three slice
+// headers on every call of a sort's inner loop.
+//
+// It replaces an insertion sort that had stood since map ranges were
+// added. That was quadratic, which the benchmark did not show until it
+// reached key counts a script could plausibly build: at 1024 keys the
+// ordering cost more than everything else in a range put together. The
+// comment it replaces claimed insertion sort "keeps this dependency-free"
+// -- sort is the standard library and this package already imports it in
+// inspect.go, so that was never a cost.
+type keyOrder struct {
+	ord     [][]byte
+	keys    []reflect.Value
+	decoded []Value
+}
+
+func (s *keyOrder) Len() int { return len(s.ord) }
+
+func (s *keyOrder) Less(i, j int) bool { return bytes.Compare(s.ord[i], s.ord[j]) < 0 }
+
+func (s *keyOrder) Swap(i, j int) {
+	s.ord[i], s.ord[j] = s.ord[j], s.ord[i]
+	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
+	s.decoded[i], s.decoded[j] = s.decoded[j], s.decoded[i]
 }
 
 // ---- declarations & switch ----
