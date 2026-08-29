@@ -1154,3 +1154,119 @@ func BenchmarkStructKeyedMap(b *testing.B) {
 	}
 	appendSink = buf
 }
+
+// BenchmarkStructFieldWrite prices what coerceField costs at the two
+// sites that now call it: the literal and the field assignment.
+//
+// The question it answers is whether a field write can afford a type
+// check at all. Every one of them pays SOMETHING now, and only the
+// converting rows get anything back, so the flat rows are the ones that
+// have to stay level -- they are the common case by a wide margin.
+//
+//	same     an int written into an int field   -- the fast path, one
+//	         reflect.TypeOf comparison and no reflect.Value
+//	convert  an int written into a float64 field -- the case the whole
+//	         change exists for, and the only one that reaches convertTo
+//	nested   a struct written into a struct-typed field -- the branch
+//	         that does not use convertTo at all
+//
+// The assign rows separate the cost from the literal's own construction:
+// a literal also allocates a StructVal and its Vals slice, which would
+// otherwise hide a per-field cost inside a much bigger number.
+//
+// ns per loop iteration and allocations per 1000, before the coercion
+// and after. Apple M3, minimum of six runs at -benchtime 300x:
+//
+//	               before    after    allocs
+//	lit/same        290.7    296.1    11778 -> 11778
+//	lit/convert     293.8    358.0    11779 -> 13781
+//	lit/nested      375.3    380.3    14787 -> 14787
+//	assign/same     194.7    195.8     8771 ->  8771
+//	assign/convert  194.2    228.0     8772 ->  9772
+//	assign/nested   227.6    231.6     9791 ->  9791
+//
+// The rows that store what they were handed pay 1-2% and allocate
+// nothing, which is the fast path doing its job -- one comparison of two
+// type words, no reflect.Value built.
+//
+// A row that actually converts pays about 33ns and ONE allocation per
+// field: lit/convert converts two fields an iteration and gains 2002
+// allocations per 1000, assign/convert converts one and gains 1000. That
+// allocation is not reflect overhead and cannot be optimised away --
+// putting a float64 into an interface boxes it, and the int the script
+// wrote was already boxed by the time it arrived. Converting a value
+// means a new box for the new type, and that is the price of the field
+// holding what it says it holds.
+func BenchmarkStructFieldWrite(b *testing.B) {
+	shapes := []struct{ name, body string }{
+		{"lit/same", `type P struct {
+	X int
+	Y int
+}
+p := P{0, 0}
+for i := 0; i < %d; i++ {
+	p = P{X: i, Y: i}
+}
+_ = p`},
+		{"lit/convert", `type P struct {
+	X float64
+	Y float64
+}
+p := P{0, 0}
+for i := 0; i < %d; i++ {
+	p = P{X: i, Y: i}
+}
+_ = p`},
+		{"lit/nested", `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+o := Out{}
+for i := 0; i < %d; i++ {
+	o = Out{I: In{N: i}}
+}
+_ = o`},
+		{"assign/same", `type P struct {
+	X int
+}
+var p P
+for i := 0; i < %d; i++ {
+	p.X = i
+}
+_ = p`},
+		{"assign/convert", `type P struct {
+	X float64
+}
+var p P
+for i := 0; i < %d; i++ {
+	p.X = i
+}
+_ = p`},
+		{"assign/nested", `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+var o Out
+in := In{N: 1}
+for i := 0; i < %d; i++ {
+	o.I = in
+}
+_ = o`},
+	}
+	for _, s := range shapes {
+		b.Run(s.name, func(b *testing.B) {
+			in, fset, f := prepScript(b, fmt.Sprintf(s.body, benchIters))
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := in.Run(fset, f); err != nil {
+					b.Fatalf("run: %v", err)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*benchIters), "ns/iter")
+		})
+	}
+}

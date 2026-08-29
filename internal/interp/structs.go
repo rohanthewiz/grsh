@@ -1511,7 +1511,11 @@ func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) 
 			if err != nil {
 				return nil, err
 			}
-			sv.Vals[idx] = v
+			fv, cerr := coerceField(t.FieldTypes[idx], v)
+			if cerr != nil {
+				return nil, in.wrapAt(kv.Value, cerr, "field", t.Name+"."+key.Name)
+			}
+			sv.Vals[idx] = fv
 			continue
 		}
 		if i >= len(t.Fields) {
@@ -1521,7 +1525,11 @@ func (in *Interp) structComposite(env *Env, t *StructType, n *ast.CompositeLit) 
 		if err != nil {
 			return nil, err
 		}
-		sv.Vals[i] = v
+		fv, cerr := coerceField(t.FieldTypes[i], v)
+		if cerr != nil {
+			return nil, in.wrapAt(el, cerr, "field", t.Name+"."+t.Fields[i])
+		}
+		sv.Vals[i] = fv
 	}
 	return sv, nil
 }
@@ -1743,6 +1751,75 @@ func (in *Interp) structField(n ast.Node, sv *StructVal, field string) (Value, e
 	return sv.Vals[idx], nil
 }
 
+// coerceField adapts a value to the declared type of the field it is
+// being written into. It is what makes `P{X: 1}` put a float64 in a
+// float64 field rather than the int the literal happens to be spelled
+// with.
+//
+// Go converts an untyped constant to the type of the slot it lands in.
+// grsh has no notion of untyped-ness -- `1` has already evaluated to a Go
+// int before anything knows where it is headed -- so the conversion has
+// to be done AT THE SLOT instead. Every container element already did
+// exactly that through convertTo; the struct field was the one storage
+// location that did not, and the gap showed in four ways:
+//
+//	P{X: 1} == P{X: 1.0}      false: int(1) is not float64(1)
+//	map[P]string{P{X: 1}: …}  declines field-wise order, because the
+//	                          field holds two dynamic types across keys
+//	P{X: "s"}   X float64     accepted in silence
+//	Out{I: q}   I In          a Q accepted into an In field
+//
+// The last two are the reason this is not simply convertTo: a field whose
+// type IS a script struct has structValType as its RT, and every struct
+// erases to that, so convertTo would wave any struct through. The
+// declared struct is checked here instead, by the same test convertTo
+// uses at a container slot -- the value's own minted storage type against
+// the field's -- which keeps the two answers agreeing with the interning
+// rule in store.go: two identical declarations of P are mutually
+// acceptable, a Q is not.
+//
+// Two values deliberately pass through untouched:
+//
+//   - A field whose type grsh could not model has a nil RT. declareType
+//     records such a field on purpose and leaves it dynamically typed;
+//     coercing to nothing would be a nil dereference.
+//   - nil itself. It is the one value with a meaning at every type, and
+//     the interpreter stores it everywhere already. The case with no good
+//     answer is a struct-TYPED field: Go rejects `p.I = nil` outright, so
+//     there is nothing to match, and converting would have to invent
+//     either a typed nil *StructVal or a freshly allocated zero struct --
+//     neither of which the script wrote.
+//
+// What it does NOT do is tighten anything convertTo is loose about:
+// `P{X: 1.5}` into an int field still truncates to 1, exactly as
+// `[]int{1.5}` has always done. That looseness is one decision living in
+// one place, and this is not the site to make it two.
+func coerceField(d TypeDesc, v Value) (Value, error) {
+	if d.RT == nil || v == nil {
+		return v, nil
+	}
+	if d.IsStruct() {
+		sv, ok := v.(*StructVal)
+		if !ok || (sv != nil && sv.Type.storeT != d.ST.storeT) {
+			return nil, serr.New(fmt.Sprintf("cannot use %v (%s) as %s", v, valTypeName(v), d.ST.Name))
+		}
+		return sv, nil
+	}
+	// The value is already in the field's own type on the overwhelming
+	// majority of writes -- every int into an int field, every string
+	// into a string field. reflect.TypeOf reads the interface's type word
+	// and allocates nothing, so the common path costs one comparison and
+	// never builds a reflect.Value.
+	if reflect.TypeOf(v) == d.RT {
+		return v, nil
+	}
+	rv, err := convertTo(v, d.RT)
+	if err != nil {
+		return nil, err
+	}
+	return rv.Interface(), nil
+}
+
 // setStructField writes sv.Field = v.
 //
 // It does NOT copy v. setLValue is its only caller and copies every value
@@ -1758,7 +1835,11 @@ func (in *Interp) setStructField(n ast.Node, sv *StructVal, field string, v Valu
 	if !ok {
 		return in.errAt(n, fmt.Sprintf("unknown field %s in %s", field, sv.Type.Name))
 	}
-	sv.Vals[idx] = v
+	fv, err := coerceField(sv.Type.FieldTypes[idx], v)
+	if err != nil {
+		return in.wrapAt(n, err, "field", sv.Type.Name+"."+field)
+	}
+	sv.Vals[idx] = fv
 	return nil
 }
 

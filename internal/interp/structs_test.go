@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/rohanthewiz/serr"
 )
 
 // ---- script-declared struct types ----
@@ -3147,15 +3149,17 @@ func TestAScriptRangesAMapWithANaNKey(t *testing.T) {
 		// levels down and the whole struct-key path -- decode, arena,
 		// field-wise order -- runs over it.
 		//
-		// The literals are written 1.0 and -2.0 DELIBERATELY: `P{X: 1}`
-		// stores an int in a float64 field today, which makes the field
-		// hold two dynamic types across the keys and declines the order
-		// to the text fallback. That is a conversion gap of its own and
-		// not what this test is about, so it is stepped around here.
+		// The literals are written 1 and -2 rather than 1.0 and -2.0
+		// deliberately, and this is the case that used to have to spell
+		// them out: `P{X: 1}` stored an int in a float64 field, so the
+		// field held two dynamic types across the keys and the order
+		// declined to the text fallback. coerceField converts at the
+		// slot now, so the bare integers reach the field as float64 and
+		// the field-wise order runs.
 		src: `type P struct {
 	X float64
 }
-m := map[P]string{P{X: 1.0}: "a", P{X: math.NaN()}: "n", P{X: -2.0}: "c"}`,
+m := map[P]string{P{X: 1}: "a", P{X: math.NaN()}: "n", P{X: -2}: "c"}`,
 		want: []string{"P{X: NaN}=n", "P{X: -2}=c", "P{X: 1}=a"},
 	}} {
 		t.Run(c.name, func(t *testing.T) {
@@ -3527,4 +3531,282 @@ func sliceCasesOf(t *testing.T, fn string) []string {
 			"helper no longer recognises their shape", fn)
 	}
 	return names
+}
+
+// TestAFieldHoldsItsDeclaredType is the core of the conversion: whatever
+// a script writes into a field, the field holds its OWN type afterwards.
+//
+// Every case asserts %T as well as the value, because the value alone
+// cannot see the defect -- `1` and `1.0` both PRINT as 1, and the whole
+// bug was invisible until something asked what type was actually stored.
+// That is also why it went unnoticed: it only surfaced through == and
+// through a map key's ordering, two places where the dynamic type decides
+// the answer and never appears in it.
+func TestAFieldHoldsItsDeclaredType(t *testing.T) {
+	for _, c := range []struct {
+		name, src, want string
+	}{{
+		name: "keyed literal",
+		src:  `p := P{X: 1}`,
+		want: "float64 1",
+	}, {
+		name: "positional literal",
+		src:  `p := P{1}`,
+		want: "float64 1",
+	}, {
+		name: "field assignment",
+		// The literal was the reported site; the assignment is the same
+		// defect one function over. Without it a field would hold a
+		// float64 or an int depending on which statement wrote it.
+		src: `var p P
+p.X = 1`,
+		want: "float64 1",
+	}, {
+		name: "compound assignment",
+		src: `p := P{X: 1}
+p.X += 1`,
+		want: "float64 2",
+	}, {
+		name: "elided literal in a slice",
+		// []P{{X: 1}} reaches structComposite through elidedElem rather
+		// than through evalComposite, so it is a separate route into the
+		// same two lines.
+		src:  `p := []P{{X: 1}}[0]`,
+		want: "float64 1",
+	}, {
+		name: "the zero already agreed",
+		// The control. An untouched field was ALWAYS its declared type --
+		// that is what made the bug so odd to look at: `var p P` gave a
+		// float64 and `P{X: 1}` gave an int, for the same field.
+		src:  `var p P`,
+		want: "float64 0",
+	}, {
+		name: "a float constant into an int field",
+		// The other direction, and the reason the fix is a conversion
+		// rather than a check: Go accepts P{X: 1.0} for an int X because
+		// the constant is representable. grsh cannot tell that constant
+		// from a float64 variable, so it converts both -- which means
+		// P{X: 1.5} truncates here where Go would refuse it. That
+		// looseness is convertTo's, inherited unchanged from what
+		// []int{1.5} has always done, not something coerceField adds.
+		src:  `type P struct { X int }; p := P{X: 1.0}`,
+		want: "int 1",
+	}, {
+		name: "an interface field takes the value as spelled",
+		// A field declared `any` has no type to convert TO, so the
+		// dynamic type is the one the script wrote. Converting here
+		// would be actively wrong.
+		src:  `type P struct { X any }; p := P{X: 1}`,
+		want: "int 1",
+	}} {
+		t.Run(c.name, func(t *testing.T) {
+			src := c.src
+			if !strings.Contains(src, "type P struct") {
+				src = "type P struct {\n\tX float64\n}\n" + src
+			}
+			wantOut(t, src+"\nfmt.Printf(\"%T %v\\n\", p.X, p.X)", c.want+"\n")
+		})
+	}
+}
+
+// TestAKeyedLiteralCoercesTheFieldItNames separates the two indexes a
+// keyed element carries.
+//
+// `P{X: 1, S: "a"}` walks the literal's elements in the order WRITTEN,
+// so the loop counter i is the element's position and idx is the field's
+// -- and they disagree the moment a literal names its fields out of
+// declaration order. Coercing against the wrong one is silent when the
+// two fields happen to share a type, so the struct here is deliberately
+// mixed: a float64 and a string, written in the other order.
+func TestAKeyedLiteralCoercesTheFieldItNames(t *testing.T) {
+	wantOut(t, `type P struct {
+	S string
+	X float64
+}
+p := P{X: 1, S: "a"}
+fmt.Printf("%T %v %T %v\n", p.X, p.X, p.S, p.S)`, "float64 1 string a\n")
+}
+
+// TestAFieldOfAnUnmodelledTypeStaysDynamic pins the escape hatch
+// declareType deliberately leaves open, because coerceField is exactly
+// the thing that could close it by accident.
+//
+// A field whose type grsh cannot resolve -- a self-referential one is the
+// reachable case -- records a zero TypeDesc with a nil RT, and the
+// declaration comment says such a field "simply starts nil and works".
+// Coercing against a nil type would be a nil dereference at best and a
+// blanket refusal at worst, so the nil RT has to short-circuit.
+func TestAFieldOfAnUnmodelledTypeStaysDynamic(t *testing.T) {
+	wantOut(t, `type N struct {
+	Next N
+}
+var n N
+n.Next = 5
+fmt.Println(n.Next)
+n.Next = "anything"
+fmt.Println(n.Next)`, "5\nanything\n")
+}
+
+// TestNilIsStillWritableIntoAnyField pins the second short-circuit, and
+// it is a decision rather than an oversight.
+//
+// nil is the one value with a meaning at every type, and coerceField
+// could plausibly convert it the way a container slot does -- `xs[0] =
+// nil` on a []float64 stores 0. It does not, for the case that has no
+// good answer: a struct-TYPED field. Go rejects `p.I = nil` outright, so
+// there is nothing to match; converting would have to invent either a
+// typed nil *StructVal or a freshly allocated zero struct, neither of
+// which the script wrote. Leaving nil alone keeps a value the
+// interpreter already stores everywhere storable, and costs nothing.
+func TestNilIsStillWritableIntoAnyField(t *testing.T) {
+	wantOut(t, `type In struct {
+	N int
+}
+type P struct {
+	Xs []int
+	A  any
+	I  In
+}
+var p P
+p.Xs = nil
+p.A = nil
+p.I = nil
+fmt.Println(p.Xs == nil, p.A == nil, len(p.Xs))
+q := P{Xs: nil, A: nil, I: nil}
+fmt.Println(q.Xs == nil, q.A == nil)`, "true true 0\ntrue true\n")
+}
+
+// TestTwoStructsAreEqualHoweverTheirFieldsWereSpelled is the first of the
+// two places the untyped-constant gap was actually VISIBLE.
+//
+// structEqual compares field-wise, so two fields holding int(1) and
+// float64(1) made two structs that print identically compare unequal --
+// and the script has no way to see why, since %v shows 1 on both sides.
+func TestTwoStructsAreEqualHoweverTheirFieldsWereSpelled(t *testing.T) {
+	wantOut(t, `type P struct {
+	X float64
+	Y int
+}
+a := P{X: 1, Y: 2}
+b := P{X: 1.0, Y: 2.0}
+fmt.Println(a == b)
+fmt.Println(P{X: 1} == P{X: 1.0000001})`, "true\nfalse\n")
+}
+
+// TestAStructKeyedMapOrdersFieldsWrittenAsBareIntegers is the second, and
+// it is the symptom the Open item was filed under.
+//
+// keyCmp declines to order a field that holds two dynamic types across
+// the keys, and falls back to comparing the RENDERED text. The values are
+// 1, 2 and 10 precisely because those two orders disagree: field-wise
+// gives 1 2 10, text gives 1 10 2. A test using 1 and -2 would pass under
+// the bug.
+func TestAStructKeyedMapOrdersFieldsWrittenAsBareIntegers(t *testing.T) {
+	wantOut(t, `type P struct {
+	X float64
+}
+m := map[P]string{P{X: 10}: "c", P{X: 1}: "a", P{X: 2}: "b"}
+for k, v := range m {
+	fmt.Print(k, "=", v, " ")
+}
+fmt.Println()`, "P{X: 1}=a P{X: 2}=b P{X: 10}=c \n")
+}
+
+// TestAFieldRefusesAValueItsTypeCannotHold covers what the conversion
+// turns into an error rather than a silent store.
+//
+// The struct case is the one that needed code of its own: a field whose
+// type is a script struct has structValType as its RT, every struct
+// erases to that, so convertTo alone would wave a Q into an In field.
+func TestAFieldRefusesAValueItsTypeCannotHold(t *testing.T) {
+	for _, c := range []struct{ name, src, want string }{{
+		name: "a string into a float64 field",
+		src:  `type P struct { X float64 }; _ = P{X: "s"}`,
+		want: "cannot use s (string) as float64",
+	}, {
+		name: "an int into a string field",
+		// convertTo refuses this specially rather than converting: Go's
+		// string(65) is "A", which is never what a script meant here.
+		src:  `type P struct { X string }; _ = P{X: 1}`,
+		want: "(use strconv.Itoa)",
+	}, {
+		name: "another struct into a struct-typed field",
+		src: `type In struct { N int }
+type Q struct { N int }
+type Out struct { I In }
+_ = Out{I: Q{N: 1}}`,
+		want: "cannot use Q{N: 1} (Q) as In",
+	}, {
+		name: "a non-struct into a struct-typed field",
+		src: `type In struct { N int }
+type Out struct { I In }
+_ = Out{I: 7}`,
+		want: "cannot use 7 (int) as In",
+	}, {
+		name: "at an assignment, not only a literal",
+		src: `type P struct { X float64 }
+var p P
+p.X = "s"`,
+		want: "cannot use s (string) as float64",
+	}} {
+		t.Run(c.name, func(t *testing.T) { wantErr(t, c.src, c.want) })
+	}
+}
+
+// TestARefusedFieldWriteRecordsWhichField checks the breadcrumb rather
+// than the message, because that is where it lives.
+//
+// The user-facing one-liner is "loc: message" (see runner.UserMessage),
+// and the loc already pins the exact value that was refused -- naming the
+// field in the text too would be noise at the prompt. The serr attribute
+// is the same shape callReflect attaches for a bad argument, and it is
+// what --debug prints.
+func TestARefusedFieldWriteRecordsWhichField(t *testing.T) {
+	for _, c := range []struct{ name, src, want string }{
+		{"literal", `type P struct { X float64 }; _ = P{X: "s"}`, "P.X"},
+		{"positional literal", `type P struct { X float64 }; _ = P{"s"}`, "P.X"},
+		{"assignment", `type P struct { X float64 }
+var p P
+p.X = "s"`, "P.X"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := eval(t, c.src, nil)
+			if err == nil {
+				t.Fatalf("expected an error, got none\nsource:\n%s", c.src)
+			}
+			got, ok := serr.WrapAsSErr(err).GetAttribute("field")
+			if !ok {
+				t.Fatalf("no \"field\" attribute on %v", err)
+			}
+			if got != c.want {
+				t.Errorf("field attribute = %v, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestTwoDeclarationsOfAStructShareAFieldSlot pins coerceField against
+// the interning rule in store.go rather than against StructType identity.
+//
+// Redeclaring P in an inner scope makes a SECOND *StructType with the
+// same shape, and the two share a minted storage type. Comparing the
+// *StructType pointers would refuse this, and would disagree with what a
+// []P slot already accepts -- one rule, checked the same way in both
+// places.
+func TestTwoDeclarationsOfAStructShareAFieldSlot(t *testing.T) {
+	wantOut(t, `type In struct {
+	N int
+}
+type Out struct {
+	I In
+}
+mk := func() any {
+	type In struct {
+		N int
+	}
+	return In{N: 7}
+}
+var o Out
+o.I = mk()
+fmt.Println(o.I.N)`, "7\n")
 }

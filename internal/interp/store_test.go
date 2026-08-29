@@ -3,6 +3,7 @@ package interp
 import (
 	"fmt"
 	"reflect"
+	"sync/atomic"
 	"testing"
 )
 
@@ -193,20 +194,37 @@ func TestMintedTypesInternByShape(t *testing.T) {
 	}
 }
 
+// loopyRun numbers the struct shapes TestRepeatedDeclarationMintsOnce
+// declares, so each execution of the test mints one nothing has minted
+// before. See the comment on that test for why a fixed name cannot work.
+var loopyRun atomic.Int64
+
 // The leak bound itself: declareType runs on every execution of its
 // statement, so a `type` inside a loop makes a StructType per iteration.
 // Only the SHAPE is minted, so the table must not grow with the trip
 // count.
+//
+// The declared type is given a name unique to this RUN, and that is load
+// bearing rather than tidy. The mint tables are process-global and
+// outlive the test: a fixed name is already in them the second time the
+// test executes, the growth is 0 rather than 1, and the exact assertion
+// below fails on perfectly correct code. That made `go test -count=2`
+// red on this package, and it made a mutation-probe pass -- which runs
+// the suite over and over and reads a failure as "the probe was caught"
+// -- report a catch for every probe, including ones that changed nothing
+// but speed. A unique shape per run is what makes the exact count
+// assertable more than once.
 func TestRepeatedDeclarationMintsOnce(t *testing.T) {
 	storeMu.Lock()
 	before, keysBefore := len(storeTypes), len(keyTypes)
 	storeMu.Unlock()
 
+	name := fmt.Sprintf("Loopy%d", loopyRun.Add(1))
 	if _, err := eval(t, `for i := 0; i < 50; i++ {
-	type Loopy struct {
+	type `+name+` struct {
 		X int
 	}
-	p := Loopy{i}
+	p := `+name+`{i}
 	_ = p
 }`, nil); err != nil {
 		t.Fatalf("run: %v", err)
