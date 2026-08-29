@@ -9,8 +9,11 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
+	"regexp"
 	"runtime"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1725,37 +1728,31 @@ func TestRangingAMapDecodesItsKeysIntoOneArena(t *testing.T) {
 	}
 	keys := mp.MapKeys()
 
-	var sink []Value
+	var sink []*StructVal
 	sorted := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys) })
 	control := testing.AllocsPerRun(50, func() {
-		// The control has to mirror sortMapKeys' CURRENT render, not the
-		// one it had when this test was written. It used to build a
-		// []string with a String() per key; when the render became one
-		// appended slab the control kept the old shape, and the gap
-		// silently grew from "the arena" to "the arena plus the render" --
-		// a floor assertion that still passed while measuring something
-		// else. Everything but the source of the StructVals is copied
-		// from sortMapKeys deliberately, so that it all cancels.
-		ord := make([][]byte, len(keys))
-		bounds := make([]int, len(keys)+1)
-		var buf []byte
-		out := make([]Value, len(keys))
+		// The control has to mirror sortMapKeys' CURRENT shape, not the
+		// one it had when this test was written. It has been wrong twice
+		// already: it built a []string with a String() per key after the
+		// render became one appended slab, and it kept that slab after
+		// the ordering stopped rendering at all. Both times the gap
+		// silently grew from "the arena" to "the arena plus something
+		// else" -- a floor assertion that still passed while measuring
+		// something it did not name. Everything but the source of the
+		// StructVals is copied from sortMapKeys deliberately, so that it
+		// all cancels.
+		out := make([]*StructVal, len(keys))
 		for i, k := range keys {
-			sv := decodeMintedKey(k, nil)
-			out[i] = sv
-			buf = sv.appendTo(buf)
-			bounds[i+1] = len(buf)
-			if i == 0 {
-				buf = growForRest(buf, len(keys))
-			}
-		}
-		for i := range ord {
-			ord[i] = buf[bounds[i]:bounds[i+1]]
+			out[i] = decodeMintedKey(k, nil)
 		}
 		// keys is permuted in place, exactly as sortMapKeys permutes
 		// it; copying it first would put an allocation in the control
 		// that the thing under test does not have.
-		sort.Sort(&keyOrder{ord: ord, keys: keys, decoded: out})
+		var c keyCmp
+		sort.Sort(&fieldOrder{keyOrder: &keyOrder{keys: keys, decoded: out}, cmp: &c})
+		if c.declined {
+			t.Errorf("the control's own keys declined; this map is meant to order field-wise")
+		}
 		sink = out
 	})
 	// The gap, not either number: what the two runs do differently is
@@ -2354,6 +2351,87 @@ func TestAStructKeyedMapMatchesFmt(t *testing.T) {
 	}
 }
 
+// THE TEST THAT SAYS A RANGE AND A PRINT AGREE, over the same randomised
+// maps the renderer's parity test uses.
+//
+// It is not a second copy of that test. That one holds appendStructKeyedMap
+// against fmt; this one holds sortMapKeys -- a different function, with a
+// different sort, reaching keyCmp from the other side -- against the same
+// fixed point, by rebuilding fmt's map text out of the order the RANGE
+// would visit. If the two ever choose different orders for one map, the
+// rebuilt text stops matching.
+//
+// It skips the maps keyCmp declines, and that is not a gap: fmt orders
+// those by a machine address, so there is no order to agree with. What
+// they get instead is determinism, which
+// TestADeclinedMapRangesInRenderedTextOrder pins. Both arms are counted
+// and both are required to be non-empty, because a change that made
+// everything decline would otherwise leave this test asserting nothing.
+func TestARangeVisitsAStructKeyedMapInFmtsOrder(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B string
+}`, "P")
+	pool := []Value{
+		nil, 0, 1, -1, 1 << 40, "", "a", "b", "zzz", true, false,
+		0.5, -0.5, 'x', 'y', byte(3), int64(1 << 41),
+	}
+	valTypes := []reflect.Type{
+		reflect.TypeFor[int](),
+		reflect.TypeFor[string](),
+		reflect.TypeFor[any](),
+		st.storeT,
+	}
+	const seed = 20260829
+	rng := rand.New(rand.NewSource(seed))
+	var took, declined int
+	for _, n := range []int{2, 3, 7, 40} {
+		for _, vt := range valTypes {
+			for trial := 0; trial < 40; trial++ {
+				keys := make([][]Value, n)
+				vals := make([]Value, n)
+				for i := range keys {
+					if rng.Intn(8) == 0 {
+						keys[i] = nil // the nil key, which must sort first
+					} else {
+						keys[i] = []Value{pool[rng.Intn(len(pool))], pool[rng.Intn(len(pool))]}
+					}
+					vals[i] = sampleOfType(t, st, vt, rng)
+				}
+				m := mapOfStructKeys(t, st, vt, keys, vals)
+				if _, ok := appendStructKeyedMap(nil, m); !ok {
+					declined++
+					continue
+				}
+				took++
+				// sortMapKeys permutes both slices together, so keys[i]
+				// is still the map key that decoded[i] came from and is
+				// what its value has to be read with.
+				mk := m.MapKeys()
+				decoded := sortMapKeys(mk)
+				b := []byte("map[")
+				for i, sv := range decoded {
+					if i > 0 {
+						b = append(b, ' ')
+					}
+					b = sv.appendTo(b)
+					b = append(b, ':')
+					b = appendValue(b, fromStore(m.MapIndex(mk[i])))
+				}
+				b = append(b, ']')
+				if got, want := string(b), fmt.Sprintf("%v", m.Interface()); got != want {
+					t.Fatalf("seed %d, n=%d, values %v, trial %d:\n ranged %s\n fmt    %s",
+						seed, n, vt, trial, got, want)
+				}
+			}
+		}
+	}
+	if took == 0 || declined == 0 {
+		t.Errorf("%d maps ordered field-wise and %d declined; both arms have to be reached "+
+			"or this test is asserting nothing", took, declined)
+	}
+}
+
 // sampleOfType makes one value assignable to vt, for the randomised
 // parity test above.
 func sampleOfType(t *testing.T, st *StructType, vt reflect.Type, rng *rand.Rand) Value {
@@ -2608,10 +2686,10 @@ fmt.Println(Holder{M: m, PP: pp, QQ: qq, E: map[P]int{}})
 			"E: map[]}\n")
 }
 
-// appendTo has to APPEND, which is the whole reason it exists: sortMapKeys
-// renders a map's keys end to end into one slab, so a render that ignored
-// the buffer it was handed would still pass every test that only ever
-// calls String.
+// appendTo has to APPEND, which is the whole reason it exists: the
+// text-order fallback in sortMapKeys renders a map's keys end to end into
+// one slab, so a render that ignored the buffer it was handed would still
+// pass every test that only ever calls String.
 func TestAppendToExtendsItsBuffer(t *testing.T) {
 	st := declare(t, `type P struct {
 	A int
@@ -2626,14 +2704,14 @@ func TestAppendToExtendsItsBuffer(t *testing.T) {
 
 // ---- ordering a whole map ----
 
-// The claim sortMapKeys' rewrite rests on is that its cost is PER MAP,
-// not per key: one slab for the rendered text and one sort, where before
-// there were four allocations per key at one field and sixteen at ten.
+// The claim sortMapKeys rests on is that its cost is PER MAP, not per
+// key: one arena and one sort, where before the rewrite there were four
+// allocations per key at one field and sixteen at ten.
 //
 // So the assertion is on the SHAPE, not on a number. Doubling the key
 // count must not double the allocations -- it may add one or two, since
-// the slabs themselves grow -- and a per-key render would show up here as
-// a count that tracks nk. Pinning an exact count instead would report the
+// the arena steps to a new chunk -- and anything per-key would show up
+// here as a count that tracks nk. Pinning an exact count instead would report the
 // compiler's inlining decisions, for the reasons written out in
 // TestRangingAMapDecodesItsKeysIntoOneArena.
 func TestOrderingAMapAllocatesPerMapNotPerKey(t *testing.T) {
@@ -2651,7 +2729,7 @@ func TestOrderingAMapAllocatesPerMapNotPerKey(t *testing.T) {
 			mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
 		}
 		keys := mp.MapKeys()
-		var sink []Value
+		var sink []*StructVal
 		n := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys) })
 		if len(sink) != nk {
 			t.Fatalf("ordering %d keys returned %d", nk, len(sink))
@@ -2669,11 +2747,11 @@ func TestOrderingAMapAllocatesPerMapNotPerKey(t *testing.T) {
 	}
 }
 
-// The three slices sortMapKeys sorts have to move TOGETHER: ord decides
-// the order, keys is what the caller reads the map with, and decoded is
-// what it hands the script as the range variable. A Swap that moved two
-// of the three would still produce sorted output -- and would pair every
-// key with another key's value.
+// The two slices sortMapKeys sorts have to move TOGETHER: keys is what
+// the caller reads the map with, and decoded is what it hands the script
+// as the range variable. A Swap that moved one and not the other would
+// still produce sorted output -- and would pair every key with another
+// key's value.
 //
 // Ranging the map through the interpreter is what makes that visible, so
 // this drives a script rather than sortMapKeys directly.
@@ -2704,12 +2782,21 @@ fmt.Println("done")
 }
 
 // Forty keys is past every threshold in the ordering pass -- the one-key
-// shortcut, the two-key arena bound, and insertion sort's old reach -- so
-// this is the case that pins the ORDER itself. It is the text order, not
-// a numeric one: P{N: 10} sorts before P{N: 2} because "1" < "2", which
-// is exactly what the previous implementation did and what the rewrite
-// had to preserve.
-func TestAMapRangesInRenderedTextOrder(t *testing.T) {
+// shortcut, the two-key arena bound, and the sizes a sort special-cases
+// -- so this is the case that pins the ORDER itself.
+//
+// The order is fmt's, field by field, so P{N: 2} comes before P{N: 10}.
+// It used to be the order of the RENDERED TEXT, which put 10 first
+// because '0' < '}', and that is exactly what changed here.
+//
+// The second half is the whole reason it changed, and is the assertion
+// that would survive a different order being chosen: the same script
+// PRINTS the map, and the sequence the range visited has to be the
+// sequence fmt printed. A bare map handed to fmt.Println never reaches
+// grsh's renderer -- Go's fmt orders and prints it itself -- so that side
+// of the comparison is the standard library's own answer, not a copy of
+// the implementation under test.
+func TestAMapRangesInFmtsOrder(t *testing.T) {
 	out, err := eval(t, `type P struct {
 	N int
 }
@@ -2721,28 +2808,114 @@ for k := range m {
 	fmt.Print(k.N, " ")
 }
 fmt.Println()
+fmt.Println(m)
 `, nil)
 	if err != nil {
 		t.Fatalf("running: %v\n%s", err, out)
 	}
-	// The expectation is built by rendering each key exactly as the
-	// interpreter does and sorting THAT, which is the point of the test:
-	// the order comes from the whole rendered struct, closing brace
-	// included, so P{N: 10} sorts before P{N: 1} ("0" < "}") and 10..19
-	// arrive before 1. Sorting the bare numbers as text gives a different
-	// answer, and that wrong expectation is what this comment is here to
-	// stop the next reader from restoring.
-	rendered := make([]string, 40)
-	for i := range rendered {
-		rendered[i] = fmt.Sprintf("P{N: %d}", i)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want a ranged line and a printed line, got:\n%s", out)
 	}
-	sort.Strings(rendered)
-	want := make([]string, len(rendered))
-	for i, r := range rendered {
-		want[i] = strings.TrimSuffix(strings.TrimPrefix(r, "P{N: "), "}")
+	// Numeric order, spelled out rather than computed, so the test says
+	// what the answer is instead of re-deriving it.
+	want := make([]string, 40)
+	for i := range want {
+		want[i] = strconv.Itoa(i)
 	}
-	if got := strings.TrimSpace(out); got != strings.Join(want, " ") {
-		t.Errorf("a 40-key map ranged as\n  %s\nwant\n  %s", got, strings.Join(want, " "))
+	if got := strings.Fields(lines[0]); !slices.Equal(got, want) {
+		t.Errorf("a 40-key map ranged as\n  %s\nwant\n  %s", strings.Join(got, " "), strings.Join(want, " "))
+	}
+	// What fmt itself printed, read back out of the map text. The values
+	// are dropped: only the order of the keys is being compared.
+	var printed []string
+	for _, m := range regexp.MustCompile(`P\{N: (\d+)\}`).FindAllStringSubmatch(lines[1], -1) {
+		printed = append(printed, m[1])
+	}
+	if !slices.Equal(printed, want) {
+		t.Fatalf("fmt printed the same map as\n  %s\nwant\n  %s -- the test's own expectation is wrong, not the range",
+			strings.Join(printed, " "), strings.Join(want, " "))
+	}
+	if got := strings.Fields(lines[0]); !slices.Equal(got, printed) {
+		t.Errorf("the range visited\n  %s\nbut fmt printed the same map as\n  %s",
+			strings.Join(got, " "), strings.Join(printed, " "))
+	}
+}
+
+// A map keyCmp declines falls back to the rendered-text order, and this
+// is the case that proves the fallback runs rather than being dead code.
+//
+// The two orders DISAGREE on the keys chosen, which is what makes the
+// assertion meaningful: field-wise puts P{N: 2} first, text puts
+// P{N: 10} first because '0' < '}'. Asserting the text order therefore
+// fails if the decline is missed, and fails if the fallback is skipped.
+//
+// The decline itself is the *StructType one: a re-declared P mints one
+// key type but keeps a StructType per declaration, so one map can hold
+// keys from both, and fmt orders those by the addresses of the two
+// StructTypes -- an answer that changes between runs and that nothing
+// here can or should reproduce.
+func TestADeclinedMapRangesInRenderedTextOrder(t *testing.T) {
+	st := declare(t, `type P struct {
+	N int
+}`, "P")
+	other := declare(t, `type P struct {
+	N int
+}`, "P")
+	if other == st || other.keyT != st.keyT {
+		t.Fatal("this test needs two StructTypes sharing one minted key type")
+	}
+	// Forty keys, alternating between the two declarations, for the
+	// reason the two-key version of this test was not enough: a sort of
+	// two elements makes one comparison and then stops, so it cannot tell
+	// an ordering that keeps its slices in step from one that does not.
+	const nk = 40
+	m := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for i := 0; i < nk; i++ {
+		owner := st
+		if i%2 == 1 {
+			owner = other
+		}
+		k, err := structKeyOf(&StructVal{Type: owner, Vals: []Value{i}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.SetMapIndex(intoKeyStore(k, owner.keyT), reflect.ValueOf(i))
+	}
+	// Both declarations render as "P{N: i}", so the expectation is the
+	// plain text order and says out loud what the fallback is: P{N: 10}
+	// before P{N: 2}, which is where it differs from the field-wise
+	// answer this map cannot have.
+	want := make([]string, nk)
+	for i := range want {
+		want[i] = fmt.Sprintf("P{N: %d}", i)
+	}
+	sort.Strings(want)
+
+	// Ten runs, each starting from whatever permutation MapKeys hands
+	// back, because DETERMINISM is what the fallback exists for: fmt's
+	// own order for this map is an address and is not reproducible, so
+	// the only property left to hold is that the script sees the same
+	// order every time.
+	for run := 0; run < 10; run++ {
+		keys := m.MapKeys()
+		decoded := sortMapKeys(keys)
+		got := make([]string, len(decoded))
+		for i, sv := range decoded {
+			got[i] = sv.String()
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("run %d ranged as\n  %s\nwant\n  %s -- the text-order fallback did not run",
+				run, strings.Join(got, " "), strings.Join(want, " "))
+		}
+		// The keys have to have moved with them: the caller reads each
+		// entry's VALUE through keys[i], and the value here is the field.
+		for i, k := range keys {
+			if got, want := fromStore(m.MapIndex(k)), decoded[i].Vals[0]; got != want {
+				t.Fatalf("run %d, slot %d: key %v carries value %v, want %v -- "+
+					"the fallback sort moved the text and left the keys behind", run, i, decoded[i], got, want)
+			}
+		}
 	}
 }
 

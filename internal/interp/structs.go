@@ -608,8 +608,8 @@ func newStructVal(t *StructType, n int) *StructVal {
 // pair of slabs instead of allocating each of them on its own.
 //
 // A range over a struct-keyed map decodes EVERY key before the loop body
-// runs -- sortMapKeys has to render each one to order them -- so all n
-// results are alive simultaneously however they were allocated. That is
+// runs -- sortMapKeys has to compare their fields to order them -- so all
+// n results are alive simultaneously however they were allocated. That is
 // what makes a slab legitimate here rather than clever: it changes where
 // the memory comes from, not how long it lives.
 //

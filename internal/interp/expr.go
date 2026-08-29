@@ -864,7 +864,8 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 			}
 		}
 	case reflect.Map:
-		// Sort keys when possible so scripts are deterministic.
+		// Sort keys when possible so scripts are deterministic -- and,
+		// for a struct-keyed map, in the same order fmt prints them.
 		keys := rv.MapKeys()
 		// sortMapKeys hands back the script's own keys for a struct-keyed
 		// map, because ordering had to decode every one of them anyway.
@@ -907,72 +908,107 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 // or nil when the keys need no decoding.
 //
 // The two jobs are one function because for a struct-keyed map they are
-// one piece of work: ordering needs every key rendered, rendering needs
-// it decoded, and the decoded struct is exactly what the range variable
-// must be. Kept apart, every key of every range was decoded twice.
+// one piece of work: ordering needs every key decoded, and the decoded
+// struct is exactly what the range variable must be. Kept apart, every
+// key of every range was decoded twice.
 //
-// EVERYTHING HERE IS PER MAP, NOT PER KEY, which is what the shape of the
-// cost demanded. BenchmarkSortMapKeys, ns per key, Apple M3:
+// THE ORDER IS fmt's. A struct-keyed map is ordered field by field by
+// keyCmp -- the same comparator appendStructKeyedMap uses to reproduce
+// internal/fmtsort -- so `for k := range m` and `fmt.Println(m)` visit
+// the entries in the same order. They did not before. This ordered by
+// each key's RENDERED TEXT, which puts P{N: 10} before P{N: 2} because
+// '0' < '}', while fmt compares the fields themselves and puts 2 first.
+// Both orders were deterministic and neither was wrong; they simply
+// disagreed, so a script that printed a map and then ranged it saw its
+// entries in two different orders. That is the disagreement this closes.
+//
+// DROPPING THE RENDER IS WHY IT ALSO GOT FASTER, and the trade is a
+// SHAPE trade rather than a free win. The text order had to render every
+// key before the first comparison -- n renders of text nothing would ever
+// read -- where keyCmp reads the decoded fields the range variable is
+// made of anyway. But a render is paid n times and a comparison n log n
+// times, so what was removed grows more slowly than what replaced it.
+// BenchmarkSortMapKeys, ns per key, Apple M3, minimum of six runs:
 //
 //	keys              4      16      64     256    1024
 //	 struct, 1 field
-//	  before      187.5   177.8   196.2   322.7  1005.0
-//	  after        87.2    79.2    62.1    66.3    82.4
-//	  allocs      19->8   67->9  259->9 1027->10 4099->16
+//	  text        104.8    84.2    70.0    71.9    80.2
+//	  fields       45.8    48.3    54.9    74.6    95.0
+//	  allocs      8->6    9->6    9->6   10->6   15->12
 //	 struct, 10 fields
-//	  before      806.0   749.9   780.6   981.3  1834.0
-//	  after       186.2   161.9   166.7   190.4   211.1
-//	  allocs     67->12 259->12 1027->12 4099->18 16387->36
-//	 string
-//	  before       14.4    16.9    54.4   204.6   789.1
-//	  after         9.5    15.7    26.0    36.9    51.6
-//	  allocs       1->0    1->0    1->0     1->0     1->0
+//	  text        181.7   166.0   180.3   194.3   208.5
+//	  fields       50.6    49.5    66.7    85.6   122.2
+//	  allocs     12->6   12->6   12->6  18->12  36->30
 //
-// Two costs sat on top of each other and both are gone. The RENDER was
-// four allocations a key at one field and sixteen at ten -- a
-// strings.Builder plus an fmt.Fprintf per FIELD -- for text that is
-// thrown away as soon as the order is fixed; it now appends into one slab
-// for the whole map, which is what turns a per-key allocation count into
-// a per-MAP one. The SORT was insertion sort, quadratic, invisible at
-// four keys and most of the cost at a thousand; the flat ns/key of the
-// "after" rows is the shape that changed, not merely the height.
+// The allocations that go are the render's -- the slab and the doubling
+// steps it took, the bounds, and the slice of views cut into it. What is
+// left is the arena's, and it still steps rather than tracking n.
 //
-// The counts that still grow -- 9 to 16 at a thousand one-field keys --
-// are keyArena cutting a fresh chunk every keyChunkVals slots, which is
-// the retention cap and not a per-key cost: they step, they do not
-// track n.
+// A ONE-FIELD KEY PAST ~256 IS THE ONE PLACE THIS LOSES: 18% at a
+// thousand. One int field makes a comparison almost as cheap as
+// bytes.Compare on the rendered text, so removing n renders no longer
+// pays for the n log n comparisons that remain. Ten fields move the
+// crossover past every count measured, because the comparison still
+// stops at the first field while the render has ten of them to write --
+// the wider the key, the further out it goes. A shell ranging a
+// thousand-key map is not the case worth tuning for, and the four-key map
+// it does range is 2.3x faster, so the trade is taken as it stands.
 //
-// WHAT IS DELIBERATELY UNCHANGED is the ORDER itself: keys are compared
-// as the text they render to, so `P{X: 10}` still sorts before `P{X: 2}`.
-// The sort is no longer stable, and that costs nothing here, because ties
-// are keys with identical text and distinct contents (an int 1 and a
-// string "1" in the same field) -- their relative order was already the
-// map's own randomised iteration order, which stability preserved rather
-// than fixed.
-func sortMapKeys(keys []reflect.Value) []Value {
+// Read the table knowing the benchmark's keys differ in their FIRST
+// field, which is the comparator's best case and the render's worst. Keys
+// that tie for a few fields before they differ would move the crossover
+// in.
+//
+// A DECLINED MAP FALLS BACK TO THE TEXT ORDER. keyCmp refuses to invent
+// an answer wherever fmtsort's own comes from a machine address -- two
+// keys carrying different *StructTypes, one field holding two different
+// dynamic types, a field type it has no case for -- and in exactly those
+// cases fmt has no order to match: its answer changes between runs. So
+// the fallback's job is not parity but DETERMINISM, and the rendered text
+// is the order that already had that property.
+//
+// THE DECLINE IS FOUND BY THE SORT, not by a pass over the keys first,
+// and that is deliberate rather than lazy. A pre-pass would have to
+// declare a whole field position declined the moment two keys disagree
+// about its type, including when no comparison ever reaches that field --
+// P{A: 1, B: 1} and P{A: 2, B: "x"} are settled by A, by fmt as well as
+// here, so declining them would give up a map the two agree on. Finding
+// it in the comparator gives up only the pairs actually asked about.
+//
+// What makes that safe is that a pair the sort SKIPS cannot be a pair the
+// answer depends on. A correct comparison sort has to compare every pair
+// that ends up adjacent in its output, so a skipped pair x,y has some z
+// between them with x < z < y; those two comparisons did not decline, so
+// fmt orders them the same way, and fmt therefore puts x before y for the
+// same reason this does. The pairs whose order rests on an address are
+// exactly the adjacent ones, and those are exactly the ones compared.
+func sortMapKeys(keys []reflect.Value) []*StructVal {
 	n := len(keys)
 	if n == 0 {
 		return nil
 	}
 	// The type is asked, not the value: every key in a map shares one
 	// type, so one lookup settles the whole slice. It is hoisted above
-	// the render because the struct case needs the type itself and not
+	// the decode because the struct case needs the type itself and not
 	// merely the fact that there is one; a non-struct key kind leaves
 	// keyOwnerOf on its first line, so the hoist costs the string case
 	// nothing.
 	kt := keyOwnerOf(keys[0].Type())
 	strKeys := keys[0].Kind() == reflect.String
 	if !strKeys && kt == nil {
-		// No order this function can give, and nothing to decode.
+		// No order this function can give, and nothing to decode. That
+		// is the remaining gap in "a range matches fmt": an int-keyed map
+		// lands here and is ranged in the map's own randomised order,
+		// where fmt sorts it numerically. Closing it means a comparator
+		// per scalar kind rather than keyCmp, which is about decoded
+		// structs, so it is a separate change and not this one.
 		return nil
 	}
 	// A MAP OF ONE KEY IS ALREADY ORDERED. Everything below exists to
-	// establish an order, so a single key skips the render entirely --
-	// which for a struct key was the most expensive thing here, ~190ns at
-	// one field and ~740ns at ten for text nothing would have read.
+	// establish an order, so a single key skips straight to the decode.
 	if n == 1 {
 		if kt != nil {
-			return []Value{decodeMintedKey(keys[0], nil)}
+			return []*StructVal{decodeMintedKey(keys[0], nil)}
 		}
 		return nil
 	}
@@ -982,6 +1018,9 @@ func sortMapKeys(keys []reflect.Value) []Value {
 		// to render, nothing to memoise and nothing to keep in step, so
 		// this branch sorts the keys THEMSELVES and touches no memory at
 		// all -- reflect.Value.String on a string key is a header load.
+		//
+		// It is also already fmt's order, and always was: fmtsort orders
+		// string keys with strings.Compare, which is this.
 		//
 		// Two other shapes were written first. All three in one binary,
 		// minimum of eight runs at a fixed iteration count, Apple M3, ns
@@ -1000,9 +1039,6 @@ func sortMapKeys(keys []reflect.Value) []Value {
 		// in a shell. One allocation-free path that leads everywhere up
 		// to 256 keys and trails by 10% at 1024 beat two paths and a
 		// threshold between them.
-		//
-		// The struct branch below cannot make this trade: its sort text
-		// costs a render, so it has to be memoised whatever the key count.
 		slices.SortFunc(keys, func(a, b reflect.Value) int {
 			return strings.Compare(a.String(), b.String())
 		})
@@ -1011,19 +1047,6 @@ func sortMapKeys(keys []reflect.Value) []Value {
 		return nil
 	}
 
-	// A struct key holds a *StructType POINTER, so any ordering Go would
-	// derive from the key itself varies run to run. Sorting on the
-	// rendered struct -- the same text the script would print -- is both
-	// reproducible across runs and the order a reader expects.
-	//
-	// ord holds one VIEW per key of that text; buf holds all of it end to
-	// end. Views cannot be taken while buf is still growing -- an append
-	// that reallocates would leave them pointing at the old array -- so
-	// the render records bounds and the views are cut once, after.
-	ord := make([][]byte, n)
-	bounds := make([]int, n+1)
-	var buf []byte
-	decoded := make([]Value, n)
 	// One arena for the whole map. Every key is decoded HERE, before the
 	// caller's loop body runs even once, so all of them are alive
 	// together whether they came from an arena or not -- the slab changes
@@ -1037,12 +1060,34 @@ func sortMapKeys(keys []reflect.Value) []Value {
 	if n > 2 {
 		arena = newKeyArena(kt, n)
 	}
+	// Held as the *StructVal it is, so a nil key stays the typed nil the
+	// script sees everywhere else. keyCmp and appendTo both answer for it.
+	decoded := make([]*StructVal, n)
 	for i, k := range keys {
-		sv := decodeMintedKey(k, arena)
-		// Held as the *StructVal it is, so a nil key stays the typed nil
-		// the script sees everywhere else. appendTo answers for it
-		// exactly as String does.
-		decoded[i] = sv
+		decoded[i] = decodeMintedKey(k, arena)
+	}
+
+	pair := &keyOrder{keys: keys, decoded: decoded}
+	// The comparator records a decline rather than returning one, which
+	// is what lets it mirror fmtsort's own recursive shape instead of
+	// threading an error through it. A declined sort leaves a meaningless
+	// order behind, which the fallback below overwrites entirely.
+	var c keyCmp
+	sort.Sort(&fieldOrder{keyOrder: pair, cmp: &c})
+	if !c.declined {
+		return decoded
+	}
+
+	// THE FALLBACK. Render every key once and order by that text.
+	//
+	// ord holds one VIEW per key of that text; buf holds all of it end to
+	// end. Views cannot be taken while buf is still growing -- an append
+	// that reallocates would leave them pointing at the old array -- so
+	// the render records bounds and the views are cut once, after.
+	ord := make([][]byte, n)
+	bounds := make([]int, n+1)
+	var buf []byte
+	for i, sv := range decoded {
 		buf = sv.appendTo(buf)
 		bounds[i+1] = len(buf)
 		if i == 0 {
@@ -1052,7 +1097,7 @@ func sortMapKeys(keys []reflect.Value) []Value {
 	for i := range ord {
 		ord[i] = buf[bounds[i]:bounds[i+1]]
 	}
-	sort.Sort(&keyOrder{ord: ord, keys: keys, decoded: decoded})
+	sort.Sort(&textOrder{keyOrder: pair, ord: ord})
 	return decoded
 }
 
@@ -1069,42 +1114,65 @@ func growForRest(buf []byte, n int) []byte {
 	return slices.Grow(buf, (n-1)*len(buf)+len(buf)/8+16)
 }
 
-// keyOrder orders the three parallel slices sortMapKeys builds for a
-// struct-keyed map: the rendered text that decides the order, the map's
-// own keys, and the decoded structs the range variable will be. All three
-// have to move together, which is why this is a sort.Interface rather
-// than one of the slices helpers.
+// keyOrder is the pair of slices any ordering of a struct-keyed map has
+// to keep in step: the map's own keys, which the caller reads values
+// with, and the decoded structs it hands the script as the range
+// variable. A Swap that moved one and not the other would still produce
+// sorted output -- and would pair every key with another key's value.
+//
+// It carries no Less. The two orders below supply that, because
+// sortMapKeys has two of them: fmt's, and the text order it falls back on
+// when fmt's cannot be reproduced.
 //
 // It is deliberately not inspect.go's keySorter. That one sorts two
-// slices by a []string it keeps and PRINTS afterwards; this one sorts
-// three by text that is scratch, so the text lives as views into one slab
-// and is dropped on return. Merging them would force one caller to carry
-// the other's cost -- a third slice to swap, or n string allocations.
+// slices by a []string it keeps and PRINTS afterwards; this one sorts by
+// something that is scratch either way and is dropped on return. Merging
+// them would force one caller to carry the other's cost.
 //
-// The receiver is a POINTER so Less and Swap do not copy three slice
-// headers on every call of a sort's inner loop.
-//
-// It replaces an insertion sort that had stood since map ranges were
-// added. That was quadratic, which the benchmark did not show until it
-// reached key counts a script could plausibly build: at 1024 keys the
-// ordering cost more than everything else in a range put together. The
-// comment it replaces claimed insertion sort "keeps this dependency-free"
-// -- sort is the standard library and this package already imports it in
-// inspect.go, so that was never a cost.
+// The receivers are POINTERS so Less and Swap do not copy slice headers
+// on every call of a sort's inner loop.
 type keyOrder struct {
-	ord     [][]byte
 	keys    []reflect.Value
-	decoded []Value
+	decoded []*StructVal
 }
 
-func (s *keyOrder) Len() int { return len(s.ord) }
-
-func (s *keyOrder) Less(i, j int) bool { return bytes.Compare(s.ord[i], s.ord[j]) < 0 }
+func (s *keyOrder) Len() int { return len(s.keys) }
 
 func (s *keyOrder) Swap(i, j int) {
-	s.ord[i], s.ord[j] = s.ord[j], s.ord[i]
 	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
 	s.decoded[i], s.decoded[j] = s.decoded[j], s.decoded[i]
+}
+
+// fieldOrder is fmt's order: keyCmp over the decoded structs, which is
+// internal/fmtsort's comparison rewritten over keys that have already
+// been decoded. cmp is shared with the caller, which reads its decline
+// flag once the sort is done.
+type fieldOrder struct {
+	*keyOrder
+	cmp *keyCmp
+}
+
+func (s *fieldOrder) Less(i, j int) bool { return s.cmp.keys(s.decoded[i], s.decoded[j]) < 0 }
+
+// textOrder is the fallback: the keys ordered as the text they render to,
+// which is what this function used before it could reproduce fmt's order
+// and is still the only deterministic answer for a map fmt itself orders
+// by address.
+//
+// Ties -- two distinct keys with identical text, an int 1 and a string
+// "1" in the same field -- keep whatever order the declined sort above
+// left them in, which is the map's own randomised one. That was true of
+// the text order before this too: the sort was never stable.
+type textOrder struct {
+	*keyOrder
+	ord [][]byte
+}
+
+func (s *textOrder) Less(i, j int) bool { return bytes.Compare(s.ord[i], s.ord[j]) < 0 }
+
+func (s *textOrder) Swap(i, j int) {
+	s.ord[i], s.ord[j] = s.ord[j], s.ord[i]
+	s.keyOrder.Swap(i, j)
 }
 
 // ---- declarations & switch ----

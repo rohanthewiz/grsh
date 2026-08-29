@@ -792,11 +792,17 @@ var (
 //
 // It is a different unit again from BenchmarkMapKeyArena. That one prices
 // the DECODE of n keys, which is linear in n; this one prices decode plus
-// render plus sort, and the sort is the part whose shape is not linear.
-// The key counts run to 1024 for exactly that reason: a quadratic term
-// hiding under a linear one is invisible until the counts are far enough
-// apart to separate them, and ns/key is what makes that visible -- a
-// linear cost holds its ns/key flat as n grows, a quadratic one does not.
+// sort, and the sort is the part whose shape is not linear. The key
+// counts run to 1024 for exactly that reason: a quadratic term hiding
+// under a linear one is invisible until the counts are far enough apart
+// to separate them, and ns/key is what makes that visible -- a linear
+// cost holds its ns/key flat as n grows, a quadratic one does not.
+//
+// It is also what prices the trade sortMapKeys made when it stopped
+// ordering by rendered text: the render was linear and the comparisons
+// that replaced it are n log n, so the struct rows are the measurement
+// that says where the two cross. The table in sortMapKeys' doc is this
+// benchmark, both ways.
 //
 // EACH ITERATION RE-SCRAMBLES, by copying a fixed unsorted permutation
 // over the working slice. sortMapKeys sorts in place, so without the copy
@@ -881,7 +887,7 @@ func BenchmarkSortMapKeys(b *testing.B) {
 
 // sortSink keeps sortMapKeys' result live; it is nil for the string row,
 // which is itself part of what that row asserts.
-var sortSink []Value
+var sortSink []*StructVal
 
 // BenchmarkAppendSliceValue prices appendValue's slice cases against the
 // fmt fallback they replaced, which is the measurement the cases exist
