@@ -1729,7 +1729,7 @@ func TestRangingAMapDecodesItsKeysIntoOneArena(t *testing.T) {
 	keys := mp.MapKeys()
 
 	var sink []*StructVal
-	sorted := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys) })
+	sorted := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys, nil) })
 	control := testing.AllocsPerRun(50, func() {
 		// The control has to mirror sortMapKeys' CURRENT shape, not the
 		// one it had when this test was written. It has been wrong twice
@@ -2408,7 +2408,7 @@ func TestARangeVisitsAStructKeyedMapInFmtsOrder(t *testing.T) {
 				// is still the map key that decoded[i] came from and is
 				// what its value has to be read with.
 				mk := m.MapKeys()
-				decoded := sortMapKeys(mk)
+				decoded := sortMapKeys(mk, nil)
 				b := []byte("map[")
 				for i, sv := range decoded {
 					if i > 0 {
@@ -2730,7 +2730,7 @@ func TestOrderingAMapAllocatesPerMapNotPerKey(t *testing.T) {
 		}
 		keys := mp.MapKeys()
 		var sink []*StructVal
-		n := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys) })
+		n := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys, nil) })
 		if len(sink) != nk {
 			t.Fatalf("ordering %d keys returned %d", nk, len(sink))
 		}
@@ -2899,7 +2899,7 @@ func TestADeclinedMapRangesInRenderedTextOrder(t *testing.T) {
 	// order every time.
 	for run := 0; run < 10; run++ {
 		keys := m.MapKeys()
-		decoded := sortMapKeys(keys)
+		decoded := sortMapKeys(keys, nil)
 		got := make([]string, len(decoded))
 		for i, sv := range decoded {
 			got[i] = sv.String()
@@ -2999,7 +2999,7 @@ func TestAScalarKeyedMapRangesInFmtsOrder(t *testing.T) {
 					m.SetMapIndex(k, reflect.ValueOf(1))
 				}
 				keys := m.MapKeys()
-				if decoded := sortMapKeys(keys); decoded != nil {
+				if decoded := sortMapKeys(keys, nil); decoded != nil {
 					t.Fatalf("%s: a scalar key was decoded; the caller reads the map's own keys", c.name)
 				}
 				b := []byte("map[")
@@ -3033,7 +3033,7 @@ func TestAnInterfaceKeyedMapDeclinesToTextOrder(t *testing.T) {
 	want := []string{"1", "3", "a", "b", "true"}
 	for run := 0; run < 10; run++ {
 		keys := m.MapKeys()
-		if decoded := sortMapKeys(keys); decoded != nil {
+		if decoded := sortMapKeys(keys, nil); decoded != nil {
 			t.Fatal("an interface key was decoded")
 		}
 		got := make([]string, len(keys))
@@ -3109,6 +3109,230 @@ fmt.Println()
 	sort.Strings(want)
 	if got := strings.TrimSpace(out); got != strings.Join(want, " ") {
 		t.Errorf("a 40-key string map ranged as\n  %s\nwant\n  %s", got, strings.Join(want, " "))
+	}
+}
+
+// ---- a key no lookup can find ----
+
+// THE CRASH THIS PINS. A range used to walk a map's keys and fetch each
+// value with rv.MapIndex(k), which fails on the one key that is not equal
+// to itself: a NaN is a live entry no lookup can ever find, MapIndex
+// handed back the zero Value, and the range died reading it --
+//
+//	grsh: grsh internal error: reflect: call of reflect.Value.Interface on zero Value
+//
+// -- for a bare float key, for a map[any]V boxing one, and for a script
+// struct with a float field, which are the three ways a NaN reaches a map
+// key. All three run here, each ranged AND printed, because the fix must
+// not cost the order the previous two sessions bought.
+func TestAScriptRangesAMapWithANaNKey(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		src  string
+		want []string
+	}{{
+		name: "float key",
+		// fmt sorts NaN below every other float, and so does the range.
+		src:  `m := map[float64]string{1.5: "a", 3: "b", math.NaN(): "n", -2: "c"}`,
+		want: []string{"NaN=n", "-2=c", "1.5=a", "3=b"},
+	}, {
+		name: "interface key",
+		// Every key is a float64, so the interface order is the float
+		// order rather than a decline.
+		src:  `m := map[any]string{1.5: "a", math.NaN(): "n", -2.0: "c"}`,
+		want: []string{"NaN=n", "-2=c", "1.5=a"},
+	}, {
+		name: "struct key",
+		// The minted key holds its fields as `any`, so the NaN is two
+		// levels down and the whole struct-key path -- decode, arena,
+		// field-wise order -- runs over it.
+		//
+		// The literals are written 1.0 and -2.0 DELIBERATELY: `P{X: 1}`
+		// stores an int in a float64 field today, which makes the field
+		// hold two dynamic types across the keys and declines the order
+		// to the text fallback. That is a conversion gap of its own and
+		// not what this test is about, so it is stepped around here.
+		src: `type P struct {
+	X float64
+}
+m := map[P]string{P{X: 1.0}: "a", P{X: math.NaN()}: "n", P{X: -2.0}: "c"}`,
+		want: []string{"P{X: NaN}=n", "P{X: -2}=c", "P{X: 1}=a"},
+	}} {
+		t.Run(c.name, func(t *testing.T) {
+			// The script builds and ranges the map five times over, from
+			// five fresh maps, because the order the sort starts from is
+			// the map's own randomised one -- a pairing bug that leaves
+			// a small map already correct would otherwise pass here as
+			// often as it fails.
+			out, err := eval(t, `for run := 0; run < 5; run++ {
+`+c.src+`
+for k, v := range m {
+	fmt.Print(k, "=", v, " ")
+}
+fmt.Println()
+}
+`, nil)
+			if err != nil {
+				t.Fatalf("running: %v\n%s", err, out)
+			}
+			// Compared line by line rather than field by field: a struct
+			// key renders with a space inside it (`P{X: 1}`), so
+			// splitting on whitespace would cut the keys in half and
+			// compare two wrong lists that print identically in a
+			// failure message.
+			want := strings.Join(c.want, " ")
+			for run, line := range strings.Split(strings.TrimSpace(out), "\n") {
+				if got := strings.TrimSpace(line); got != want {
+					t.Errorf("run %d ranged\n  %s\nwant\n  %s", run, got, want)
+				}
+			}
+		})
+	}
+}
+
+// Every value must still land beside the key it belongs to, which is the
+// thing the fix could get wrong: keys and values are now two slices, and
+// a sort that moved one without the other would produce a perfectly
+// ordered map of mismatched pairs.
+//
+// EVERY VALUE HERE IS ITS OWN KEY'S TEXT, so the pairing is checkable
+// without a lookup -- which is the point, since a NaN key is exactly the
+// key no lookup can find. Each map is built and ranged ten times, because
+// the permutation the sort starts from is the map's own randomised one
+// and a swap bug need not show on the first.
+//
+// The cases cover all three sorters that carry values: scalarOrder for a
+// float and an accepted interface key, textOrder for a declined one, and
+// keyOrder for a struct key.
+func TestARangedMapPairsEveryValueWithItsOwnKey(t *testing.T) {
+	st := declare(t, `type P struct {
+	X float64
+	Y int
+}`, "P")
+	nan := math.NaN()
+
+	// build makes one map[K]string whose every value is fmt's text for
+	// its key, from the keys given.
+	build := func(kt reflect.Type, keys []any) reflect.Value {
+		m := reflect.MakeMap(reflect.MapOf(kt, reflect.TypeFor[string]()))
+		for _, k := range keys {
+			kv := reflect.ValueOf(k)
+			if kt.Kind() == reflect.Interface {
+				// A map[any]string wants the key boxed, not converted.
+				kv = reflect.ValueOf(&k).Elem()
+			}
+			m.SetMapIndex(kv, reflect.ValueOf(fmt.Sprint(k)))
+		}
+		return m
+	}
+	// structMap is build for a P key: the key is minted, and its text is
+	// the promoted String the minted type carries.
+	structMap := func(fields [][]Value) reflect.Value {
+		m := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[string]()))
+		for _, f := range fields {
+			k, err := structKeyOf(&StructVal{Type: st, Vals: f})
+			if err != nil {
+				t.Fatalf("encoding key %v: %v", f, err)
+			}
+			kv := intoKeyStore(k, st.keyT)
+			m.SetMapIndex(kv, reflect.ValueOf(fmt.Sprint(kv.Interface())))
+		}
+		return m
+	}
+
+	cases := []struct {
+		name string
+		m    reflect.Value
+	}{
+		{"float with a NaN", build(reflect.TypeFor[float64](), []any{1.5, -2.0, nan, 0.0, 99.25})},
+		{"int, the unpaired path", build(reflect.TypeFor[int](), []any{3, -1, 0, 77, 12})},
+		{"string, the unpaired path", build(reflect.TypeFor[string](), []any{"b", "a", "zz", "", "m"})},
+		// One dynamic type throughout: the interface order is taken.
+		{"interface, accepted", build(reflect.TypeFor[any](), []any{1.5, -2.0, nan, 7.0})},
+		// int and string together: fmt orders those by which type was
+		// linked lower, so keyCmp declines and the text order runs.
+		{"interface, declined to text", build(reflect.TypeFor[any](), []any{1, "a", 2.5, nan, "z"})},
+		{"struct with a NaN field", structMap([][]Value{{1.0, 2}, {nan, 3}, {-4.0, 5}, {1.0, 9}})},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for run := 0; run < 10; run++ {
+				keys, vals := mapKeysAndVals(c.m)
+				sortMapKeys(keys, vals)
+				for i, k := range keys {
+					want := fmt.Sprint(k.Interface())
+					// Read the value exactly as rangeOver does, which is
+					// what makes the two unpaired rows worth having: they
+					// assert the MapIndex route still pairs correctly and
+					// that mapKeysAndVals really did leave them on it.
+					v := c.m.MapIndex(k)
+					if vals != nil {
+						v = vals[i]
+					}
+					if got := v.String(); got != want {
+						t.Fatalf("run %d, slot %d: key %s carries value %q, want %q "+
+							"-- the sort moved keys without their values",
+							run, i, want, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// mayNotEqualItself decides which maps pay for the paired pass, and it is
+// pinned by type rather than by behaviour because a wrong NO is a crash
+// while a wrong YES is only slower -- the two failures are not symmetric,
+// and only a table makes the NO side visible.
+func TestMayNotEqualItselfNamesTheKeysMapIndexCannotFind(t *testing.T) {
+	st := declare(t, `type P struct {
+	X int
+}`, "P")
+	type plainStruct struct {
+		A int
+		B string
+	}
+	type floatStruct struct {
+		A int
+		B float32
+	}
+	type nested struct{ In floatStruct }
+	cases := []struct {
+		t    reflect.Type
+		want bool
+	}{
+		// The two commonest maps a script writes, and the reason the
+		// question is asked at all: neither pays anything.
+		{reflect.TypeFor[string](), false},
+		{reflect.TypeFor[int](), false},
+		{reflect.TypeFor[uint64](), false},
+		{reflect.TypeFor[bool](), false},
+		{reflect.TypeFor[rune](), false},
+		{reflect.TypeFor[*int](), false},
+		{reflect.TypeFor[chan int](), false},
+		{reflect.TypeFor[plainStruct](), false},
+		{reflect.TypeFor[[4]int](), false},
+		// A NaN lives in any of these.
+		{reflect.TypeFor[float32](), true},
+		{reflect.TypeFor[float64](), true},
+		{reflect.TypeFor[complex128](), true},
+		{reflect.TypeFor[any](), true},
+		{reflect.TypeFor[error](), true},
+		{reflect.TypeFor[floatStruct](), true},
+		{reflect.TypeFor[nested](), true},
+		{reflect.TypeFor[[4]float64](), true},
+		// A MINTED KEY IS ALWAYS A YES, even for a struct of one int
+		// field: the carrier holds the script's fields as `any`, and the
+		// type cannot say what went into them. This is the conservative
+		// arm mapKeysAndVals documents, and it is here so that a future
+		// change of storage that made it a NO would have to be a
+		// deliberate one.
+		{st.keyT, true},
+	}
+	for _, c := range cases {
+		if got := mayNotEqualItself(c.t); got != c.want {
+			t.Errorf("mayNotEqualItself(%s) = %v, want %v", c.t, got, c.want)
+		}
 	}
 }
 

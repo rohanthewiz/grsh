@@ -867,11 +867,16 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 	case reflect.Map:
 		// Sort keys when possible so scripts are deterministic -- and,
 		// for a struct-keyed map, in the same order fmt prints them.
-		keys := rv.MapKeys()
+		//
+		// vals is non-nil only when the key type makes MapIndex an unsafe
+		// way to reach a value; see mapKeysAndVals. When it is non-nil it
+		// is held in step with keys by every sort below, so vals[i] is
+		// keys[i]'s value however the keys were reordered.
+		keys, vals := mapKeysAndVals(rv)
 		// sortMapKeys hands back the script's own keys for a struct-keyed
 		// map, because ordering had to decode every one of them anyway.
 		// Decoding again in this loop would do that work twice per key.
-		decoded := sortMapKeys(keys)
+		decoded := sortMapKeys(keys, vals)
 		for i, k := range keys {
 			// The key erasure is undone by that decode: a struct-keyed
 			// map stores a minted key wrapping a StructKey, and the
@@ -885,7 +890,17 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 			} else {
 				key = k.Interface()
 			}
-			cont, err := iterate(key, fromStore(rv.MapIndex(k)))
+			// The value comes from the key when a lookup by key is
+			// sound, which is the common case and costs one hash and no
+			// second slice; otherwise it was pulled beside the key by
+			// the one pass that read them both. See mapKeysAndVals.
+			var val reflect.Value
+			if vals != nil {
+				val = vals[i]
+			} else {
+				val = rv.MapIndex(k)
+			}
+			cont, err := iterate(key, fromStore(val))
 			if err != nil || !cont {
 				return err
 			}
@@ -902,6 +917,114 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 		return in.errAt(n, fmt.Sprintf("cannot range over %s", valTypeName(x)))
 	}
 	return nil
+}
+
+// mapKeysAndVals reads a map's keys, and reads its VALUES beside them
+// when reading them any other way would be unsound.
+//
+// THE UNSOUND WAY IS MapIndex, and what breaks it is a key that is not
+// equal to itself. A range used to walk keys from MapKeys and fetch each
+// value with rv.MapIndex(k); a NaN key is a live entry of the map that no
+// lookup can ever find, so MapIndex handed back the zero Value and the
+// range died on it:
+//
+//	nan := math.NaN()
+//	for k, v := range map[float64]int{1: 1, nan: 2} { ... }
+//	grsh: grsh internal error: reflect: call of reflect.Value.Interface on zero Value
+//
+// It is not only a bare float key. A NaN reaches a map key through any
+// container that carries one -- a map[any]V holding one, a script struct
+// with a float field -- and every one of those keys is equally unfindable.
+//
+// THE FIX IS ONE MapRange PASS that takes the key and the value together,
+// because an iterator hands over the entry it is standing on and never
+// has to find it. The cost is a second slice of n Values plus keeping it
+// in step with the keys through the sort; what it buys back is the n hash
+// lookups the MapIndex loop was paying, and WHICH OF THE TWO IS BIGGER
+// DEPENDS ENTIRELY ON HOW EXPENSIVE THE KEY IS TO HASH.
+// BenchmarkRangeMapEntries, whole acquisition, 64 entries, ns per entry,
+// Apple M3, minimum of eight runs:
+//
+//	key         paired   by key
+//	 int          58.1     58.6     same route, so same number
+//	 string       70.6     70.1     same route
+//	 float64      74.5     68.5     +9%, and two allocations
+//	 struct P    108.1    142.7     -24%, and one allocation
+//
+// A float hashes in a few instructions, so paying a slice to skip 64 of
+// those lookups loses by 9%. A minted struct key is four words with an
+// interface field in it, and skipping those lookups wins by 24% -- so the
+// map with no choice about the route is the one the route suits.
+//
+// WHICH MAPS PAY IS DECIDED ONCE, BY TYPE, which is why the first two
+// rows are flat: the two commonest maps a script writes -- string-keyed
+// and int-keyed -- stay on the old path exactly, allocate no second
+// slice, and sort as they always did. Only a key type that CAN hold a NaN
+// takes the paired pass.
+//
+// The question is asked of the type rather than of the keys because
+// asking the keys means a pass over them, and the pass is the thing being
+// decided on. A type-level yes is therefore conservative: a map[P]int
+// whose P has only int fields still takes the paired pass, because P's
+// stored key form holds its fields as `any` and the type cannot say what
+// went into them. The struct row above is why that is left alone -- the
+// conservative answer is the faster one there, so a refinement that put
+// some struct-keyed maps back on MapIndex would be a pessimisation
+// dressed as a narrowing.
+func mapKeysAndVals(rv reflect.Value) (keys, vals []reflect.Value) {
+	if !mayNotEqualItself(rv.Type().Key()) {
+		return rv.MapKeys(), nil
+	}
+	// Len is a hint for the capacity and not a bound on the loop: the
+	// iterator decides how many entries there are, and appending keeps
+	// the two slices the same length whatever it says.
+	n := rv.Len()
+	keys = make([]reflect.Value, 0, n)
+	vals = make([]reflect.Value, 0, n)
+	for iter := rv.MapRange(); iter.Next(); {
+		// Key and Value mint a Value each, exactly as MapKeys and
+		// MapIndex did; what is saved is the lookup between them. They
+		// cannot be SetIterKey'd into scratch, because all n keys are
+		// alive at once for the sort.
+		keys = append(keys, iter.Key())
+		vals = append(vals, iter.Value())
+	}
+	return keys, vals
+}
+
+// mayNotEqualItself reports whether a value of type t can fail x == x,
+// which is exactly the property that makes a map entry unfindable by its
+// own key.
+//
+// Only NaN has it, so the answer is: t is a float or a complex, t is an
+// interface and so could box either, or t is a composite built out of
+// something that is. Everything else -- ints, strings, bools, pointers,
+// channels -- is equal to itself always.
+//
+// A struct's own fields are walked rather than the script struct's, and
+// that is what makes it right for a MINTED key type, whose single field
+// is a carrier holding the script's fields as `any`. The interface case
+// catches it, which is the conservative yes mapKeysAndVals describes.
+//
+// The recursion terminates because Go has no value-recursive type: a
+// struct cannot contain itself by value, and an array's element type is
+// strictly smaller in the same sense.
+func mayNotEqualItself(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return true
+	case reflect.Interface:
+		return true
+	case reflect.Array:
+		return mayNotEqualItself(t.Elem())
+	case reflect.Struct:
+		for i := 0; i < t.NumField(); i++ {
+			if mayNotEqualItself(t.Field(i).Type) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // sortMapKeys orders a map's keys so a range over it is deterministic,
@@ -988,7 +1111,11 @@ func (in *Interp) rangeOver(n *ast.RangeStmt, x Value, iterate func(k, v Value) 
 // fmt orders them the same way, and fmt therefore puts x before y for the
 // same reason this does. The pairs whose order rests on an address are
 // exactly the adjacent ones, and those are exactly the ones compared.
-func sortMapKeys(keys []reflect.Value) []*StructVal {
+//
+// vals, when non-nil, is the map's values in the same slots as keys, and
+// every sort below moves it with them. mapKeysAndVals says when a caller
+// has to supply one; a caller that reaches its values by key passes nil.
+func sortMapKeys(keys, vals []reflect.Value) []*StructVal {
 	n := len(keys)
 	if n == 0 {
 		return nil
@@ -1018,7 +1145,7 @@ func sortMapKeys(keys []reflect.Value) []*StructVal {
 	if kt == nil {
 		// Every non-struct key: nothing to decode, so the sort is the
 		// whole job and the caller reads the map's own keys.
-		orderScalarKeys(keys)
+		orderScalarKeys(keys, vals)
 		// nil: the script's keys are the map's own, so the caller has
 		// nothing to read here.
 		return nil
@@ -1044,7 +1171,7 @@ func sortMapKeys(keys []reflect.Value) []*StructVal {
 		decoded[i] = decodeMintedKey(k, arena)
 	}
 
-	pair := &keyOrder{keys: keys, decoded: decoded}
+	pair := &keyOrder{keys: keys, vals: vals, decoded: decoded}
 	// The comparator records a decline rather than returning one, which
 	// is what lets it mirror fmtsort's own recursive shape instead of
 	// threading an error through it. A declined sort leaves a meaningless
@@ -1074,7 +1201,7 @@ func sortMapKeys(keys []reflect.Value) []*StructVal {
 	for i := range ord {
 		ord[i] = buf[bounds[i]:bounds[i+1]]
 	}
-	sort.Sort(&textOrder{keys: keys, decoded: decoded, ord: ord})
+	sort.Sort(&textOrder{keys: keys, vals: vals, decoded: decoded, ord: ord})
 	return decoded
 }
 
@@ -1083,9 +1210,10 @@ func sortMapKeys(keys []reflect.Value) []*StructVal {
 //
 // This is the whole job for a scalar-keyed map. There is nothing to
 // decode -- a script's int key IS the map's int key -- so the keys are
-// sorted in place, the caller reads them directly, and no memory is
-// touched at all. BenchmarkSortMapKeys, ns per key, Apple M3, minimum of
-// six runs, zero allocations at every count:
+// sorted in place, the caller reads them directly, and for every key type
+// that cannot hold a NaN no memory is touched at all.
+// BenchmarkSortMapKeys, ns per key, Apple M3, minimum of six runs, zero
+// allocations at every count:
 //
 //	keys        4    16    64   256  1024
 //	 int      8.2  13.0  20.9  26.6  39.2
@@ -1110,71 +1238,115 @@ func sortMapKeys(keys []reflect.Value) []*StructVal {
 // to range, and fmtsort orders one; there is no reason to be narrower
 // than the thing being reproduced.
 //
-// WHAT IS LEFT UNORDERED is what fmt orders by a MACHINE ADDRESS or by
-// nothing this package can render: pointer, channel and unsafe.Pointer
-// keys, whose text IS an address and so cannot be made deterministic
-// either, and complex, array and native-struct keys, which fmtsort
-// compares element-wise and no script can spell. Those range in the map's
-// own randomised order, exactly as every scalar key did before this.
-func orderScalarKeys(keys []reflect.Value) {
-	switch keys[0].Kind() {
+// WHICH KINDS GET AN ORDER AT ALL, and which are left in the map's own,
+// is scalarKeyCmp's answer; it also holds the comparators themselves,
+// because there are two ways in here and both must sort identically.
+func orderScalarKeys(keys, vals []reflect.Value) {
+	// An interface key needs more than a comparator: its order can be
+	// DECLINED, and a decline has a fallback to run. It keeps its own
+	// function for that.
+	if keys[0].Kind() == reflect.Interface {
+		orderInterfaceKeys(keys, vals)
+		return
+	}
+	// A nil comparator is a kind with no reproducible order; the keys are
+	// left in the map's own.
+	cmpKeys := scalarKeyCmp(keys[0].Kind())
+	if cmpKeys == nil {
+		return
+	}
+	if vals != nil {
+		// A map that had to pull its values beside its keys sorts through
+		// sort.Interface, because that is the only shape that can move a
+		// second slice on every swap. It costs one allocation for the
+		// sorter, which only the key types mapKeysAndVals singles out
+		// ever pay -- a float, a complex, or an interface key.
+		sort.Sort(&scalarOrder{keys: keys, vals: vals, cmp: cmpKeys})
+		return
+	}
+	// The path every string- and int-keyed map takes: no second slice to
+	// keep in step, so the sort touches no memory at all.
+	slices.SortFunc(keys, cmpKeys)
+}
+
+// scalarKeyCmp is fmt's comparison for one KIND of map key, or nil for a
+// kind fmt orders by something no reproduction can predict.
+//
+// The comparators are named functions rather than closures written at the
+// two call sites because there are two call sites: orderScalarKeys sorts
+// the keys alone, and sorts them beside their values when the map had to
+// be read in one pass. One definition each is what keeps those two paths
+// provably the same order.
+//
+// WHAT IS LEFT UNORDERED -- a nil return -- is what fmt orders by a
+// MACHINE ADDRESS or by nothing this package can render: pointer, channel
+// and unsafe.Pointer keys, whose text IS an address and so cannot be made
+// deterministic either, and complex, array and native-struct keys, which
+// fmtsort compares element-wise and no script can spell. Those range in
+// the map's own randomised order, exactly as every scalar key did before
+// this existed.
+func scalarKeyCmp(k reflect.Kind) func(a, b reflect.Value) int {
+	switch k {
 	case reflect.String:
-		// A STRING KEY IS ALREADY THE TEXT IT SORTS BY, so this touches
-		// no memory at all -- reflect.Value.String on a string key is a
-		// header load -- and it was already fmt's order: fmtsort compares
-		// string keys with strings.Compare, which is this.
-		//
-		// Two other shapes were written first. All three in one binary,
-		// minimum of eight runs at a fixed iteration count, Apple M3, ns
-		// per key:
-		//
-		//	keys                            4    16    64    256    1024
-		//	 insertion sort on a []string 10.3  22.3  58.2  179.5   779.9   1 alloc
-		//	 sort.Sort on a []string      16.3  16.1  27.1   34.4    46.7   2 allocs
-		//	 this                          6.4  12.9  25.9   34.8    51.5   0 allocs
-		//
-		// The []string wins at a thousand keys because it calls String
-		// once per key where this calls it n log n times -- but it pays
-		// an allocation for the slice and another for the sorter, which
-		// escapes into sort.Sort's interface, and those two ARE what a
-		// four-key map costs. Small string-keyed maps are the common case
-		// in a shell. One allocation-free path that leads everywhere up
-		// to 256 keys and trails by 10% at 1024 beat two paths and a
-		// threshold between them.
-		slices.SortFunc(keys, func(a, b reflect.Value) int {
-			return strings.Compare(a.String(), b.String())
-		})
+		return cmpStringKeys
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		slices.SortFunc(keys, func(a, b reflect.Value) int {
-			return cmp.Compare(a.Int(), b.Int())
-		})
+		return cmpIntKeys
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		slices.SortFunc(keys, func(a, b reflect.Value) int {
-			return cmp.Compare(a.Uint(), b.Uint())
-		})
+		return cmpUintKeys
 	case reflect.Float32, reflect.Float64:
-		// cmp.Compare puts NaN below every other float and calls two NaNs
-		// equal, which is fmtsort's floatCompare exactly. Two NaN keys are
-		// still distinct map entries whose relative order neither fmt nor
-		// this fixes -- the only tie two distinct scalar keys can produce.
-		slices.SortFunc(keys, func(a, b reflect.Value) int {
-			return cmp.Compare(a.Float(), b.Float())
-		})
+		return cmpFloatKeys
 	case reflect.Bool:
-		// false before true, which is fmtsort's rule and Go's own
-		// convention everywhere else.
-		slices.SortFunc(keys, func(a, b reflect.Value) int {
-			switch {
-			case a.Bool() == b.Bool():
-				return 0
-			case a.Bool():
-				return 1
-			default:
-				return -1
-			}
-		})
-	case reflect.Interface:
-		orderInterfaceKeys(keys)
+		return cmpBoolKeys
+	}
+	return nil
+}
+
+// cmpStringKeys orders string keys, and A STRING KEY IS ALREADY THE TEXT
+// IT SORTS BY, so this touches no memory at all -- reflect.Value.String
+// on a string key is a header load -- and it was already fmt's order:
+// fmtsort compares string keys with strings.Compare, which is this.
+//
+// Two other shapes were written first. All three in one binary, minimum
+// of eight runs at a fixed iteration count, Apple M3, ns per key:
+//
+//	keys                            4    16    64    256    1024
+//	 insertion sort on a []string 10.3  22.3  58.2  179.5   779.9   1 alloc
+//	 sort.Sort on a []string      16.3  16.1  27.1   34.4    46.7   2 allocs
+//	 this                          6.4  12.9  25.9   34.8    51.5   0 allocs
+//
+// The []string wins at a thousand keys because it calls String once per
+// key where this calls it n log n times -- but it pays an allocation for
+// the slice and another for the sorter, which escapes into sort.Sort's
+// interface, and those two ARE what a four-key map costs. Small
+// string-keyed maps are the common case in a shell. One allocation-free
+// path that leads everywhere up to 256 keys and trails by 10% at 1024
+// beat two paths and a threshold between them.
+func cmpStringKeys(a, b reflect.Value) int { return strings.Compare(a.String(), b.String()) }
+
+func cmpIntKeys(a, b reflect.Value) int { return cmp.Compare(a.Int(), b.Int()) }
+
+func cmpUintKeys(a, b reflect.Value) int { return cmp.Compare(a.Uint(), b.Uint()) }
+
+// cmpFloatKeys leans on cmp.Compare, which puts NaN below every other
+// float and calls two NaNs equal -- fmtsort's floatCompare exactly. Two
+// NaN keys are still distinct map entries whose relative order neither
+// fmt nor this fixes: the only tie two distinct scalar keys can produce.
+//
+// A NaN key is also the reason mapKeysAndVals exists, and this is the
+// comparator that runs beside it: a float-keyed map is sorted with its
+// values held in step, because no NaN key can find its own value again.
+func cmpFloatKeys(a, b reflect.Value) int { return cmp.Compare(a.Float(), b.Float()) }
+
+// cmpBoolKeys puts false before true, which is fmtsort's rule and Go's
+// own convention everywhere else.
+func cmpBoolKeys(a, b reflect.Value) int {
+	switch {
+	case a.Bool() == b.Bool():
+		return 0
+	case a.Bool():
+		return 1
+	default:
+		return -1
 	}
 }
 
@@ -1197,11 +1369,18 @@ func orderScalarKeys(keys []reflect.Value) {
 // The render is worth nothing to the accepted path, so it is not built
 // until the decline is known -- a map[any]int of plain ints pays one
 // wasted sort and no memory.
-func orderInterfaceKeys(keys []reflect.Value) {
+func orderInterfaceKeys(keys, vals []reflect.Value) {
 	var c keyCmp
-	slices.SortFunc(keys, func(a, b reflect.Value) int {
+	cmpKeys := func(a, b reflect.Value) int {
 		return c.field(a.Interface(), b.Interface())
-	})
+	}
+	// An interface key can box a NaN, so mapKeysAndVals always hands this
+	// one a vals to keep in step -- both here and in the fallback below.
+	if vals != nil {
+		sort.Sort(&scalarOrder{keys: keys, vals: vals, cmp: cmpKeys})
+	} else {
+		slices.SortFunc(keys, cmpKeys)
+	}
 	if !c.declined {
 		return
 	}
@@ -1219,7 +1398,7 @@ func orderInterfaceKeys(keys []reflect.Value) {
 	for i := range ord {
 		ord[i] = buf[bounds[i]:bounds[i+1]]
 	}
-	sort.Sort(&textOrder{keys: keys, ord: ord})
+	sort.Sort(&textOrder{keys: keys, vals: vals, ord: ord})
 }
 
 // growForRest sizes the render slab from its first entry, so a map of a
@@ -1235,11 +1414,12 @@ func growForRest(buf []byte, n int) []byte {
 	return slices.Grow(buf, (n-1)*len(buf)+len(buf)/8+16)
 }
 
-// keyOrder is the pair of slices any ordering of a struct-keyed map has
-// to keep in step: the map's own keys, which the caller reads values
-// with, and the decoded structs it hands the script as the range
-// variable. A Swap that moved one and not the other would still produce
-// sorted output -- and would pair every key with another key's value.
+// keyOrder is the set of slices any ordering of a struct-keyed map has to
+// keep in step: the map's own keys, the decoded structs it hands the
+// script as the range variable, and -- when the caller could not look its
+// values up by key -- those values. A Swap that moved one and not the
+// others would still produce sorted output, and would pair every key with
+// another key's value.
 //
 // It carries no Less. fieldOrder supplies that, and is the only thing
 // that embeds it; the text order below keeps its own slices, because it
@@ -1254,6 +1434,7 @@ func growForRest(buf []byte, n int) []byte {
 // on every call of a sort's inner loop.
 type keyOrder struct {
 	keys    []reflect.Value
+	vals    []reflect.Value
 	decoded []*StructVal
 }
 
@@ -1262,6 +1443,13 @@ func (s *keyOrder) Len() int { return len(s.keys) }
 func (s *keyOrder) Swap(i, j int) {
 	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
 	s.decoded[i], s.decoded[j] = s.decoded[j], s.decoded[i]
+	// A ranged map always supplies vals for a struct key -- a minted key
+	// holds its fields as `any`, so mapKeysAndVals cannot rule out a NaN
+	// in one. It is still checked, because the ordering tests call
+	// sortMapKeys with keys alone.
+	if s.vals != nil {
+		s.vals[i], s.vals[j] = s.vals[j], s.vals[i]
+	}
 }
 
 // fieldOrder is fmt's order: keyCmp over the decoded structs, which is
@@ -1282,9 +1470,12 @@ func (s *fieldOrder) Less(i, j int) bool { return s.cmp.keys(s.decoded[i], s.dec
 //
 // It does not embed keyOrder, because its two callers do not agree on
 // what there is to keep in step: a declined struct-keyed map has decoded
-// structs to move with the keys, and a declined map[any]V has nothing
-// but the keys. decoded is nil for the second, and Swap says so rather
-// than making the struct path's own sort carry the check.
+// structs to move with the keys, and a declined map[any]V has only keys
+// and the values pulled beside them. decoded is nil for the second, and
+// Swap says so rather than making the struct path's own sort carry the
+// check; vals is checked the same way, and for the same reason keyOrder
+// checks it -- a map ranged by a script always has one, and the ordering
+// tests do not.
 //
 // Ties -- two distinct keys with identical text, an int 1 and a string
 // "1" -- keep whatever order the declined sort before this left them in,
@@ -1292,6 +1483,7 @@ func (s *fieldOrder) Less(i, j int) bool { return s.cmp.keys(s.decoded[i], s.dec
 // before this too: the sort was never stable.
 type textOrder struct {
 	keys    []reflect.Value
+	vals    []reflect.Value
 	decoded []*StructVal
 	ord     [][]byte
 }
@@ -1306,6 +1498,40 @@ func (s *textOrder) Swap(i, j int) {
 	if s.decoded != nil {
 		s.decoded[i], s.decoded[j] = s.decoded[j], s.decoded[i]
 	}
+	if s.vals != nil {
+		s.vals[i], s.vals[j] = s.vals[j], s.vals[i]
+	}
+}
+
+// scalarOrder sorts a map's keys with its VALUES held in step, for the
+// maps that had to read both in one pass because their keys cannot look a
+// value up again. See mapKeysAndVals for which those are.
+//
+// It exists because slices.SortFunc cannot move a second slice: it swaps
+// the elements of the one slice it was given. sort.Interface can, so the
+// paired path pays the one allocation that escaping into that interface
+// costs -- and only that path pays it, which is why the keys-only sort
+// was not simply replaced by this.
+//
+// cmp is the same comparator the keys-only path uses, taken from
+// scalarKeyCmp or supplied by orderInterfaceKeys, so the two paths cannot
+// drift into two different orders.
+//
+// The receivers are POINTERS so Less and Swap do not copy slice headers
+// on every call of a sort's inner loop.
+type scalarOrder struct {
+	keys []reflect.Value
+	vals []reflect.Value
+	cmp  func(a, b reflect.Value) int
+}
+
+func (s *scalarOrder) Len() int { return len(s.keys) }
+
+func (s *scalarOrder) Less(i, j int) bool { return s.cmp(s.keys[i], s.keys[j]) < 0 }
+
+func (s *scalarOrder) Swap(i, j int) {
+	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
+	s.vals[i], s.vals[j] = s.vals[j], s.vals[i]
 }
 
 // ---- declarations & switch ----

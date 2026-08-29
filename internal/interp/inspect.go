@@ -83,12 +83,16 @@ func inspectValue(name string, v Value) string {
 		b.WriteString("]")
 		return b.String()
 	case reflect.Map:
-		keys := rv.MapKeys()
+		// vals is non-nil exactly when a value cannot be looked back up
+		// by its key -- a NaN key is a live entry MapIndex can never
+		// find. See mapKeysAndVals; inspecting such a map used to panic
+		// on the zero Value the lookup handed back.
+		keys, vals := mapKeysAndVals(rv)
 		strs := make([]string, len(keys))
 		for i, k := range keys {
 			strs[i] = oneLine(k.Interface())
 		}
-		sort.Sort(&keySorter{strs, keys})
+		sort.Sort(&keySorter{strs, keys, vals})
 		var b strings.Builder
 		fmt.Fprintf(&b, "%s: %s (len %d) {\n", name, displayType(v), rv.Len())
 		w := maxWidth(strs)
@@ -97,7 +101,11 @@ func inspectValue(name string, v Value) string {
 			n = inspectMaxItems
 		}
 		for i := 0; i < n; i++ {
-			fmt.Fprintf(&b, "  %-*s: %s\n", w, strs[i], oneLine(fromStore(rv.MapIndex(keys[i]))))
+			val := rv.MapIndex(keys[i])
+			if vals != nil {
+				val = vals[i]
+			}
+			fmt.Fprintf(&b, "  %-*s: %s\n", w, strs[i], oneLine(fromStore(val)))
 		}
 		if len(keys) > n {
 			fmt.Fprintf(&b, "  ... %d more\n", len(keys)-n)
@@ -179,8 +187,11 @@ func elemStructName(rv reflect.Value, et reflect.Type) (string, bool) {
 func structNameIn(rv reflect.Value) string {
 	elems := func(yield func(reflect.Value) bool) {
 		if rv.Kind() == reflect.Map {
-			for _, k := range rv.MapKeys() {
-				if !yield(rv.MapIndex(k)) {
+			// MapRange rather than MapKeys plus MapIndex: only the
+			// values are wanted here, and an iterator reaches the value
+			// of a NaN key, which no lookup can.
+			for iter := rv.MapRange(); iter.Next(); {
+				if !yield(iter.Value()) {
 					return
 				}
 			}
@@ -307,14 +318,22 @@ func maxWidth(ss []string) int {
 
 // keySorter sorts map keys by their rendered form, keeping the reflect
 // values in step so output is deterministic.
+//
+// vals is the map's values, and is present only when the caller had to
+// read them beside the keys rather than look them up; it is nil for every
+// key type that can find its own entry again. See mapKeysAndVals.
 type keySorter struct {
 	strs []string
 	keys []reflect.Value
+	vals []reflect.Value
 }
 
 func (k *keySorter) Len() int { return len(k.strs) }
 func (k *keySorter) Swap(i, j int) {
 	k.strs[i], k.strs[j] = k.strs[j], k.strs[i]
 	k.keys[i], k.keys[j] = k.keys[j], k.keys[i]
+	if k.vals != nil {
+		k.vals[i], k.vals[j] = k.vals[j], k.vals[i]
+	}
 }
 func (k *keySorter) Less(i, j int) bool { return k.strs[i] < k.strs[j] }

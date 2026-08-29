@@ -152,6 +152,29 @@ func TestInspectMapIsSortedAndAligned(t *testing.T) {
 	}
 }
 
+// `?m` on a map with a NaN key used to panic the REPL, for the reason a
+// range over one used to die: the inspector walked MapKeys and fetched
+// each value with MapIndex, and a NaN key is a live entry no lookup can
+// find. The values are read beside the keys now.
+//
+// Each value here is distinct, so a value landing under the wrong key is
+// a failure and not just a survived panic -- the sort moves the keys, and
+// the values have to move with them.
+//
+// INSPECTED EIGHT TIMES, from eight fresh maps, because the permutation
+// the sort starts from is the map's own randomised one: five keys already
+// in order is a 1-in-120 accident, and one run of this test would report
+// a dropped Swap as a pass that often.
+func TestInspectAMapWithANaNKey(t *testing.T) {
+	const want = "m: map[float64]int (len 5) {\n  -3.5: 3\n  0   : 4\n  1.5 : 1\n  9.25: 5\n  NaN : 2\n}"
+	for run := 0; run < 8; run++ {
+		got := inspect(t, `m := map[float64]int{1.5: 1, math.NaN(): 2, -3.5: 3, 0.0: 4, 9.25: 5}`, "m")
+		if got != want {
+			t.Fatalf("run %d got:\n%s\nwant:\n%s", run, got, want)
+		}
+	}
+}
+
 func TestInspectMapElidesPastTheItemCap(t *testing.T) {
 	got := inspect(t, `m := map[string]int{}
 for i := range 25 {

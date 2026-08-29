@@ -854,7 +854,7 @@ func BenchmarkSortMapKeys(b *testing.B) {
 				b.ReportAllocs()
 				for b.Loop() {
 					copy(work, keys)
-					sortSink = sortMapKeys(work)
+					sortSink = sortMapKeys(work, nil)
 				}
 				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
 			})
@@ -878,7 +878,7 @@ func BenchmarkSortMapKeys(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				copy(work, keys)
-				sortSink = sortMapKeys(work)
+				sortSink = sortMapKeys(work, nil)
 			}
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
 		})
@@ -901,12 +901,118 @@ func BenchmarkSortMapKeys(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				copy(work, keys)
-				sortSink = sortMapKeys(work)
+				sortSink = sortMapKeys(work, nil)
 			}
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
 		})
 	}
 }
+
+// BenchmarkRangeMapEntries prices the WHOLE acquisition a range does --
+// get the keys, order them, and reach every value -- for the two routes
+// rangeOver now chooses between.
+//
+// It exists because the NaN fix trades one cost for another and the trade
+// had to be priced, not asserted. Reading values with MapIndex is one
+// hash lookup per entry and no second slice; pulling them beside the keys
+// from one MapRange is a slice of n Values and n more swaps through the
+// sort, and no lookups at all. Which wins depends entirely on how
+// expensive the key is to hash.
+//
+// The bykey rows run the OLD shape against the same maps, which is the
+// only way to read the struct row: a struct-keyed map has no choice about
+// the route -- its minted key holds `any` fields, so mapKeysAndVals
+// cannot rule out a NaN -- and the question is what that costs it.
+//
+// The body mirrors rangeOver's map case rather than calling it, because
+// calling it means an AST and an interpreter around it; the two are
+// small enough to read side by side, and the probe pass is what holds
+// rangeOver itself.
+func BenchmarkRangeMapEntries(b *testing.B) {
+	const nk = 64
+
+	im := make(map[int]int, nk)
+	fm := make(map[float64]int, nk)
+	sm := make(map[string]int, nk)
+	for j := 0; j < nk; j++ {
+		im[j*7919%nk] = j
+		fm[float64(j*7919%nk)+0.5] = j
+		sm[fmt.Sprintf("key-%06d", j*7919%nk)] = j
+	}
+
+	st := declareForBench(b, "type P struct {\n\tA int\n}\n_ = map[P]int{}\n", "P")
+	pm := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for j := 0; j < nk; j++ {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{j * 100}})
+		if err != nil {
+			b.Fatalf("encoding a key: %v", err)
+		}
+		pm.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(j))
+	}
+
+	for _, c := range []struct {
+		name string
+		m    reflect.Value
+	}{
+		{"int", reflect.ValueOf(im)},
+		{"string", reflect.ValueOf(sm)},
+		{"float64", reflect.ValueOf(fm)},
+		{"struct", pm},
+	} {
+		rv := c.m
+		b.Run(c.name+"/asis", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				keys, vals := mapKeysAndVals(rv)
+				decoded := sortMapKeys(keys, vals)
+				for i, k := range keys {
+					if decoded != nil {
+						sortSink = decoded
+					}
+					if vals != nil {
+						entrySink = vals[i]
+					} else {
+						entrySink = rv.MapIndex(k)
+					}
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/entry")
+		})
+		b.Run(c.name+"/bykey", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				keys := rv.MapKeys()
+				decoded := sortMapKeys(keys, nil)
+				for _, k := range keys {
+					if decoded != nil {
+						sortSink = decoded
+					}
+					entrySink = rv.MapIndex(k)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/entry")
+		})
+	}
+}
+
+// declareForBench is declare's shape for a benchmark: run a declaration
+// and hand back the *StructType it defined.
+func declareForBench(b *testing.B, src, name string) *StructType {
+	b.Helper()
+	in, fset, f := prepScript(b, src)
+	if err := in.Run(fset, f); err != nil {
+		b.Fatalf("declaring %s: %v", name, err)
+	}
+	v, ok := in.globals.Get(name)
+	if !ok {
+		b.Fatalf("%s was not defined", name)
+	}
+	return v.(*StructType)
+}
+
+// entrySink keeps the value each entry reached live, so the lookup the
+// rows differ in cannot be optimised away.
+var entrySink reflect.Value
 
 // sortSink keeps sortMapKeys' result live; it is nil for the scalar rows,
 // which is itself part of what those rows assert.
