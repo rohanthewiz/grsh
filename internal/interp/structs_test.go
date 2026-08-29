@@ -1,7 +1,11 @@
 package interp
 
 import (
+	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
 	"reflect"
 	"runtime"
@@ -2056,9 +2060,28 @@ func TestAppendValueMatchesFmt(t *testing.T) {
 		math.Inf(-1),
 		math.NaN(),
 		nested,
-		(*StructVal)(nil),  // a nil struct field, which []P makes reachable
-		[]string{"x", "y"}, // no fast path: must fall through to fmt
+		(*StructVal)(nil), // a nil struct field, which []P makes reachable
+
+		// One slice per case, each in three states, because the frame
+		// and the separator are written per case and a case that drops
+		// the brackets on an empty slice -- or emits a leading space on
+		// a one-element one -- is wrong in exactly one of them.
+		[]string{"x", "y"}, []string{"solo"}, []string{}, []string(nil),
+		[]string{"", " ", "with space"}, // the separator is ambiguous, and fmt's is too
+		[]int{1, -2, 0}, []int{}, []int(nil),
+		[]int64{1 << 40, -1}, []int64{},
+		[]float64{1.5, 0.1, 1e21, math.Inf(-1), math.NaN()}, []float64{},
+		[]bool{true, false}, []bool{},
+		[]byte("hi"), []byte{0, 255}, []byte{}, // %v on a []byte is NUMBERS, not text
+		[]rune("hi"), []rune{}, // []int32, so numbers too
+		[]any{1, "x", true, nil, nested, 2.5}, []any{}, []any(nil),
+		[]any{[]string{"deep"}}, // a case reached from inside another
+		[]error{errors.New("boom"), nil}, []error{},
+
+		// No fast path: these must still fall through to fmt.
 		map[string]int{"k": 1},
+		[][]string{{"a"}, nil},
+		[]uint{1, 2}, // spellable only from a stdlib call, not from typeOf
 	}
 	for _, v := range vals {
 		if got, want := string(appendValue(nil, v)), fmt.Sprintf("%v", v); got != want {
@@ -2070,6 +2093,170 @@ func TestAppendValueMatchesFmt(t *testing.T) {
 			t.Errorf("rendering a field holding %#v gives %q, want %q", v, got, want)
 		}
 	}
+}
+
+// The slice fast paths are a CLOSED set, and this is the test that keeps
+// them closed. typeOf builds a field's type from typeIdents, so the
+// element types a script can spell are exactly typeIdents' names plus a
+// script struct -- and adding a name there without adding a case to
+// appendValue would silently drop that slice back onto fmt, with no
+// visible symptom because fmt is still correct.
+//
+// So the table is keyed by typeIdents' own names and the key sets are
+// required to match: a new native type name fails here until someone
+// writes a sample for it and decides whether it gets a case.
+//
+// Each sample is checked two ways. Parity with fmt is the correctness
+// claim. ZERO ALLOCATIONS is the claim the fast path exists for, and it
+// is what actually detects a missing case: fmt reflects over the slice
+// and boxes every element, which costs 2 allocations for seven of these
+// nine and 4 for a []any of structs. It cannot detect the other two --
+// fmt has its own fast path for []byte, and an error already carries its
+// own interface -- so those two rest on parity alone, which is noted
+// rather than hidden because a green test that cannot fail is worse than
+// no test.
+func TestEveryScriptSliceTypeHasAFastPath(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+}`, "P")
+	nested := &StructVal{Type: st, Vals: []Value{7}}
+	// Element values are chosen to make fmt's boxing VISIBLE: an int
+	// small enough to hit the runtime's cached-small-integer table boxes
+	// without allocating, which would hide a missing case.
+	samples := map[string]Value{
+		"int":     []int{1 << 40, -(1 << 41)},
+		"int64":   []int64{1 << 40, -(1 << 41)},
+		"float64": []float64{1.5, 1e21},
+		"string":  []string{"alpha", "beta"},
+		"bool":    []bool{true, false},
+		"byte":    []byte{7, 200},                   // fmt does not allocate here
+		"rune":    []rune{100000, 200000},           // []int32, printed as numbers
+		"any":     []any{nested, "x", nil},          // recursion, not fmt's Stringer
+		"error":   []error{errors.New("boom"), nil}, // fmt does not allocate here
+	}
+	for name := range typeIdents {
+		if _, ok := samples[name]; !ok {
+			t.Errorf("typeIdents has %q but this test has no sample for it: a script can "+
+				"write []%s, so appendValue needs a case for it or a reason not to", name, name)
+		}
+	}
+	for name := range samples {
+		if _, ok := typeIdents[name]; !ok {
+			t.Errorf("this test samples []%s but typeIdents no longer has %q", name, name)
+		}
+	}
+
+	// The cases are also checked STRUCTURALLY, by reading the switch out
+	// of the source. That is not belt and braces: removing the []byte or
+	// []error case changes nothing the assertions below can see -- fmt
+	// renders both correctly and, uniquely among these nine, allocates
+	// for neither -- so those two cases would otherwise be code no test
+	// can tell is gone. Parsing is what makes every case falsifiable.
+	cases := map[string]bool{}
+	for _, name := range sliceCasesOf(t, "appendValue") {
+		cases[name] = true
+		if _, ok := samples[name]; !ok {
+			t.Errorf("appendValue has a case for []%s that this test does not sample", name)
+		}
+	}
+	for name := range samples {
+		if !cases[name] {
+			t.Errorf("appendValue has no `case []%s:`, so a script's []%s falls back to fmt",
+				name, name)
+		}
+	}
+
+	// One buffer with room to spare, reused: a slab that has to grow
+	// would allocate for reasons that have nothing to do with the case
+	// under test, which is exactly how sortMapKeys uses this.
+	buf := make([]byte, 0, 4096)
+	for name, v := range samples {
+		if got, want := string(appendValue(nil, v)), fmt.Sprintf("%v", v); got != want {
+			t.Errorf("appendValue on a []%s gave %q, fmt says %q", name, got, want)
+		}
+		if n := testing.AllocsPerRun(100, func() { buf = appendValue(buf[:0], v) }); n != 0 {
+			t.Errorf("rendering a []%s allocated %.0f times, want 0 -- has its case in "+
+				"appendValue been removed, sending it back to fmt?", name, n)
+		}
+	}
+}
+
+// []P is the tenth slice type and the only one with no static case: its
+// element type is minted at runtime, so the switch cannot name it and
+// the render reaches it through reflect instead.
+//
+// The value is built by a SCRIPT rather than by calling mintStoreType
+// here, because what the fast path has to match is the type a script
+// actually produces -- a hand-built slice could be a []*StructVal and
+// pass while the reachable one fell through to fmt.
+func TestASliceOfStructsRendersWithoutFmt(t *testing.T) {
+	in, _, err := evalKeep(t, `type P struct {
+	A int
+	B string
+}
+xs := []P{P{A: 1, B: "one"}, P{A: 2, B: "two"}}
+empty := []P{}`, nil)
+	if err != nil {
+		t.Fatalf("building a []P: %v", err)
+	}
+	for _, name := range []string{"xs", "empty"} {
+		v, ok := in.globals.Get(name)
+		if !ok {
+			t.Fatalf("%s was not defined", name)
+		}
+		if rt := reflect.TypeOf(v); rt.Kind() != reflect.Slice || storeOwnerOf(rt.Elem()) == nil {
+			t.Fatalf("%s is a %v, not a slice of a minted element type -- this test is "+
+				"no longer pointed at the path it means to test", name, rt)
+		}
+		if got, want := string(appendValue(nil, v)), fmt.Sprintf("%v", v); got != want {
+			t.Errorf("appendValue on %s gave %q, fmt says %q", name, got, want)
+		}
+		buf := make([]byte, 0, 4096)
+		if n := testing.AllocsPerRun(100, func() { buf = appendValue(buf[:0], v) }); n != 0 {
+			t.Errorf("rendering %s allocated %.0f times, want 0 -- fmt would call String "+
+				"and box per element, so this is the reflect path being lost", name, n)
+		}
+	}
+
+	// A nil element is reachable: append(xs, nil) puts a typed nil in the
+	// slot. It has to reach appendTo's nil check rather than panic on the
+	// way through the two Field hops.
+	v, _ := in.globals.Get("xs")
+	rv := reflect.ValueOf(v)
+	withNil := reflect.Append(rv, reflect.Zero(rv.Type().Elem())).Interface()
+	if got, want := string(appendValue(nil, withNil)), fmt.Sprintf("%v", withNil); got != want {
+		t.Errorf("a []P with a nil element gave %q, fmt says %q", got, want)
+	}
+}
+
+// The end of the same claim, from the outside: a struct whose fields hold
+// every slice shape prints through the interpreter exactly as fmt would
+// print the same values. The unit tests above render each slice alone;
+// this one puts them in the frame appendTo supplies, which is where a
+// case that forgot its closing bracket would show.
+func TestAStructWithSliceFieldsPrintsLikeFmt(t *testing.T) {
+	wantOut(t, `type P struct {
+	A int
+}
+type S struct {
+	Str  []string
+	Ints []int
+	I64  []int64
+	Fs   []float64
+	Bs   []bool
+	By   []byte
+	Rs   []rune
+	As   []any
+	Ps   []P
+	Nest [][]string
+	M    map[string]int
+}
+s := S{Str: []string{"a", "b"}, Ints: []int{1, 2}, I64: []int64{3}, Fs: []float64{1.5},
+	Bs: []bool{true}, By: []byte{104, 105}, Rs: []rune{97}, As: []any{1, "x"},
+	Ps: []P{P{A: 9}}, Nest: [][]string{[]string{"deep"}}, M: map[string]int{"k": 1}}
+fmt.Println(s)`,
+		"S{Str: [a b], Ints: [1 2], I64: [3], Fs: [1.5], Bs: [true], By: [104 105], "+
+			"Rs: [97], As: [1 x], Ps: [P{A: 9}], Nest: [[deep]], M: map[k:1]}\n")
 }
 
 // appendTo has to APPEND, which is the whole reason it exists: sortMapKeys
@@ -2370,4 +2557,61 @@ func TestKeysFromDifferentChunksDoNotShareFields(t *testing.T) {
 			svs[i].Vals[f] = orig
 		}
 	}
+}
+
+// sliceCasesOf reads the named function out of structs.go and returns the
+// element type names of its `case []T:` arms.
+//
+// A test that reads its own package's source is unusual enough to say
+// why. What appendValue's slice cases buy is speed, and speed is only
+// sometimes observable: two of the nine -- []byte and []error -- render
+// identically and allocate identically whether their case is present or
+// removed, because fmt has its own fast path for one and the other
+// already carries its interface. Behaviour cannot tell those cases from
+// their absence. The source can, and a case nothing can falsify is
+// indistinguishable from a case nobody wrote.
+//
+// It reads the file rather than a string constant so it cannot drift, and
+// it recognises only `[]Ident`, which is exactly the shape typeIdents
+// names produce -- a case for `[][]string` or `[]P` is not a native
+// element type and is deliberately not reported.
+func sliceCasesOf(t *testing.T, fn string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "structs.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("reading structs.go to check %s's cases: %v", fn, err)
+	}
+	var decl *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == fn {
+			decl = fd
+			break
+		}
+	}
+	if decl == nil {
+		t.Fatalf("structs.go has no func %s -- has it been renamed?", fn)
+	}
+	var names []string
+	ast.Inspect(decl, func(n ast.Node) bool {
+		cc, ok := n.(*ast.CaseClause)
+		if !ok {
+			return true
+		}
+		for _, e := range cc.List {
+			at, ok := e.(*ast.ArrayType)
+			if !ok || at.Len != nil {
+				continue
+			}
+			if id, ok := at.Elt.(*ast.Ident); ok {
+				names = append(names, id.Name)
+			}
+		}
+		return true
+	})
+	if len(names) == 0 {
+		t.Fatalf("%s has no `case []T:` arms at all -- either they are gone or this "+
+			"helper no longer recognises their shape", fn)
+	}
+	return names
 }

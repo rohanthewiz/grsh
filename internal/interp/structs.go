@@ -878,8 +878,9 @@ func (sv *StructVal) appendTo(b []byte) []byte {
 //
 // The cases are the types a script can put in a field: the four literal
 // kinds evalExpr produces (int, float64, string, rune), bool, an unset
-// field's nil, a nested struct, and the int64 a stdlib call can hand
-// back.
+// field's nil, a nested struct, the int64 a stdlib call can hand back,
+// and a slice of any of those -- see the note above the slice cases for
+// why that list is closed rather than open-ended.
 func appendValue(b []byte, v Value) []byte {
 	switch x := v.(type) {
 	case nil:
@@ -903,6 +904,149 @@ func appendValue(b []byte, v Value) []byte {
 		// allocation too, and keeps a nil nested field printing "<nil>"
 		// the way fmt would by reaching the same nil check.
 		return x.appendTo(b)
+
+	// ---- slices ----
+	//
+	// THE LIST IS CLOSED, NOT A SAMPLING. A field type is resolved by
+	// typeOf, whose element names come from typeIdents -- int, int64,
+	// float64, string, bool, byte, rune, any, error -- plus a script
+	// struct. So `[]T` for every T a script can spell is exactly the
+	// eight cases below plus []P, which is handled after the switch
+	// because its element type is minted at runtime. A nested [][]T or
+	// a map still falls through to fmt.
+	// TestEveryScriptSliceTypeHasAFastPath fails if typeIdents grows a
+	// name and this does not.
+	//
+	// Each case is fmt's own rendering -- elements space-separated inside
+	// square brackets -- built WITHOUT boxing an element, which is where
+	// fmt's cost lives: it reflects over the slice and puts every element
+	// through an interface. Sixteen strings cost 551ns and 16
+	// allocations through fmt against 59ns and none here.
+	//
+	// They are written out rather than routed through one generic helper
+	// taking a per-element append func. That was measured: the indirect
+	// call survives instantiation and costs 43% on []string and 13% on
+	// []int, which is most of what the fast path buys.
+	case []string:
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = append(b, e...)
+		}
+		return append(b, ']')
+	case []int:
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = strconv.AppendInt(b, int64(e), 10)
+		}
+		return append(b, ']')
+	case []int64:
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = strconv.AppendInt(b, e, 10)
+		}
+		return append(b, ']')
+	case []float64:
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = strconv.AppendFloat(b, e, 'g', -1, 64)
+		}
+		return append(b, ']')
+	case []bool:
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = strconv.AppendBool(b, e)
+		}
+		return append(b, ']')
+	case []byte:
+		// %v on a []byte prints its NUMBERS, not its text: fmt reserves
+		// the text spelling for %s. []uint8 and []int32 below are the
+		// same shape as []int, and separate cases only because Go's type
+		// switch matches on the exact element type.
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = strconv.AppendUint(b, uint64(e), 10)
+		}
+		return append(b, ']')
+	case []rune:
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = strconv.AppendInt(b, int64(e), 10)
+		}
+		return append(b, ']')
+	case []any:
+		// The elements are already interfaces, so recursing costs no
+		// boxing -- and it is what makes a []any holding a nested struct
+		// print as the struct rather than through fmt's Stringer call.
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = appendValue(b, e)
+		}
+		return append(b, ']')
+	case []error:
+		// Same shape as []any. An element still reaches fmt one at a
+		// time -- an error renders through Error(), which this has no
+		// fast path for -- so what this case saves is the reflect walk
+		// over the slice, not the per-element format.
+		b = append(b, '[')
+		for i, e := range x {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = appendValue(b, e)
+		}
+		return append(b, ']')
+	}
+
+	// A []P holds P's MINTED element type (store.go), made at runtime, so
+	// there can be no static case for it. fmt renders it correctly --
+	// the minted type is a Stringer, which is the whole point of minting
+	// it -- and pays a String() and its own boxing per element: 1043ns
+	// and 32 allocations for sixteen one-field structs.
+	//
+	// Reaching the *StructVal directly costs neither. The two Field hops
+	// are the ones fromStore takes -- minted type, then carrier, then the
+	// struct -- and the Interface() is free because what it boxes is a
+	// POINTER, the shape property store.go's whole design already rests
+	// on. A nil element lands on appendTo's nil check and prints
+	// "<nil>", which is where ScriptStruct.String would have taken it.
+	//
+	// The Kind guard comes first so that everything else reaching here --
+	// a map, a nested slice, a type from a stdlib call -- pays one
+	// comparison, not a map lookup, on its way to fmt.
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice && storeOwnerOf(rv.Type().Elem()) != nil {
+		b = append(b, '[')
+		for i, n := 0, rv.Len(); i < n; i++ {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			sv, _ := rv.Index(i).Field(0).Field(0).Interface().(*StructVal)
+			b = sv.appendTo(b)
+		}
+		return append(b, ']')
 	}
 	return fmt.Appendf(b, "%v", v)
 }

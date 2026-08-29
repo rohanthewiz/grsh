@@ -882,3 +882,82 @@ func BenchmarkSortMapKeys(b *testing.B) {
 // sortSink keeps sortMapKeys' result live; it is nil for the string row,
 // which is itself part of what that row asserts.
 var sortSink []Value
+
+// BenchmarkAppendSliceValue prices appendValue's slice cases against the
+// fmt fallback they replaced, which is the measurement the cases exist
+// for and the one whose numbers the comment on them quotes.
+//
+// Both sides append into a buffer with capacity to spare, so what is
+// being compared is the RENDER and not the allocator: fmt's cost here is
+// the reflect walk over the slice plus an interface box per element, and
+// the fast path's is the appends alone.
+//
+// A []P is the interesting row. fmt renders it correctly through the
+// minted type's promoted String, and pays for a fresh string per element
+// on top of the box -- so it is the row where the reflect path after the
+// switch, not a static case, is what does the work.
+func BenchmarkAppendSliceValue(b *testing.B) {
+	in, fset, f := prepScript(b, "type P struct {\n\tA int\n}\n_ = []P{}\n")
+	if err := in.Run(fset, f); err != nil {
+		b.Fatalf("declaring P: %v", err)
+	}
+	pv, ok := in.globals.Get("P")
+	if !ok {
+		b.Fatal("P was not defined")
+	}
+	st := pv.(*StructType)
+	mt := mintStoreType(st)
+
+	build := func(n int) []struct {
+		name string
+		v    Value
+	} {
+		strs := make([]string, n)
+		ints := make([]int, n)
+		flts := make([]float64, n)
+		anys := make([]any, n)
+		ps := reflect.MakeSlice(reflect.SliceOf(mt), 0, n)
+		for i := range strs {
+			strs[i] = "element"
+			ints[i] = i * 100000
+			flts[i] = float64(i) + 0.5
+			anys[i] = i * 100000
+			ps = reflect.Append(ps, intoStore(&StructVal{Type: st, Vals: []Value{i}}, mt))
+		}
+		return []struct {
+			name string
+			v    Value
+		}{
+			{"[]string", strs},
+			{"[]int", ints},
+			{"[]float64", flts},
+			{"[]any", anys},
+			{"[]P", ps.Interface()},
+		}
+	}
+
+	buf := make([]byte, 0, 1<<16)
+	for _, n := range []int{4, 16, 64} {
+		for _, c := range build(n) {
+			b.Run(fmt.Sprintf("fast/%s/n%d", c.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					buf = appendValue(buf[:0], c.v)
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+			})
+			b.Run(fmt.Sprintf("fmt/%s/n%d", c.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					buf = fmt.Appendf(buf[:0], "%v", c.v)
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+			})
+		}
+	}
+	appendSink = buf
+}
+
+// appendSink keeps the last rendered buffer live so the whole loop is not
+// dead code.
+var appendSink []byte
