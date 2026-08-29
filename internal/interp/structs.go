@@ -1,9 +1,11 @@
 package interp
 
 import (
+	"cmp"
 	"fmt"
 	"go/ast"
 	"reflect"
+	"slices"
 	"strconv"
 	"unsafe"
 
@@ -1035,20 +1037,359 @@ func appendValue(b []byte, v Value) []byte {
 	// "<nil>", which is where ScriptStruct.String would have taken it.
 	//
 	// The Kind guard comes first so that everything else reaching here --
-	// a map, a nested slice, a type from a stdlib call -- pays one
-	// comparison, not a map lookup, on its way to fmt.
-	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Slice && storeOwnerOf(rv.Type().Elem()) != nil {
-		b = append(b, '[')
-		for i, n := 0, rv.Len(); i < n; i++ {
-			if i > 0 {
-				b = append(b, ' ')
+	// a nested slice, a scalar-keyed map, a type from a stdlib call --
+	// pays one comparison, not a map lookup, on its way to fmt.
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice:
+		if storeOwnerOf(rv.Type().Elem()) != nil {
+			b = append(b, '[')
+			for i, n := 0, rv.Len(); i < n; i++ {
+				if i > 0 {
+					b = append(b, ' ')
+				}
+				sv, _ := rv.Index(i).Field(0).Field(0).Interface().(*StructVal)
+				b = sv.appendTo(b)
 			}
-			sv, _ := rv.Index(i).Field(0).Field(0).Interface().(*StructVal)
-			b = sv.appendTo(b)
+			return append(b, ']')
 		}
-		return append(b, ']')
+	case reflect.Map:
+		if out, ok := appendStructKeyedMap(b, rv); ok {
+			return out
+		}
 	}
 	return fmt.Appendf(b, "%v", v)
+}
+
+// appendStructKeyedMap renders a map[P]V the way %v would, or declines.
+//
+// A SCALAR-KEYED MAP IS NOT WORTH TAKING OFF fmt, and that was measured
+// twice before this function was narrowed to struct keys. A reflect walk
+// that renders a map[string]int end to end is 1.5x faster than fmt and
+// allocates exactly as much (129 allocations at 64 entries, both), because
+// reflect.Value.MapKeys mints a Value per key and MapIndex mints one per
+// lookup -- the same two allocations fmt pays. Restructuring it to
+// SetIterKey into one preallocated slice makes the count flat in n and
+// costs about ten allocations to set up, which LOSES at three entries.
+// Small maps are the common case in a shell, so both shapes were dropped.
+//
+// A STRUCT KEY IS A DIFFERENT SHAPE OF COST. fmt renders one by calling
+// the minted type's promoted String, which decodes the key into a fresh
+// StructVal and builds a string, and it ORDERS them with a comparison
+// that walks reflect down four levels per compare, n log n times. Per
+// entry, ns, Apple M3:
+//
+//	entries              3     16     64
+//	 map[string]int   150.4  135.4  171.7
+//	 map[P]int        301.7  609.1  931.2
+//
+// Everything that gap is made of is work grsh already does better: it has
+// an arena that decodes a whole map's keys into one slab, and it can
+// compare decoded fields directly instead of walking reflect per compare.
+//
+// WHAT IT MUST NOT DO IS INVENT AN ORDER. fmt sorts map keys through
+// internal/fmtsort, and several of that package's rules -- pointers,
+// channels, and interfaces holding different concrete types -- order by
+// MACHINE ADDRESS, which no reproduction can predict. So this declines
+// rather than guesses: an unmatched key type, two keys carrying different
+// *StructTypes, a field holding two different dynamic types across keys,
+// or a field type the comparator does not know. A decline costs a wasted
+// decode and hands the whole map back to fmt, which is correct by
+// definition. TestAStructKeyedMapMatchesFmt drives all four.
+func appendStructKeyedMap(b []byte, rv reflect.Value) ([]byte, bool) {
+	st := keyOwnerOf(rv.Type().Key())
+	if st == nil {
+		return b, false
+	}
+	n := rv.Len()
+	if n == 0 {
+		// Covers the nil map too: fmt prints both as map[].
+		return append(b, "map[]"...), true
+	}
+
+	// PASS ONE: decode every key and render every value, both into
+	// storage owned by the map rather than by the entry -- the same move
+	// sortMapKeys made, for the same reason. The key TEXT is not built
+	// here: unlike sortMapKeys this does not order by it, so rendering a
+	// key before the order is known would be a render nothing reads.
+	//
+	// The two scratch Values are what keep this off reflect's per-entry
+	// allocation. SetIterKey and SetIterValue write into storage the
+	// caller owns; MapKeys and MapIndex would mint a fresh Value, and
+	// that pair is most of what fmt pays per entry.
+	var arena *keyArena
+	if n > 2 {
+		// Two keys ask for no arena: two slabs cost more than the two
+		// fused blocks they replace. Three is where it turns, which is
+		// sortMapKeys' threshold and BenchmarkMapKeyArena's measurement.
+		arena = newKeyArena(st, n)
+	}
+	ents := make([]mapEntry, n)
+	var vals []byte
+	kscratch := reflect.New(rv.Type().Key()).Elem()
+	vscratch := reflect.New(rv.Type().Elem()).Elem()
+	vr := mapValRender(rv.Type().Elem())
+	iter := rv.MapRange()
+	i := 0
+	for ; i < n && iter.Next(); i++ {
+		kscratch.SetIterKey(iter)
+		vscratch.SetIterValue(iter)
+		from := len(vals)
+		vals = appendMapValue(vals, vscratch, vr)
+		ents[i] = mapEntry{key: decodeMintedKey(kscratch, arena), from: from, to: len(vals)}
+	}
+	// Len is read before the walk, so a map mutated underneath this would
+	// otherwise leave zeroed entries to render as "<nil>:". fmtsort takes
+	// the same care for the same reason; the runtime is what complains
+	// about the mutation itself. No test reaches this -- producing the
+	// race on purpose is what it would take -- so it is belt, and said to
+	// be belt rather than left to look load-bearing.
+	ents = ents[:i]
+
+	// PASS TWO: order. The comparator records a decline rather than
+	// returning one, which is what lets it mirror fmtsort's own recursive
+	// shape instead of threading an error through it; a declined sort
+	// produces a meaningless order, and the whole result is thrown away.
+	var c keyCmp
+	slices.SortStableFunc(ents, func(x, y mapEntry) int { return c.keys(x.key, y.key) })
+	if c.declined {
+		return b, false
+	}
+
+	b = append(b, "map["...)
+	for i, e := range ents {
+		if i > 0 {
+			b = append(b, ' ')
+		}
+		b = e.key.appendTo(b)
+		b = append(b, ':')
+		b = append(b, vals[e.from:e.to]...)
+	}
+	return append(b, ']'), true
+}
+
+// valRender says how one map's VALUES are rendered. It is decided once
+// per map, not per entry, because a map's value type does not vary.
+//
+// It exists to keep an interface box off the per-entry path. The general
+// answer is appendValue, which needs a Value -- and turning a
+// reflect.Value into one costs an allocation for anything that is not
+// pointer-shaped, which is an int, a bool, a float and most of what a
+// script puts in a map. Reading the scalar straight off the reflect.Value
+// halves the allocations of rendering a struct-keyed map, and a minted
+// struct value still goes the general way, where the box is free because
+// what it boxes is a pointer.
+type valRender uint8
+
+const (
+	valAny valRender = iota // appendValue, via one interface box
+	valString
+	valInt
+	valUint
+	valFloat64
+	valBool
+)
+
+// mapValRender picks the renderer for a map's value type.
+//
+// IT MATCHES ON THE TYPE, NOT THE KIND, and that distinction is the whole
+// correctness argument. %v on a NAMED integer type calls its String
+// method if it has one -- fmt prints time.Duration(3e9) as "3s" and
+// time.Month(3) as "March" -- so a switch on reflect.Int would render
+// those as bare numbers and quietly disagree with fmt. Type identity
+// admits only the predeclared types, which have no methods, and every
+// named type falls through to appendValue, whose own type switch is
+// exact for the same reason.
+func mapValRender(t reflect.Type) valRender {
+	switch t {
+	case stringT:
+		return valString
+	case intT, int64T, runeT:
+		return valInt
+	case byteT:
+		return valUint
+	case float64T:
+		return valFloat64
+	case boolT:
+		return valBool
+	}
+	return valAny
+}
+
+// The predeclared types a map value can be rendered from directly. Named
+// once so mapValRender's switch is a pointer comparison per map rather
+// than a reflect.TypeFor call per entry.
+var (
+	stringT  = reflect.TypeFor[string]()
+	intT     = reflect.TypeFor[int]()
+	int64T   = reflect.TypeFor[int64]()
+	runeT    = reflect.TypeFor[rune]()
+	byteT    = reflect.TypeFor[byte]()
+	float64T = reflect.TypeFor[float64]()
+	boolT    = reflect.TypeFor[bool]()
+)
+
+// appendMapValue renders one map value, and must produce byte for byte
+// what appendValue produces for the same value.
+// TestMapValueRenderMatchesAppendValue holds it to that.
+//
+// float32 is deliberately absent: %v on one is %g at the shortest
+// precision that round-trips a 32-BIT float, and rv.Float() widens to 64,
+// so the obvious case would print 0.1 as 0.10000000149011612. It falls
+// through to appendValue, which falls through to fmt, which is right.
+func appendMapValue(b []byte, rv reflect.Value, vr valRender) []byte {
+	switch vr {
+	case valString:
+		return append(b, rv.String()...)
+	case valInt:
+		return strconv.AppendInt(b, rv.Int(), 10)
+	case valUint:
+		return strconv.AppendUint(b, rv.Uint(), 10)
+	case valFloat64:
+		return strconv.AppendFloat(b, rv.Float(), 'g', -1, 64)
+	case valBool:
+		return strconv.AppendBool(b, rv.Bool())
+	}
+	// fromStore is what unwraps a minted struct value; everything else is
+	// itself.
+	return appendValue(b, fromStore(rv))
+}
+
+// mapEntry is one decoded key and the bounds of its value's text inside
+// the slab every value of the map was rendered into. Bounds rather than a
+// []byte view, for the reason sortMapKeys writes out: a view taken while
+// the slab is still growing would point into a reallocated array.
+type mapEntry struct {
+	key      *StructVal
+	from, to int
+}
+
+// keyCmp orders decoded struct keys the way fmt orders the encoded ones,
+// and records when it cannot.
+//
+// IT MIRRORS internal/fmtsort's compare, which is an unexported detail of
+// the standard library with no compatibility promise. That is a real
+// coupling and it is held in place by a test, not by hope:
+// TestAStructKeyedMapMatchesFmt renders randomised maps both ways and
+// requires the bytes to be equal, so a Go release that reorders map
+// printing fails loudly here instead of quietly disagreeing with fmt.
+//
+// The walk fmtsort does over an encoded key is
+//
+//	minted struct -> ScriptKey -> StructKey{T *StructType, F any}
+//
+// so T, a POINTER, is compared before anything else, and F is an
+// interface holding the [N]any of field values. Everything below is that
+// walk rewritten over the DECODED struct, which holds the same
+// information with the indirections already paid.
+type keyCmp struct{ declined bool }
+
+// keys compares two decoded keys: fmtsort's T-then-F, in that order.
+func (c *keyCmp) keys(a, b *StructVal) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		// A nil key encodes the zero StructKey, whose T is the nil
+		// pointer and whose F is the nil interface. fmtsort puts a nil
+		// pointer at address 0 and a nil interface low, and both agree:
+		// the nil key sorts first. This is the one address comparison
+		// that IS predictable, because no *StructType lives at 0.
+		return -1
+	case b == nil:
+		return 1
+	case a.Type != b.Type:
+		// Two live *StructTypes, ordered by their addresses. Reachable:
+		// a re-declared P mints one storage type but keeps a StructType
+		// per declaration, so one map can hold keys from both.
+		c.declined = true
+		return 0
+	}
+	// T ties, so F decides. Both sides are the same [N]any type -- one
+	// StructType fixes N -- so fmtsort's type comparison on F ties too
+	// and it goes straight to the elements.
+	for i := range a.Vals {
+		if r := c.field(a.Vals[i], b.Vals[i]); r != 0 {
+			return r
+		}
+	}
+	return 0
+}
+
+// field compares one field of a key: fmtsort's interface case, which is
+// nil-low, then the concrete TYPE by address, then the value.
+//
+// The type-by-address step is why a field holding two different types
+// across two keys declines. It is not a hypothetical -- a field is
+// dynamically typed, so `P{A: 1}` and `P{A: "1"}` are both legal keys of
+// one map -- and fmt's own order for that pair changes between builds.
+func (c *keyCmp) field(a, b Value) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return -1
+	case b == nil:
+		return 1
+	}
+	// The cases are the key-position half of appendValue's: a field that
+	// is part of a key has already passed keyValue's comparability check,
+	// so no slice, map or func can reach here.
+	switch x := a.(type) {
+	case string:
+		if y, ok := b.(string); ok {
+			return cmp.Compare(x, y)
+		}
+	case int:
+		if y, ok := b.(int); ok {
+			return cmp.Compare(x, y)
+		}
+	case int64:
+		if y, ok := b.(int64); ok {
+			return cmp.Compare(x, y)
+		}
+	case rune: // int32
+		if y, ok := b.(rune); ok {
+			return cmp.Compare(x, y)
+		}
+	case byte: // uint8
+		if y, ok := b.(byte); ok {
+			return cmp.Compare(x, y)
+		}
+	case float64:
+		if y, ok := b.(float64); ok {
+			// cmp.Compare puts NaN below every other float, which is
+			// fmtsort's rule too. Two NaN keys compare EQUAL and are
+			// still distinct map keys, so their relative order is the
+			// map's own randomised one -- under fmt as well. That is the
+			// only tie a distinct pair of keys can produce, which makes
+			// the stable sort above a mirror of fmtsort rather than
+			// something behaviour can tell apart: swapping it for an
+			// unstable one changes no output any test can pin.
+			return cmp.Compare(x, y)
+		}
+	case bool:
+		if y, ok := b.(bool); ok {
+			switch {
+			case x == y:
+				return 0
+			case x:
+				return 1
+			default:
+				return -1
+			}
+		}
+	case *StructVal:
+		// A nested struct field went into the key as its own StructKey,
+		// so fmtsort recurses into T-then-F exactly as at the top level.
+		// A typed nil *StructVal is NOT the nil case above -- that one is
+		// a nil interface -- and keys answers for it.
+		if y, ok := b.(*StructVal); ok {
+			return c.keys(x, y)
+		}
+	}
+	c.declined = true
+	return 0
 }
 
 // declareType handles `type Name struct { ... }`.

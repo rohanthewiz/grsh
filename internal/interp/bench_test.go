@@ -961,3 +961,61 @@ func BenchmarkAppendSliceValue(b *testing.B) {
 // appendSink keeps the last rendered buffer live so the whole loop is not
 // dead code.
 var appendSink []byte
+
+// BenchmarkStructKeyedMap prices rendering a map[P]V against the fmt
+// fallback it replaced, and against a map[string]int -- the shape that
+// was measured and deliberately LEFT on fmt.
+//
+// The scalar row is the argument for the narrow scope, not decoration.
+// A reflect walk that renders a map[string]int end to end is 1.5x faster
+// than fmt and allocates exactly as much, because MapKeys and MapIndex
+// mint a Value apiece and that is the same pair fmt pays for; the variant
+// that makes the count flat costs about ten allocations to set up and
+// loses at three entries. A struct key is a different shape of cost --
+// fmt decodes and stringifies every key, and orders them with a reflect
+// walk four levels deep, n log n times -- and that is what this closes.
+func BenchmarkStructKeyedMap(b *testing.B) {
+	in, fset, f := prepScript(b, "type P struct {\n\tA int\n\tB string\n}\n_ = map[P]int{}\n")
+	if err := in.Run(fset, f); err != nil {
+		b.Fatalf("declaring P: %v", err)
+	}
+	pv, ok := in.globals.Get("P")
+	if !ok {
+		b.Fatal("P was not defined")
+	}
+	st := pv.(*StructType)
+
+	buf := make([]byte, 0, 1<<16)
+	for _, n := range []int{3, 16, 64, 256} {
+		mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+		ms := make(map[string]int, n)
+		for i := 0; i < n; i++ {
+			k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i * 7 % n, "v"}})
+			if err != nil {
+				b.Fatalf("encoding a key: %v", err)
+			}
+			mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+			ms[fmt.Sprintf("key%03d", i*7%n)] = i
+		}
+		for _, c := range []struct {
+			name string
+			v    Value
+		}{{"structkey", mp.Interface()}, {"stringkey", ms}} {
+			b.Run(fmt.Sprintf("fast/%s/n%d", c.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					buf = appendValue(buf[:0], c.v)
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/entry")
+			})
+			b.Run(fmt.Sprintf("fmt/%s/n%d", c.name, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					buf = fmt.Appendf(buf[:0], "%v", c.v)
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/entry")
+			})
+		}
+	}
+	appendSink = buf
+}

@@ -7,11 +7,13 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"math/rand"
 	"reflect"
 	"runtime"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -2257,6 +2259,353 @@ s := S{Str: []string{"a", "b"}, Ints: []int{1, 2}, I64: []int64{3}, Fs: []float6
 fmt.Println(s)`,
 		"S{Str: [a b], Ints: [1 2], I64: [3], Fs: [1.5], Bs: [true], By: [104 105], "+
 			"Rs: [97], As: [1 x], Ps: [P{A: 9}], Nest: [[deep]], M: map[k:1]}\n")
+}
+
+// ---- rendering a struct-keyed map ----
+
+// mapOfStructKeys builds a map[P]V the way the interpreter does: keys
+// encoded through structKeyOf and wrapped in P's minted key type, values
+// converted to vt. Tests that hand-build a map[StructKey]V instead would
+// be testing a type no script can produce.
+func mapOfStructKeys(t *testing.T, st *StructType, vt reflect.Type, keys [][]Value, vals []Value) reflect.Value {
+	t.Helper()
+	m := reflect.MakeMap(reflect.MapOf(st.keyT, vt))
+	for i, fields := range keys {
+		// A nil FIELD LIST means the nil key -- `m[nil] = v` -- which
+		// encodes to the zero StructKey and is a distinct entry from any
+		// struct.
+		k := StructKey{}
+		if fields != nil {
+			var err error
+			if k, err = structKeyOf(&StructVal{Type: st, Vals: fields}); err != nil {
+				t.Fatalf("encoding key %v: %v", fields, err)
+			}
+		}
+		v := reflect.New(vt).Elem()
+		if vals[i] != nil {
+			v.Set(reflect.ValueOf(vals[i]))
+		}
+		m.SetMapIndex(intoKeyStore(k, st.keyT), v)
+	}
+	return m
+}
+
+// THE TEST THE WHOLE FAST PATH RESTS ON.
+//
+// appendStructKeyedMap reproduces the ordering of internal/fmtsort, an
+// UNEXPORTED package of the standard library with no compatibility
+// promise. Reproducing it is only defensible if a divergence is loud, so
+// this renders randomised maps both ways and requires the bytes to be
+// equal: a Go release that changes how maps print fails here rather than
+// leaving grsh quietly printing a different order from fmt.
+//
+// The randomisation is over the two things order depends on -- the field
+// VALUES and their TYPES -- across every value type a map can hold, at
+// sizes either side of the arena threshold. The seed is fixed so a
+// failure is reproducible, and printed so a future seed sweep can be run
+// by hand.
+func TestAStructKeyedMapMatchesFmt(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B string
+}`, "P")
+	// Values a field can hold, chosen so that ties, sign, and every arm
+	// of keyCmp.field are all reachable. nil is in the pool because an
+	// unset field is nil and fmtsort puts it low.
+	pool := []Value{
+		nil, 0, 1, -1, 1 << 40, "", "a", "b", "zzz", true, false,
+		0.5, -0.5, 'x', 'y', byte(3), int64(1 << 41),
+	}
+	valTypes := []reflect.Type{
+		reflect.TypeFor[int](),
+		reflect.TypeFor[string](),
+		reflect.TypeFor[bool](),
+		reflect.TypeFor[float64](),
+		reflect.TypeFor[rune](),
+		reflect.TypeFor[byte](),
+		reflect.TypeFor[int64](),
+		reflect.TypeFor[any](),
+		st.storeT, // map[P]P: a minted struct in the value position
+	}
+	const seed = 20260829
+	rng := rand.New(rand.NewSource(seed))
+	for _, n := range []int{1, 2, 3, 7, 40} {
+		for _, vt := range valTypes {
+			for trial := 0; trial < 40; trial++ {
+				keys := make([][]Value, n)
+				vals := make([]Value, n)
+				for i := range keys {
+					if rng.Intn(8) == 0 {
+						keys[i] = nil // the nil key, which must sort first
+					} else {
+						keys[i] = []Value{pool[rng.Intn(len(pool))], pool[rng.Intn(len(pool))]}
+					}
+					vals[i] = sampleOfType(t, st, vt, rng)
+				}
+				m := mapOfStructKeys(t, st, vt, keys, vals)
+				got := string(appendValue(nil, m.Interface()))
+				want := fmt.Sprintf("%v", m.Interface())
+				if got != want {
+					t.Fatalf("seed %d, n=%d, values %v, trial %d:\n got %s\nwant %s",
+						seed, n, vt, trial, got, want)
+				}
+			}
+		}
+	}
+}
+
+// sampleOfType makes one value assignable to vt, for the randomised
+// parity test above.
+func sampleOfType(t *testing.T, st *StructType, vt reflect.Type, rng *rand.Rand) Value {
+	t.Helper()
+	switch vt {
+	case reflect.TypeFor[int]():
+		return rng.Intn(1000) - 500
+	case reflect.TypeFor[string]():
+		return []string{"", "x", "yy"}[rng.Intn(3)]
+	case reflect.TypeFor[bool]():
+		return rng.Intn(2) == 0
+	case reflect.TypeFor[float64]():
+		return float64(rng.Intn(100)) / 4
+	case reflect.TypeFor[rune]():
+		return rune('a' + rng.Intn(26))
+	case reflect.TypeFor[byte]():
+		return byte(rng.Intn(256))
+	case reflect.TypeFor[int64]():
+		return int64(rng.Intn(1000))
+	case reflect.TypeFor[any]():
+		return []Value{nil, 1, "s", true}[rng.Intn(4)]
+	case st.storeT:
+		if rng.Intn(4) == 0 {
+			return nil // a nil struct value, which renders <nil>
+		}
+		return intoStore(&StructVal{Type: st, Vals: []Value{rng.Intn(9), "v"}}, st.storeT).Interface()
+	}
+	t.Fatalf("no sample for %v", vt)
+	return nil
+}
+
+// The four ways fmt's answer comes from a MACHINE ADDRESS, which is the
+// one thing no reproduction can predict. Each must DECLINE -- not guess
+// and not approximate -- and the rendered result must still equal fmt's,
+// because declining hands the map back to fmt itself.
+//
+// The assertion is on the decline, not only on the output: an
+// implementation that stopped declining would still pass a parity check
+// most of the time, since two addresses usually happen to be ordered the
+// way the values are.
+func TestAStructKeyedMapDeclinesWhereFmtUsesAnAddress(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+}`, "P")
+	intT := reflect.TypeFor[int]()
+
+	t.Run("a key type that is not a struct", func(t *testing.T) {
+		m := reflect.ValueOf(map[string]int{"a": 1, "b": 2})
+		if _, ok := appendStructKeyedMap(nil, m); ok {
+			t.Error("took a map[string]int, whose keys it has no arena or comparator for")
+		}
+	})
+
+	t.Run("two StructTypes in one map", func(t *testing.T) {
+		// A re-declared P mints ONE key type -- minting interns on the
+		// struct's shape -- but keeps a StructType per declaration. So a
+		// map really can hold keys carrying different *StructTypes, and
+		// fmt orders those two by the addresses of the StructTypes.
+		other := declare(t, `type P struct {
+	A int
+}`, "P")
+		if other == st {
+			t.Fatal("the second declaration reused the first StructType; this test needs two")
+		}
+		if other.keyT != st.keyT {
+			t.Fatal("the two declarations minted different key types; this test needs one map to hold both")
+		}
+		m := mapOfStructKeys(t, st, intT, [][]Value{{1}}, []Value{1})
+		k, err := structKeyOf(&StructVal{Type: other, Vals: []Value{2}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.SetMapIndex(intoKeyStore(k, other.keyT), reflect.ValueOf(2))
+		if _, ok := appendStructKeyedMap(nil, m); ok {
+			t.Error("ordered two keys whose *StructTypes differ, which fmt orders by address")
+		}
+		if got, want := string(appendValue(nil, m.Interface())), fmt.Sprintf("%v", m.Interface()); got != want {
+			t.Errorf("after declining, got %q, fmt says %q", got, want)
+		}
+	})
+
+	t.Run("one field holding two types", func(t *testing.T) {
+		// Legal: a field is dynamically typed, so P{A: 1} and P{A: "1"}
+		// are both keys of the same map. fmt orders them by the addresses
+		// of `int` and `string`.
+		m := mapOfStructKeys(t, st, intT, [][]Value{{1}, {"one"}}, []Value{1, 2})
+		if _, ok := appendStructKeyedMap(nil, m); ok {
+			t.Error("ordered an int against a string, which fmt orders by type address")
+		}
+		if got, want := string(appendValue(nil, m.Interface())), fmt.Sprintf("%v", m.Interface()); got != want {
+			t.Errorf("after declining, got %q, fmt says %q", got, want)
+		}
+	})
+
+	t.Run("a field type the comparator does not know", func(t *testing.T) {
+		// uint is not a type a script can WRITE, but a stdlib call hands
+		// them back and a field takes whatever it is given.
+		m := mapOfStructKeys(t, st, intT, [][]Value{{uint(1)}, {uint(2)}}, []Value{1, 2})
+		if _, ok := appendStructKeyedMap(nil, m); ok {
+			t.Error("ordered a field type keyCmp has no case for")
+		}
+		if got, want := string(appendValue(nil, m.Interface())), fmt.Sprintf("%v", m.Interface()); got != want {
+			t.Errorf("after declining, got %q, fmt says %q", got, want)
+		}
+	})
+}
+
+// appendMapValue is a SECOND way to render a value -- from a
+// reflect.Value rather than from an interface -- and two renderers that
+// disagree would put one spelling in a map and another everywhere else.
+// So it is held against appendValue directly, which is a stronger
+// equivalence than holding each against fmt separately.
+//
+// The named types are the reason it matches on TYPE and not on KIND:
+// time.Duration and time.Month are Int-kinded and print through their
+// String methods, so a kind switch would render them as bare numbers.
+func TestMapValueRenderMatchesAppendValue(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+}`, "P")
+	vals := []Value{
+		"text", "", 0, 42, -7, int64(1 << 40), 'q', byte(200), 3.5, 0.1, true, false,
+		float32(0.1),    // Float64's case must NOT widen this one
+		3 * time.Second, // named int64 with a String method
+		time.March,      // named int with a String method
+		[]string{"a"},   // through appendValue's own slice case
+		intoStore(&StructVal{Type: st, Vals: []Value{5}}, st.storeT).Interface(),
+	}
+	for _, v := range vals {
+		rv := reflect.ValueOf(v)
+		vr := mapValRender(rv.Type())
+		got := string(appendMapValue(nil, rv, vr))
+		// fromStore is what appendMapValue's general arm applies, so the
+		// comparison has to start from the same value.
+		want := string(appendValue(nil, fromStore(rv)))
+		if got != want {
+			t.Errorf("appendMapValue(%#v) = %q, appendValue says %q", v, got, want)
+		}
+		if want2 := fmt.Sprintf("%v", fromStore(rv)); got != want2 {
+			t.Errorf("appendMapValue(%#v) = %q, fmt says %q", v, got, want2)
+		}
+	}
+}
+
+// The claim the fast path exists for. It is asserted as a COMPARISON with
+// fmt rather than as a count, for the reason the arena tests give: a
+// pinned number reports the compiler's inlining decisions, while "fewer
+// than the thing we replaced" is the actual promise and cannot pass by
+// accident -- fmt decodes and stringifies every key and boxes every
+// value, which is six allocations an entry.
+func TestRenderingAStructKeyedMapAllocatesLessThanFmt(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B string
+}`, "P")
+	// Both value shapes: a scalar, which appendMapValue renders straight
+	// off the reflect.Value, and a minted struct, which it unwraps with
+	// fromStore so the render is an appendTo rather than fmt calling the
+	// carrier's String.
+	shapes := []struct {
+		name string
+		vt   reflect.Type
+		val  func(i int) Value
+	}{
+		{"map[P]int", reflect.TypeFor[int](), func(i int) Value { return i }},
+		{"map[P]P", st.storeT, func(i int) Value {
+			return intoStore(&StructVal{Type: st, Vals: []Value{i, "v"}}, st.storeT).Interface()
+		}},
+	}
+	for _, sh := range shapes {
+		for _, n := range []int{3, 16, 64} {
+			t.Run(fmt.Sprintf("%s/n%d", sh.name, n), func(t *testing.T) {
+				checkMapAllocs(t, st, sh.vt, n, sh.val)
+			})
+		}
+	}
+}
+
+func checkMapAllocs(t *testing.T, st *StructType, vt reflect.Type, n int, val func(int) Value) {
+	t.Helper()
+	{
+		keys := make([][]Value, n)
+		vals := make([]Value, n)
+		for i := range keys {
+			keys[i] = []Value{i * 7 % n, "v"}
+			vals[i] = val(i)
+		}
+		m := mapOfStructKeys(t, st, vt, keys, vals).Interface()
+		buf := make([]byte, 0, 1<<16)
+		fast := testing.AllocsPerRun(50, func() { buf = appendValue(buf[:0], m) })
+		slow := testing.AllocsPerRun(50, func() { buf = fmt.Appendf(buf[:0], "%v", m) })
+		if fast >= slow {
+			t.Errorf("%d entries: the fast path allocated %.0f times, fmt %.0f -- "+
+				"it is meant to decode into one arena and render values without boxing", n, fast, slow)
+		}
+		// The shape, not just the height: fmt's count grows by 6 an entry,
+		// so a fast path still paying per-entry allocation for the KEY
+		// decode alone must stay well under half.
+		if fast > slow/2 {
+			t.Errorf("%d entries: %.0f allocations against fmt's %.0f is more than half; "+
+				"has the arena or the value renderer been lost?", n, fast, slow)
+		}
+	}
+}
+
+// The same claim from the outside, through the interpreter.
+//
+// IT PRINTS A STRUCT, NOT A MAP, and that is the reachability the whole
+// fast path has: `fmt.Println(m)` on a bare map is handed to Go's fmt,
+// which renders it itself and never asks grsh. appendValue sees a map
+// only as a struct FIELD, reached through appendTo -- which is exactly
+// what the open item this closes said. A test that printed the map
+// directly would pass whatever this file did.
+//
+// The three shapes here are the ones a unit test builds least naturally:
+// a nil key, a nested struct key, and struct values.
+func TestAScriptPrintsAStructKeyedMapFieldLikeFmt(t *testing.T) {
+	wantOut(t, `type Inner struct {
+	X int
+}
+type P struct {
+	A int
+	B string
+}
+type Q struct {
+	I Inner
+	N int
+}
+type Holder struct {
+	M  map[P]int
+	PP map[P]P
+	QQ map[Q]string
+	E  map[P]int
+}
+m := map[P]int{}
+m[P{A: 2, B: "b"}] = 2
+m[P{A: 1, B: "a"}] = 1
+m[nil] = 99
+pp := map[P]P{}
+pp[P{A: 1}] = P{A: 10}
+pp[P{A: 2}] = P{A: 20}
+qq := map[Q]string{}
+qq[Q{I: Inner{X: 2}, N: 1}] = "b"
+qq[Q{I: Inner{X: 1}, N: 9}] = "a"
+fmt.Println(Holder{M: m, PP: pp, QQ: qq, E: map[P]int{}})
+`,
+		// A nil key sorts first: it encodes the zero StructKey, whose T is
+		// the nil pointer, and no *StructType lives at address 0.
+		"Holder{M: map[<nil>:99 P{A: 1, B: a}:1 P{A: 2, B: b}:2], "+
+			"PP: map[P{A: 1, B: }:P{A: 10, B: } P{A: 2, B: }:P{A: 20, B: }], "+
+			"QQ: map[Q{I: Inner{X: 1}, N: 9}:a Q{I: Inner{X: 2}, N: 1}:b], "+
+			"E: map[]}\n")
 }
 
 // appendTo has to APPEND, which is the whole reason it exists: sortMapKeys
