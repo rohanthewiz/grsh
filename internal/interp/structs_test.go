@@ -1581,6 +1581,46 @@ func TestDecodedKeyDoesNotAliasTheMapKey(t *testing.T) {
 	}
 }
 
+// decodeMintedKey lifts the whole ScriptKey out of the map key with a
+// single Interface(), and that is free only because a key from MapKeys is
+// NOT ADDRESSABLE. reflect copies a three-word struct to the heap on its
+// way into an interface when the value could still be written through,
+// and hands back the words already sitting there when it could not.
+//
+// So the saving lives in a property of the CALLER rather than of the
+// function, and losing it would change nothing about the answer -- only
+// add an allocation per ranged key, which no test that reads the decoded
+// struct back could notice. This is what notices.
+//
+// The count is exactly one: the *StructVal, fused with its field block by
+// newStructVal. The value is asserted too, because a decode that did
+// nothing would also allocate nothing.
+func TestDecodingAMapKeyDoesNotCopyIt(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{1, 2}})
+	if err != nil {
+		t.Fatalf("encoding: %v", err)
+	}
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(7))
+	inMap := mp.MapKeys()[0]
+
+	var sink *StructVal
+	got := testing.AllocsPerRun(200, func() {
+		sink = decodeMintedKey(inMap)
+	})
+	if got != 1 {
+		t.Errorf("decoding a map key allocates %.0f times, want 1 (the *StructVal): "+
+			"lifting the carrier out of the key is copying it to the heap first", got)
+	}
+	if sink.String() != "P{A: 1, B: 2}" {
+		t.Errorf("the key decoded to %s, want P{A: 1, B: 2}", sink.String())
+	}
+}
+
 // The general path sizes its slice from the declared array, never from
 // the instance, so an instance carrying MORE values than the type has
 // fields stops on a bounds check instead of writing past the array --

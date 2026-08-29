@@ -81,20 +81,19 @@ func TestMintedTypePromotesExactlyOneMethod(t *testing.T) {
 	// ScriptKey at offset zero and nothing else. mintKeyType panics if
 	// that ever stops holding, and this is the same invariant stated
 	// where a reader of the test will meet it.
+	//
+	// The decode side leans on the same equivalence from the other end:
+	// decodeMintedKey lifts the carrier back out with
+	// rv.Field(0).Interface().(ScriptKey), so a mint that grew a second
+	// field would fail the assertion there. That assertion is a runtime
+	// check the old by-index field reads never had -- which is why
+	// StructKey's field ORDER is no longer pinned anywhere.
 	kc := reflect.TypeFor[ScriptKey]()
 	if st.keyT.NumField() != 1 || st.keyT.Field(0).Type != kc ||
 		st.keyT.Field(0).Offset != 0 || st.keyT.Size() != kc.Size() {
 		t.Fatalf("minted key type %s is not layout-identical to ScriptKey (%d fields, %d bytes vs %d): "+
 			"intoKeyStore's reflect.NewAt alias reads the wrong memory",
 			st.keyT, st.keyT.NumField(), st.keyT.Size(), kc.Size())
-	}
-	// decodeMintedKey reads StructKey's fields BY INDEX -- T then F --
-	// rather than lifting the struct out whole, so reordering them would
-	// decode the encoding out of the wrong slots.
-	for i, want := range [2]string{"T", "F"} {
-		if got := structKeyType.Field(i).Name; got != want {
-			t.Fatalf("StructKey field %d is %s, want %s: decodeMintedKey reads these by index", i, got, want)
-		}
 	}
 	if got, want := mt.Size(), reflect.TypeFor[*StructVal]().Size(); got != want {
 		t.Errorf("minted type is %d bytes, want %d: the storage must stay one pointer wide", got, want)

@@ -585,6 +585,13 @@ _ = n`},
 // -- reports an allocation the real path never pays. A decode measured
 // that way once made a change look like it saved an allocation per
 // ranged key when it saved none.
+//
+// decodeMintedKey now TRADES on that difference rather than merely being
+// measured under it: it lifts the whole carrier out with one Interface(),
+// which is free only for a non-addressable key. So an input from
+// intoKeyStore would not just misreport this benchmark, it would price a
+// path the interpreter does not take. TestDecodingAMapKeyDoesNotCopyIt
+// holds the real one to a single allocation.
 func BenchmarkKeyCrossing(b *testing.B) {
 	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
 	for _, nf := range []int{1, 3, 6, 10} {

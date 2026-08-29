@@ -407,28 +407,62 @@ func zeroInSlot(t reflect.Type) Value {
 // already knows the answer for the whole map — one key type per map — so
 // a guard would put a registry lookup inside the loop for nothing.
 //
-// The two StructKey fields are read THROUGH reflect rather than by
-// lifting the whole StructKey out with Interface(). A three-word struct
-// does not fit in an interface word, so boxing one out of an ADDRESSABLE
-// field copies it to the heap first; reading the fields separately never
-// does, because a pointer unboxes for free and the field array comes out
-// of its `any` field as the two words already sitting there.
+// THE CARRIER IS LIFTED OUT WHOLE, with one Interface() and a type
+// assertion, rather than walked into field by field through reflect. That
+// is a trade with a condition attached, and the condition is
+// ADDRESSABILITY. A three-word struct does not fit in an interface word,
+// so boxing one out of an addressable value has to copy it to the heap
+// first — an interface's contents must not change underneath it, and an
+// addressable value could still be written through. Out of a
+// NON-ADDRESSABLE value there is nothing to protect against, so reflect
+// hands back an interface pointing at the words already sitting there and
+// the copy never happens.
+//
+// Every key on this path comes from MapKeys, which is exactly the
+// non-addressable case, so the lift is free here — and
+// TestDecodingAMapKeyDoesNotCopyIt pins that at one allocation, the
+// *StructVal itself. A future caller handing this an addressable key
+// would still get the right answer, just a second allocation for it.
+//
+// What the lift removes is a Field walk and one of the two Interface()
+// calls, all of it floor, so the saving is the same at every arity —
+// minimum of ten runs at a fixed iteration count, Apple M3, one
+// allocation on both paths throughout:
+//
+//	fields          1     3     6    10
+//	field walk   26.2  31.5  36.0  45.6
+//	lifted       19.9  24.7  29.7  39.4  ns
+//
+// which is 24% off a one-field decode and 14% off a ten-field one, the
+// gap NARROWING with arity because the per-field work it does not touch
+// grows around it.
+//
+// A third form was built and measured and not taken: reading the eface's
+// data word straight into a *StructKey, which is sound for the same
+// reason intoKeyStore's alias is — mintKeyType has already checked that a
+// minted key type is one ScriptKey at offset zero, and a ScriptKey is one
+// StructKey at offset zero. It came in ~1.4ns ahead. That is a sixth
+// unsafe expression, and a third of a percent of one interpreted range
+// iteration, for something no script can feel.
+//
+// The assertion also CHECKS what the walk merely assumed. Reading
+// StructKey's fields by index left the field ORDER load-bearing, guarded
+// only by a test; `.(ScriptKey)` names the type instead, so a mint that
+// stopped being one ScriptKey would panic here rather than decode the
+// wrong slots.
 func decodeMintedKey(rv reflect.Value) *StructVal {
-	// Two hops, like fromStore: the minted type embeds the carrier, the
-	// carrier holds the encoding.
-	sk := rv.Field(0).Field(0)
-	t, _ := sk.Field(0).Interface().(*StructType)
-	if t == nil {
+	// One hop: the minted type embeds the carrier, and the carrier's one
+	// field is the encoding.
+	sk := rv.Field(0).Interface().(ScriptKey).K
+	if sk.T == nil {
 		// The zero key, which `m[nil] = 1` puts in a map. structVal
 		// answers a typed nil for it and so must this.
 		return nil
 	}
-	// Interface() on an interface-kind Value is not the boxing case: it
-	// hands back the eface already in the field rather than building a
-	// new one, so this costs a two-word load and the array is not copied.
-	// It is what lets decodeKeyArr take a plain `any` and so serve this
-	// path and StructKey.structVal from one body.
-	return decodeKeyArr(t, sk.Field(1).Interface())
+	// sk.F is the two words that were in the map, copied to this frame.
+	// decodeKeyArr takes it as a plain `any`, which is what lets one body
+	// serve this path and StructKey.structVal both.
+	return decodeKeyArr(sk.T, sk.F)
 }
 
 // intoStore wraps a script struct for a container slot of minted type mt.
