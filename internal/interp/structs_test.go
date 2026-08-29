@@ -1036,6 +1036,23 @@ for k := range m {
 	k.X = 99
 }
 fmt.Println(m[P{1}], len(m))`, "10 1\n")
+	// The same claim for a map with SEVERAL keys, which is a different
+	// path: one key is decoded on its own, more than one comes out of a
+	// shared keyArena. Writing to the range variable must reach neither
+	// the map nor the other keys of the same loop, and this is the only
+	// place a script says so.
+	wantOut(t, `type P struct {
+	X int
+	Y int
+}
+m := map[P]int{{1, 1}: 10, {2, 2}: 20, {3, 3}: 30}
+for k, v := range m {
+	k.X, k.Y = 99, 99
+	fmt.Println(v)
+}
+for k, v := range m {
+	fmt.Println(k, v)
+}`, "10\n20\n30\nP{X: 1, Y: 1} 10\nP{X: 2, Y: 2} 20\nP{X: 3, Y: 3} 30\n")
 }
 
 // Two struct types never collide however alike their fields are, and the
@@ -1566,10 +1583,10 @@ func TestDecodedKeyDoesNotAliasTheMapKey(t *testing.T) {
 	// the one a range loop yields, and it is the map's own memory.
 	inMap := mp.MapKeys()[0]
 
-	first := decodeMintedKey(inMap)
+	first := decodeMintedKey(inMap, nil)
 	first.Vals[0] = 99
 
-	second := decodeMintedKey(inMap)
+	second := decodeMintedKey(inMap, nil)
 	if got := second.String(); got != "P{A: 1, B: 2}" {
 		t.Errorf("after writing to a decoded key, the next decode reads %s; the decode aliases the map's key", got)
 	}
@@ -1610,7 +1627,7 @@ func TestDecodingAMapKeyDoesNotCopyIt(t *testing.T) {
 
 	var sink *StructVal
 	got := testing.AllocsPerRun(200, func() {
-		sink = decodeMintedKey(inMap)
+		sink = decodeMintedKey(inMap, nil)
 	})
 	if got != 1 {
 		t.Errorf("decoding a map key allocates %.0f times, want 1 (the *StructVal): "+
@@ -1618,6 +1635,197 @@ func TestDecodingAMapKeyDoesNotCopyIt(t *testing.T) {
 	}
 	if sink.String() != "P{A: 1, B: 2}" {
 		t.Errorf("the key decoded to %s, want P{A: 1, B: 2}", sink.String())
+	}
+}
+
+// A whole map's keys are decoded out of ONE arena, and the count that
+// proves it is the count that does not grow.
+//
+// The assertion is written against BOTH ways of decoding the same keys,
+// because "2 allocations" is worth nothing on its own -- it has to be 2
+// where the alternative is n. Running the same loop with a nil arena in
+// the same test is what turns the number into a guard, and it also pins
+// the fallback: a nil arena must still decode, one fused block at a time.
+func TestOneArenaServesAWholeMapsKeys(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	const nk = 8
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for i := 0; i < nk; i++ {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i, i * 10}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+	}
+	keys := mp.MapKeys()
+
+	var sink *StructVal
+	arena := testing.AllocsPerRun(100, func() {
+		a := newKeyArena(st, len(keys))
+		for _, k := range keys {
+			sink = decodeMintedKey(k, a)
+		}
+	})
+	// The two slabs. newKeyArena itself is a third object, but it does
+	// not escape this loop and the compiler keeps it on the stack.
+	if arena != 2 {
+		t.Errorf("decoding %d keys through one arena allocates %.0f times, want 2 (the two slabs)", nk, arena)
+	}
+	perKey := testing.AllocsPerRun(100, func() {
+		for _, k := range keys {
+			sink = decodeMintedKey(k, nil)
+		}
+	})
+	if perKey != nk {
+		t.Errorf("decoding %d keys without an arena allocates %.0f times, want %d "+
+			"(one fused block each) -- the arena's %.0f is not being compared against anything", nk, perKey, nk, arena)
+	}
+	if sink == nil || sink.Type != st || len(sink.Vals) != 2 {
+		t.Errorf("the decoded key is %v, want a two-field P -- a decode that did nothing would also allocate nothing", sink)
+	}
+}
+
+// The arena has exactly one user, and this is the test that says so.
+//
+// Every other test here would pass with sortMapKeys reverted to a decode
+// per key: the arena is a source of memory, not of answers, so nothing
+// that reads a decoded key can see whether one was built. Removing the
+// two lines that build it was tried, and the whole package stayed green.
+//
+// So the assertion is a COMPARISON against the same work done the other
+// way. The control renders the keys exactly as sortMapKeys does -- a
+// []string, a []Value, one String() per key -- differing only in where
+// the StructVals come from, which makes every allocation the two share
+// cancel and leaves the gap equal to what the arena replaced: nk fused
+// blocks become 2 slabs.
+func TestRangingAMapDecodesItsKeysIntoOneArena(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	const nk = 8
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for i := 0; i < nk; i++ {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i, i * 10}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+	}
+	keys := mp.MapKeys()
+
+	var sink []Value
+	sorted := testing.AllocsPerRun(50, func() { sink = sortMapKeys(keys) })
+	control := testing.AllocsPerRun(50, func() {
+		strs := make([]string, len(keys))
+		out := make([]Value, len(keys))
+		for i, k := range keys {
+			sv := decodeMintedKey(k, nil)
+			out[i] = sv
+			strs[i] = sv.String()
+		}
+		_ = strs
+		sink = out
+	})
+	// The gap, not either number: what the two runs do differently is
+	// where nk StructVals come from, so everything else cancels.
+	//
+	// It is a FLOOR rather than an equality because newKeyArena's header
+	// is stack-allocated only while it inlines, and -race turns that off
+	// -- so the ordinary build shows nk-2 (two slabs) and the race build
+	// nk-3 (two slabs and a header). Both are the same claim; pinning the
+	// exact value would make this test report the compiler's inlining
+	// decisions as an arena bug.
+	if gap, want := control-sorted, float64(nk-3); gap < want {
+		t.Errorf("sortMapKeys allocates %.0f times for %d keys against %.0f for the same work decoded one key at a time, "+
+			"a gap of %.0f; want at least %.0f, being %d fused blocks replaced by two slabs -- "+
+			"the range path is not using an arena", sorted, nk, control, gap, want, nk)
+	}
+	if len(sink) != nk {
+		t.Fatalf("the control decoded %d keys, want %d", len(sink), nk)
+	}
+	// THE ONE-KEY THRESHOLD IS NOT PINNED HERE, and that is a finding
+	// rather than an omission. Three ways of catching a dropped length
+	// test were built and all three measure the compiler instead:
+	//
+	//   - against this control, -race adds one allocation to sortMapKeys
+	//     that the control does not see, which is exactly the size of the
+	//     effect being looked for;
+	//   - against a constant, every count on this path shifts under -race
+	//     when newKeyArena stops inlining;
+	//   - against the STEP from one key to two, which would cancel both,
+	//     except that the step is not uniform: String's own allocations
+	//     vary with the text a key renders to (7, 13, 19, 24, 29, 34 for
+	//     one to six keys, and a different sequence under -race).
+	//
+	// Dropping the length test would cost 16-18ns per key on one-key maps
+	// and 2-3ns on two-key ones, and would change no answer, so it is a
+	// tuning decision. It is recorded the way this package records its
+	// other tuned constants -- as a measurement in keyArena's doc, beside
+	// BenchmarkMapKeyArena, which is where it can be re-run.
+}
+
+// Keys carved from one arena must be as independent as keys that were
+// allocated apart, and that is the arena's ONE real hazard: n structs cut
+// from a single []Value differ from n separate ones exactly if a carve
+// ever hands out an overlapping window.
+//
+// TestStructMapKeysComeBack makes the same point from a script, but only
+// for a one-key map -- which takes the nil-arena path and so cannot see
+// this at all. Sharing would be invisible until a script wrote to a range
+// variable and silently changed a DIFFERENT key of the same loop.
+func TestArenaKeysDoNotShareFields(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B int
+}`, "P")
+	const nk = 5
+	mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for i := 0; i < nk; i++ {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i, i * 10}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+	}
+	keys := mp.MapKeys()
+
+	a := newKeyArena(st, len(keys))
+	svs := make([]*StructVal, len(keys))
+	want := make([]string, len(keys))
+	orig := make([][]Value, len(keys))
+	for i, k := range keys {
+		svs[i] = decodeMintedKey(k, a)
+		want[i] = svs[i].String()
+		orig[i] = append([]Value(nil), svs[i].Vals...)
+	}
+	// Write a sentinel into every field of every key in turn, and after
+	// each write check that every OTHER key still reads what it decoded
+	// to. Comparing backing-array addresses would catch the same bug, but
+	// only the overlap it thought to look for; a write that lands in a
+	// neighbour shows up here however the two came to overlap.
+	//
+	// Each field is restored immediately, so every struct stays an ARENA
+	// slot for the whole sweep. Re-decoding the mutated key instead would
+	// swap it for an independently allocated one and quietly stop testing
+	// the slot the later keys are neighbours of.
+	for i := range svs {
+		for f := range svs[i].Vals {
+			svs[i].Vals[f] = "sentinel"
+			for j := range svs {
+				if j == i {
+					continue
+				}
+				if got := svs[j].String(); got != want[j] {
+					t.Fatalf("writing field %d of key %d changed key %d to %s, want %s: "+
+						"two keys from one arena share a backing array", f, i, j, got, want[j])
+				}
+			}
+			svs[i].Vals[f] = orig[i][f]
+		}
 	}
 }
 

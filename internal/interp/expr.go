@@ -914,22 +914,39 @@ func sortMapKeys(keys []reflect.Value) []Value {
 	// decoded stays nil for every key kind that is already the script's
 	// own value, which is the signal the caller reads.
 	var decoded []Value
+	// The type is asked, not the value: every key in a map shares one
+	// type, so one lookup settles the whole slice. It is hoisted out of
+	// the switch because the struct case now needs the type itself and
+	// not merely the fact that there is one; a non-struct key kind leaves
+	// keyOwnerOf on its first line, so the hoist costs the string case
+	// nothing.
+	kt := keyOwnerOf(keys[0].Type())
 	switch {
 	case keys[0].Kind() == reflect.String:
 		for i, k := range keys {
 			strs[i] = k.String()
 		}
-	case keyOwnerOf(keys[0].Type()) != nil:
+	case kt != nil:
 		// A struct key holds a *StructType POINTER, so any ordering Go
 		// would derive from the key itself varies run to run. Sorting on
 		// the rendered struct — the same text the script would print —
 		// is both stable and the order a reader expects.
-		//
-		// The type is asked, not the value: every key in a map shares one
-		// type, so one lookup settles the whole slice.
 		decoded = make([]Value, len(keys))
+		// One arena for the whole map. Every key is decoded HERE, before
+		// the caller's loop body runs even once, so all of them are alive
+		// together whether they came from an arena or not — the slab
+		// changes where they live, not for how long.
+		//
+		// Maps of one or two keys ask for none: two slabs cost more than
+		// the one or two fused blocks they would replace, and there is
+		// too little to amortise them over. Three is where it turns, and
+		// BenchmarkMapKeyArena is where that was measured.
+		var arena *keyArena
+		if len(keys) > 2 {
+			arena = newKeyArena(kt, len(keys))
+		}
 		for i, k := range keys {
-			sv := decodeMintedKey(k)
+			sv := decodeMintedKey(k, arena)
 			// Held as the *StructVal it is, so a nil key stays the typed
 			// nil the script sees everywhere else. String answers for it.
 			decoded[i] = sv

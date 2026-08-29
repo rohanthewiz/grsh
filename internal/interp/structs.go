@@ -223,9 +223,21 @@ func (k StructKey) structVal() *StructVal {
 // fields is the same answer the old field loop gave for an array of nil
 // interfaces.
 func decodeKeyArr(t *StructType, a any) *StructVal {
-	sv := newStructVal(t, len(t.Fields))
+	return fillKeyArr(newStructVal(t, len(t.Fields)), a)
+}
+
+// fillKeyArr writes a key's boxed field array into a StructVal that has
+// already been built, and is decodeKeyArr's whole body.
+//
+// The split exists so the two ways of OBTAINING that StructVal -- one
+// allocation each from newStructVal, or a carve from a keyArena on the
+// range path -- share one decoder and can never drift. The guard reads
+// sv.Type rather than taking a second *StructType parameter, because the
+// only correct type to check against is the one the StructVal was built
+// for; passing it separately would let the two disagree.
+func fillKeyArr(sv *StructVal, a any) *StructVal {
 	typ, data := unboxKeyArr(a)
-	if keyTyp, _ := unboxKeyArr(t.keyArrZero); typ != keyTyp {
+	if keyTyp, _ := unboxKeyArr(sv.Type.keyArrZero); typ != keyTyp {
 		return sv
 	}
 	for i, v := range unsafe.Slice((*any)(data), len(sv.Vals)) {
@@ -588,6 +600,107 @@ func newStructVal(t *StructType, n int) *StructVal {
 		return &b.sv
 	}
 	return &StructVal{Type: t, Vals: make([]Value, n)}
+}
+
+// keyArena carves the *StructVals for one map's decoded keys out of two
+// slabs instead of allocating each of them on its own.
+//
+// A range over a struct-keyed map decodes EVERY key before the loop body
+// runs -- sortMapKeys has to render each one to order them -- so all n
+// results are alive simultaneously however they were allocated. That is
+// what makes a slab legitimate here rather than clever: it changes where
+// the memory comes from, not how long it lives.
+//
+//	per key   [StructVal|[N]Value] [StructVal|[N]Value] ...   n allocations
+//	arena     [StructVal StructVal ...] [Value Value ...]     2 allocations
+//
+// WHAT IT SAVES is BenchmarkMapKeyArena, minimum of twelve runs at a
+// fixed iteration count, Apple M3, ns PER KEY:
+//
+//	keys           1     2     3     4    16    64
+//	 1 field
+//	  per key   30.1  26.3  27.1  23.1  20.4  20.4
+//	  arena     46.3  28.7  22.3  17.5  14.4  11.2
+//	10 fields
+//	  per key   31.9  33.0  34.4  41.4  38.6  38.2
+//	  arena     49.4  36.4  33.6  35.0  28.4  24.5
+//
+// Allocations go from n to 2 and STAY at 2, and that is the whole
+// mechanism: past a couple of keys a decode is paying the allocator, not
+// the fields. So the saving grows with the key count and shrinks with the
+// field count -- 45% of a one-field decode at sixteen keys, 26% of a
+// ten-field one -- because what it removes is per-KEY floor sitting
+// underneath per-FIELD work it does not touch.
+//
+// SMALL MAPS ARE THE EXCEPTION, and are why sortMapKeys checks the length
+// before building one. Two slabs are two allocations where newStructVal's
+// fused block is one each, so a one-key map pays 16-18ns per key for an
+// arena it never amortises and a two-key map still pays 2-3ns. Three is
+// where it turns, and that is the bound sortMapKeys uses.
+//
+// The threshold is a TUNING choice, not a correctness one -- an arena
+// built for one key decodes it perfectly well -- so it is recorded here
+// against the benchmark that set it rather than pinned by a test. See
+// TestRangingAMapDecodesItsKeysIntoOneArena for why no test could:
+// counting allocations across the bound measures the compiler's inlining
+// as much as this function.
+//
+// THE TRADE IS RETENTION. A key that outlives its loop -- `for k := range
+// m { found = k }` -- holds the whole slab alive, where a fused block
+// would have held only itself. Two things bound that: the slab is sized
+// by the map that was just ranged, and it is SMALLER than the []string of
+// rendered keys sortMapKeys already builds and holds for the same n. So
+// the arena is not a new order of memory, only a longer-lived one in a
+// shape that has to keep a key. Chunking the slab to cap it was built and
+// measured, and cost 2-8% at every arity to guard something no script has
+// hit; the cap can go in if one ever does.
+type keyArena struct {
+	svs  []StructVal
+	vals []Value
+}
+
+// newKeyArena sizes an arena for n keys of struct type t.
+//
+// It inlines at its one call site, so the keyArena header itself costs no
+// allocation there and the two slabs are the whole price — which is what
+// TestRangingAMapDecodesItsKeysIntoOneArena's count of exactly two rests
+// on.
+//
+// One type for all n is the map's own invariant -- a minted key type is
+// minted per *StructType, so every key in a map decodes to the same
+// struct -- which is what lets the field slab be one flat n*len(Fields)
+// block rather than n separate ones.
+func newKeyArena(t *StructType, n int) *keyArena {
+	return &keyArena{
+		svs:  make([]StructVal, n),
+		vals: make([]Value, n*len(t.Fields)),
+	}
+}
+
+// structVal hands out the next StructVal, allocating a fresh one instead
+// whenever the arena cannot serve the request.
+//
+// EVERY way of running out falls back rather than failing: a nil receiver
+// (the single-key path, which asks for no arena at all), an exhausted
+// slab, or a type wanting more fields than the arena was sized for. The
+// last cannot happen while a map holds one key type, but it is two
+// compares and it makes the carve TOTAL -- a future caller that sizes an
+// arena wrongly gets slower decodes, not a bounds panic on a premise held
+// three functions away.
+func (a *keyArena) structVal(t *StructType) *StructVal {
+	nf := len(t.Fields)
+	if a == nil || len(a.svs) == 0 || len(a.vals) < nf {
+		return newStructVal(t, nf)
+	}
+	sv := &a.svs[0]
+	a.svs = a.svs[1:]
+	sv.Type = t
+	// The capacity is capped at nf so an append to one struct's Vals
+	// cannot reach into the next struct's fields. copyStruct sizes itself
+	// from the instance, so a Vals that could grow is not hypothetical.
+	sv.Vals = a.vals[:nf:nf]
+	a.vals = a.vals[nf:]
+	return sv
 }
 
 func (sv *StructVal) String() string {

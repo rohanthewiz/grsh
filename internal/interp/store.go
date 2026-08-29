@@ -407,6 +407,11 @@ func zeroInSlot(t reflect.Type) Value {
 // already knows the answer for the whole map — one key type per map — so
 // a guard would put a registry lookup inside the loop for nothing.
 //
+// arena, when non-nil, supplies the *StructVal instead of allocating one
+// per key. It is the same "a whole map at a time" fact spent a second
+// way, and a nil arena is a complete answer — see keyArena for what it
+// buys and for the small map sizes that are better off without it.
+//
 // THE CARRIER IS LIFTED OUT WHOLE, with one Interface() and a type
 // assertion, rather than walked into field by field through reflect. That
 // is a trade with a condition attached, and the condition is
@@ -450,19 +455,22 @@ func zeroInSlot(t reflect.Type) Value {
 // only by a test; `.(ScriptKey)` names the type instead, so a mint that
 // stopped being one ScriptKey would panic here rather than decode the
 // wrong slots.
-func decodeMintedKey(rv reflect.Value) *StructVal {
+func decodeMintedKey(rv reflect.Value, arena *keyArena) *StructVal {
 	// One hop: the minted type embeds the carrier, and the carrier's one
 	// field is the encoding.
 	sk := rv.Field(0).Interface().(ScriptKey).K
 	if sk.T == nil {
 		// The zero key, which `m[nil] = 1` puts in a map. structVal
-		// answers a typed nil for it and so must this.
+		// answers a typed nil for it and so must this. Note that this
+		// returns WITHOUT touching the arena: a nil key consumes no slot,
+		// which is why an arena sized for the whole map can never be
+		// short.
 		return nil
 	}
 	// sk.F is the two words that were in the map, copied to this frame.
-	// decodeKeyArr takes it as a plain `any`, which is what lets one body
+	// fillKeyArr takes it as a plain `any`, which is what lets one body
 	// serve this path and StructKey.structVal both.
-	return decodeKeyArr(sk.T, sk.F)
+	return fillKeyArr(arena.structVal(sk.T), sk.F)
 }
 
 // intoStore wraps a script struct for a container slot of minted type mt.

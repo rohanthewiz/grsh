@@ -639,9 +639,88 @@ func BenchmarkKeyCrossing(b *testing.B) {
 		b.Run(fmt.Sprintf("decode/%d", nf), func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				svSink = decodeMintedKey(inMap)
+				svSink = decodeMintedKey(inMap, nil)
 			}
 		})
+	}
+}
+
+// BenchmarkMapKeyArena prices a WHOLE MAP's keys, which is the unit the
+// range path actually decodes in and the one BenchmarkKeyCrossing
+// structurally cannot show: it decodes a single key, so a change that
+// amortises across a map reads there as no change at all.
+//
+// The two rows are the same decode differing only in where the StructVals
+// come from -- one fused block each, against two slabs for the map -- so
+// the gap is the keyArena, and ns/key rather than ns/op is what makes the
+// rows comparable across key counts.
+//
+// KEY COUNTS 1 AND 2 STRADDLE THE THRESHOLD sortMapKeys applies, and they
+// are here to keep it honest: the arena LOSES at one key and is a wash at
+// two, so this benchmark is the thing to re-run before moving that bound.
+// 64 is well past any map a script is likely to range and shows where the
+// curve flattens -- the saving is bounded by the allocator, not the map.
+//
+// Field counts 1 and 10 bracket the same way BenchmarkKeyCrossing's do: a
+// decode is per-field work sitting on a per-KEY floor, and the arena only
+// touches the floor, so the saving has to shrink as a fraction when the
+// fields grow around it. Two arities are enough to see that it does.
+func BenchmarkMapKeyArena(b *testing.B) {
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+	for _, nf := range []int{1, 10} {
+		src := "type P struct {\n"
+		for i := 0; i < nf; i++ {
+			src += "\t" + names[i] + " int\n"
+		}
+		src += "}\n_ = map[P]int{}\n"
+		in, fset, f := prepScript(b, src)
+		if err := in.Run(fset, f); err != nil {
+			b.Fatalf("declaring P: %v", err)
+		}
+		v, ok := in.globals.Get("P")
+		if !ok {
+			b.Fatal("P was not defined")
+		}
+		st := v.(*StructType)
+
+		for _, nk := range []int{1, 2, 3, 4, 16, 64} {
+			mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+			for j := 0; j < nk; j++ {
+				vals := make([]Value, nf)
+				for i := range vals {
+					vals[i] = j*100 + i
+				}
+				k, err := structKeyOf(&StructVal{Type: st, Vals: vals})
+				if err != nil {
+					b.Fatalf("encoding a key: %v", err)
+				}
+				mp.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(j))
+			}
+			// From MapKeys, for the reason given on BenchmarkKeyCrossing:
+			// an addressable key would price a path the interpreter does
+			// not take.
+			keys := mp.MapKeys()
+
+			b.Run(fmt.Sprintf("arena/f%d/k%d", nf, nk), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					a := newKeyArena(st, len(keys))
+					for _, k := range keys {
+						svSink = decodeMintedKey(k, a)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
+			})
+			b.Run(fmt.Sprintf("perkey/f%d/k%d", nf, nk), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					for _, k := range keys {
+						svSink = decodeMintedKey(k, nil)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
+			})
+		}
 	}
 }
 
