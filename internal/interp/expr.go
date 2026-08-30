@@ -1580,12 +1580,13 @@ func orderDeclinableKeys(keys, vals []reflect.Value, c *keyCmp, cmpKeys func(a, 
 // growForRest sizes the render slab from its first entry, so a map of a
 // thousand keys grows its buffer once instead of ten times.
 //
-// The first key is a good estimator for the rest and a harmless one when
-// it is not: its one caller renders n instances of ONE struct type, so
-// the only spread is in how many digits a field takes, and a guess that
-// comes up short simply falls back on append's own doubling. The eighth
-// is headroom for that spread; over-guessing costs a slab that is dropped
-// when the sort returns.
+// The first entry is a good estimator for the rest and a harmless one
+// when it is not: every caller renders n instances of ONE type -- the
+// fallbacks below render a map's keys, appendStructKeyedMap renders its
+// values -- so the only spread is in how wide one instance comes out, and
+// a guess that comes up short simply falls back on append's own doubling.
+// The eighth is headroom for that spread; over-guessing costs a slab that
+// is dropped when the render is done with it.
 func growForRest(buf []byte, n int) []byte {
 	return slices.Grow(buf, (n-1)*len(buf)+len(buf)/8+16)
 }

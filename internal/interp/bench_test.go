@@ -1214,6 +1214,35 @@ var appendSink []byte
 // loses at three entries. A struct key is a different shape of cost --
 // fmt decodes and stringifies every key, and orders them with a reflect
 // walk four levels deep, n log n times -- and that is what this closes.
+//
+// WHAT THE ALLOCATION COLUMN SAYS is the point of the structkey rows now.
+// The render's cost is PER MAP, not per entry: one arena for the decoded
+// keys, one slab for the rendered values sized from the first of them,
+// and the encoded key read straight out of the scratch value rather than
+// boxed out of it. Seven allocations render three entries and seven
+// render two hundred and fifty-six.
+//
+// It was 269 at 256 entries before keyScratch. SetIterKey writes into a
+// scratch value, a scratch value is ADDRESSABLE, and lifting a three-word
+// ScriptKey out of an addressable value with Interface() copies it to the
+// heap first -- so the move that took reflect's per-entry allocation off
+// the KEY handed one straight back. keyScratch says how the alias
+// removes it; TestRenderingAStructKeyedMapAllocatesPerMapNotPerEntry is
+// what keeps it off.
+//
+// ns per entry, Apple M3, minimum of twenty-four runs at 500x. "boxed"
+// is the scratch read through Interface(), "per map" is what runs now:
+//
+//	entries          3     16     64    256
+//	 boxed        147.2  134.6  140.3  174.5   allocs 9, 24, 74, 269
+//	 per map      114.2   97.7  111.1  148.9   allocs 7,  7,  7,   7
+//
+// 15-27% of the render, and the gap is widest in the middle because the
+// small map's fixed costs dilute it and the large one spends more of its
+// time in the sort. The 1024-entry map allocates thirteen rather than
+// seven, and that is the arena cutting three more chunks -- keyChunkVals
+// bounding what one retained key can hold alive, which is a different
+// promise and not this one.
 func BenchmarkStructKeyedMap(b *testing.B) {
 	in, fset, f := prepScript(b, "type P struct {\n\tA int\n\tB string\n}\n_ = map[P]int{}\n")
 	if err := in.Run(fset, f); err != nil {

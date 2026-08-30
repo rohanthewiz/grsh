@@ -423,11 +423,13 @@ func zeroInSlot(t reflect.Type) Value {
 // hands back an interface pointing at the words already sitting there and
 // the copy never happens.
 //
-// Every key on this path comes from MapKeys, which is exactly the
-// non-addressable case, so the lift is free here — and
+// Every key on this path comes from MapKeys or iter.Key(), which is
+// exactly the non-addressable case, so the lift is free here — and
 // TestDecodingAMapKeyDoesNotCopyIt pins that at one allocation, the
-// *StructVal itself. A future caller handing this an addressable key
-// would still get the right answer, just a second allocation for it.
+// *StructVal itself. A caller holding an ADDRESSABLE key would still get
+// the right answer and pay a second allocation for it — which is why
+// appendStructKeyedMap, whose scratch key IS addressable, reaches
+// fillKeyArr itself through keyScratch rather than coming here.
 //
 // What the lift removes is a Field walk and one of the two Interface()
 // calls, all of it floor, so the saving is the same at every arity —
@@ -505,6 +507,36 @@ func intoStore(sv *StructVal, mt reflect.Type) reflect.Value {
 // of its own: a zero ScriptKey is already the zero minted value.
 func intoKeyStore(k StructKey, kt reflect.Type) reflect.Value {
 	return reflect.NewAt(kt, unsafe.Pointer(&ScriptKey{K: k})).Elem()
+}
+
+// keyScratch is intoKeyStore read backwards: it hands back a settable
+// reflect.Value of minted key type kt that ALIASES the ScriptKey sk
+// points at, so that a key written through the Value can be read back as
+// an ordinary Go struct.
+//
+// It exists for the one caller that reads a whole map's keys through a
+// SCRATCH value -- appendStructKeyedMap, which calls SetIterKey rather
+// than iter.Key() to keep reflect from minting a Value per entry. That
+// scratch is addressable, and lifting a three-word ScriptKey out of an
+// addressable value with Interface() copies it to the heap first, which
+// put an allocation back on the very path the scratch was for: 269
+// allocations to render a 256-entry map, 256 of them this. Reading sk.K
+// directly costs none, and no reflect either.
+//
+// THE ALIAS IS SOUND FOR EXACTLY intoKeyStore's REASON. A minted key
+// type is one embedded ScriptKey at offset zero and nothing else, so the
+// two are the same three words under different names -- same size,
+// alignment and pointer map. mintKeyType CHECKS that at declaration and
+// panics if a future mint stops being layout-identical, so both
+// directions of the alias rest on one guard rather than on two
+// assumptions.
+//
+// The write barrier the collector needs is emitted the usual way:
+// SetIterKey does a typed copy into memory reflect knows the type of, and
+// what changes here is only which type NAME that memory is read back
+// under.
+func keyScratch(kt reflect.Type, sk *ScriptKey) reflect.Value {
+	return reflect.NewAt(kt, unsafe.Pointer(sk)).Elem()
 }
 
 // eface mirrors the two-word layout of an interface holding a value too

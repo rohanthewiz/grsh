@@ -719,13 +719,13 @@ const keyChunkVals = 1024
 // measured in, so that one divisor can bound both slabs at once.
 //
 // unsafe.Sizeof is a COMPILE-TIME CONSTANT, not a pointer
-// reinterpretation -- it reads a type's width and nothing else. The five
+// reinterpretation -- it reads a type's width and nothing else. The six
 // unsafe expressions this package accounts for are the ones that alias
-// memory (the NewAt in intoKeyStore, and the unsafe.Slice plus eface pair
-// on each of the encode and decode paths); this is not a sixth, and
-// writing 2 here instead would be the same arithmetic with the reason
-// left out and a silent error waiting for whoever adds a field to
-// StructVal.
+// memory (the NewAt in intoKeyStore and its mirror in keyScratch, and the
+// unsafe.Slice plus eface pair on each of the encode and decode paths);
+// this is not a seventh, and writing 2 here instead would be the same
+// arithmetic with the reason left out and a silent error waiting for
+// whoever adds a field to StructVal.
 const svSlots = int(unsafe.Sizeof(StructVal{}) / unsafe.Sizeof(Value(nil)))
 
 // keyChunkFor is how many keys the next chunk serves: as many as fit in
@@ -1117,6 +1117,13 @@ func appendStructKeyedMap(b []byte, rv reflect.Value) ([]byte, bool) {
 	// allocation. SetIterKey and SetIterValue write into storage the
 	// caller owns; MapKeys and MapIndex would mint a fresh Value, and
 	// that pair is most of what fmt pays per entry.
+	//
+	// The KEY scratch is aliased to a plain ScriptKey rather than made
+	// with reflect.New, because a scratch is addressable and the lift
+	// decodeMintedKey does out of an addressable value has to copy the
+	// key to the heap -- which handed back, once per entry, the very
+	// allocation the scratch was there to remove. keyScratch says why the
+	// alias is sound; reading sk.K after SetIterKey costs nothing at all.
 	var arena *keyArena
 	if n > 2 {
 		// Two keys ask for no arena: two slabs cost more than the two
@@ -1126,7 +1133,8 @@ func appendStructKeyedMap(b []byte, rv reflect.Value) ([]byte, bool) {
 	}
 	ents := make([]mapEntry, n)
 	var vals []byte
-	kscratch := reflect.New(rv.Type().Key()).Elem()
+	var sk ScriptKey
+	kscratch := keyScratch(rv.Type().Key(), &sk)
 	vscratch := reflect.New(rv.Type().Elem()).Elem()
 	vr := mapValRender(rv.Type().Elem())
 	iter := rv.MapRange()
@@ -1136,7 +1144,37 @@ func appendStructKeyedMap(b []byte, rv reflect.Value) ([]byte, bool) {
 		vscratch.SetIterValue(iter)
 		from := len(vals)
 		vals = appendMapValue(vals, vscratch, vr)
-		ents[i] = mapEntry{key: decodeMintedKey(kscratch, arena), from: from, to: len(vals)}
+		if i == 0 {
+			// Size the value slab from its first entry rather than
+			// letting append double its way there -- the same estimate
+			// sortMapKeys' fallback makes over its key slab, and sound
+			// for the same reason: one map has one VALUE type, so the
+			// only spread between entries is how wide one renders.
+			vals = growForRest(vals, n)
+		}
+		// sk is the memory kscratch names, so SetIterKey has just
+		// written this entry's encoded key into it, and the decode is
+		// decodeMintedKey's body MINUS its first line -- the lift this
+		// loop exists to avoid.
+		//
+		// THE THREE LINES ARE REPEATED RATHER THAN FACTORED OUT, and
+		// that was measured before it was accepted. Splitting the
+		// shared tail into a decodeKey(StructKey, *keyArena) put a
+		// second call frame on decodeMintedKey, which is the RANGE
+		// path and the hotter of the two: BenchmarkMapKeyArena came in
+		// 2-8% slower across every row, both binaries built from one
+		// tree and run alternately. A nil check is not what could
+		// drift between the two anyway -- the decoding is, and that is
+		// fillKeyArr, which both call and which decodeKeyArr's comment
+		// names as the single decoder for exactly this reason.
+		//
+		// A nil key consumes no arena slot, which is what lets an arena
+		// sized for the whole map still serve a map full of them.
+		var key *StructVal
+		if sk.K.T != nil {
+			key = fillKeyArr(arena.structVal(sk.K.T), sk.K.F)
+		}
+		ents[i] = mapEntry{key: key, from: from, to: len(vals)}
 	}
 	// Len is read before the walk, so a map mutated underneath this would
 	// otherwise leave zeroed entries to render as "<nil>:". fmtsort takes

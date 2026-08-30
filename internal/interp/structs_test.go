@@ -2659,6 +2659,59 @@ func checkMapAllocs(t *testing.T, st *StructType, vt reflect.Type, n int, val fu
 	}
 }
 
+// The SHAPE of the render's allocation, which is the claim the previous
+// test cannot make: rendering a map costs a fixed number of allocations,
+// not a number that grows with the entries.
+//
+// It is what keyScratch bought. Reading each key out of the scratch value
+// with Interface() copied a three-word ScriptKey to the heap because a
+// scratch is ADDRESSABLE, so the count was 269 for 256 entries -- one an
+// entry plus the fixed part -- while the test above still passed
+// comfortably, fmt's own count being six an entry. A per-entry
+// allocation is invisible to a comparison against something worse; only
+// the slope catches it.
+//
+// The tolerance is a slope and not a pinned count, for the reason
+// checkMapAllocs gives: a count reports the compiler's inlining
+// decisions, while "the same work sixteen times over costs no more" is
+// the actual promise. Both sizes are 7 today and the slope is flat to 256
+// exactly, so the slack is two: P is two fields wide and keyChunkVals is
+// 1024 slots, which puts the arena's first refill at 256 keys -- past
+// this test, and the reason big is 256 rather than 1024, where three
+// refills legitimately cost six.
+//
+// TWO IS ALSO TIGHT ENOUGH TO PIN THE VALUE SLAB. Letting append double
+// its way to a 256-entry render instead of sizing it from the first entry
+// costs five more allocations at the top than at the bottom, which is not
+// a per-entry cost but is the other half of what "one slab" means here.
+func TestRenderingAStructKeyedMapAllocatesPerMapNotPerEntry(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B string
+}`, "P")
+	const small, big = 16, 256
+	count := func(n int) float64 {
+		keys := make([][]Value, n)
+		vals := make([]Value, n)
+		for i := range keys {
+			keys[i] = []Value{i * 7 % n, "v"}
+			vals[i] = i
+		}
+		m := mapOfStructKeys(t, st, reflect.TypeFor[int](), keys, vals).Interface()
+		buf := make([]byte, 0, 1<<16)
+		return testing.AllocsPerRun(50, func() { buf = appendValue(buf[:0], m) })
+	}
+	lo, hi := count(small), count(big)
+	if hi > lo+2 {
+		t.Errorf("rendering %d entries allocated %.0f times against %d entries' %.0f: "+
+			"%.0f more for %d more entries means the cost is no longer PER MAP -- the keys "+
+			"are meant to decode into one arena, the values to render into one slab sized "+
+			"from the first entry, and the encoded key to be read through keyScratch rather "+
+			"than boxed out of the addressable scratch value",
+			big, hi, small, lo, hi-lo, big-small)
+	}
+}
+
 // The same claim from the outside, through the interpreter.
 //
 // IT PRINTS A STRUCT, NOT A MAP, and that is the reachability the whole
