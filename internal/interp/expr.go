@@ -1055,42 +1055,70 @@ func mayNotEqualItself(t reflect.Type) bool {
 // all, so it ranged differently on every run while fmt printed it in
 // numeric order. Both are closed here.
 //
-// DROPPING THE RENDER IS WHY IT ALSO GOT FASTER, and the trade is a
-// SHAPE trade rather than a free win. The text order had to render every
-// key before the first comparison -- n renders of text nothing would ever
+// DROPPING THE RENDER IS WHY IT ALSO GOT FASTER, and it was a SHAPE
+// trade rather than a free win. The text order had to render every key
+// before the first comparison -- n renders of text nothing would ever
 // read -- where keyCmp reads the decoded fields the range variable is
 // made of anyway. But a render is paid n times and a comparison n log n
-// times, so what was removed grows more slowly than what replaced it.
-// BenchmarkSortMapKeys, ns per key, Apple M3, minimum of six runs:
+// times, so what came out grows more slowly than what replaced it, and
+// at ONE INT FIELD the two rows crossed: past ~256 keys the field-wise
+// order was slower than the text it replaced, 18% of it at a thousand,
+// because one int compare is about as cheap as bytes.Compare on the text
+// and there was no longer a render to save.
 //
-//	keys              4      16      64     256    1024
-//	 struct, 1 field
-//	  text        104.8    84.2    70.0    71.9    80.2
-//	  fields       45.8    48.3    54.9    74.6    95.0
-//	  allocs      8->6    9->6    9->6   10->6   15->12
-//	 struct, 10 fields
-//	  text        181.7   166.0   180.3   194.3   208.5
-//	  fields       50.6    49.5    66.7    85.6   122.2
-//	  allocs     12->6   12->6   12->6  18->12  36->30
+// PROJECTING THE FIRST FIELD IS WHAT CLOSED THAT CROSSING. projectedOrder
+// keeps the n-time pass the render had and spends it on a token that is
+// cheaper to COMPARE than the text as well as cheaper to build, so both
+// halves of the trade improve at once and there is nothing left to cross.
 //
-// The allocations that go are the render's -- the slab and the doubling
-// steps it took, the bounds, and the slice of views cut into it. What is
-// left is the arena's, and it still steps rather than tracking n.
+// BenchmarkSortMapKeys, ns per key, Apple M3, minimum of eight runs.
+// "text" is the order this function used before keyCmp, measured again
+// rather than quoted from the session that removed it; "fields" is keyCmp
+// with projectMinKeys raised out of reach; "projected" is what runs now.
 //
-// A ONE-FIELD KEY PAST ~256 IS THE ONE PLACE THIS LOSES: 18% at a
-// thousand. One int field makes a comparison almost as cheap as
-// bytes.Compare on the rendered text, so removing n renders no longer
-// pays for the n log n comparisons that remain. Ten fields move the
-// crossover past every count measured, because the comparison still
-// stops at the first field while the render has ten of them to write --
-// the wider the key, the further out it goes. A shell ranging a
-// thousand-key map is not the case worth tuning for, and the four-key map
-// it does range is 2.3x faster, so the trade is taken as it stands.
+//	keys              4      8     16     64    256   1024
+//	 1 int field
+//	  text         62.0   60.6   59.0   63.7   71.2   87.8
+//	  fields       45.0   38.8   39.3   61.7   82.6  113.5
+//	  projected    39.4   38.5   38.4   36.9   40.8   51.4
+//	 10 int fields
+//	  text        212.9  195.5  195.0  200.1  213.2  227.4
+//	  fields       72.8   65.6   69.8   76.3  102.2  138.0
+//	  projected    62.5   53.7   52.0   55.5   57.5   74.0
+//	 1 string field
+//	  text         61.4   57.6   55.1   55.6   64.9   82.9
+//	  fields       40.8   46.3   54.4   70.9   92.4  133.7
+//	  projected    39.6   46.0   46.7   60.4   76.9  107.5
+//	 10 int fields, the first CONSTANT
+//	  text        210.9  192.3  192.1  194.5  205.9  236.5
+//	  fields       64.0   63.5   77.0   97.5  132.3  188.7
+//	  projected    69.1   60.3   81.2   97.7  128.9  171.6
+//
+// Read nothing smaller than 5% out of it: the nativestruct row, which
+// none of these three code paths can touch, moved that much between the
+// runs.
+//
+// The one int field at a thousand keys -- the row the crossing was
+// measured on -- is now 55% off the field-wise order and 41% off the text
+// order it lost to. The bottom block is the shape a projection can only
+// lose on, and it tracks the fields row because projectedBy refuses a
+// first field that separates nothing.
+//
+// A STRING FIRST FIELD IS THE ONE PLACE THE TEXT ORDER IS STILL AHEAD, by
+// 23% at a thousand keys, and it is not an option: the text order is not
+// fmt's, so it is reachable only as a decline's fallback. The projection
+// still takes 20% off what a string-keyed field cost before it. What the
+// render has there is locality -- its []byte views all point into ONE
+// slab, in order -- where a []string holds a header per key and the sort
+// chases a separate body for each comparison.
+//
+// The allocations the render's removal saved were the slab and its
+// doubling steps, the bounds, and the slice of views. A projection adds
+// ONE back, per map: the token array.
 //
 // Read the table knowing the benchmark's keys differ in their FIRST
-// field, which is the comparator's best case and the render's worst. Keys
-// that tie for a few fields before they differ would move the crossover
-// in.
+// field, which is the projection's best case and the render's worst --
+// except in the bottom block, which is the other end of that range.
 //
 // A DECLINED MAP FALLS BACK TO THE TEXT ORDER. keyCmp refuses to invent
 // an answer wherever fmtsort's own comes from a machine address -- two
@@ -1181,7 +1209,16 @@ func sortMapKeys(keys, vals []reflect.Value) []*StructVal {
 	// threading an error through it. A declined sort leaves a meaningless
 	// order behind, which the fallback below overwrites entirely.
 	var c keyCmp
-	sort.Sort(&fieldOrder{keyOrder: pair, cmp: &c})
+	// A projected order when the keys allow one and there are enough of
+	// them to pay for it, and the general field-wise order otherwise. The
+	// two produce the SAME sequence -- projectedOrderOf says why -- so
+	// this is a speed choice and nothing else, including for the decline
+	// flag the fallback below reads.
+	if s := projectedOrderOf(pair, &c); s != nil {
+		sort.Sort(s)
+	} else {
+		sort.Sort(&fieldOrder{keyOrder: pair, cmp: &c})
+	}
 	if !c.declined {
 		return decoded
 	}
@@ -1601,6 +1638,195 @@ type fieldOrder struct {
 }
 
 func (s *fieldOrder) Less(i, j int) bool { return s.cmp.keys(s.decoded[i], s.decoded[j]) < 0 }
+
+// projectedOrder is fieldOrder with the FIRST FIELD LIFTED OUT OF ITS
+// INTERFACE, into a dense array of the field's own type that the sort
+// reads instead of unpacking that field on every comparison.
+//
+// It is the render's trade made again with a better token. sortMapKeys'
+// doc explains why ordering by rendered text lost: a render is paid n
+// times and a comparison n log n times, so the render's linear cost only
+// pays when a comparison is dear -- and against one int field it is not,
+// which is where the one place it lost came from. A projection
+// pays the same n up front and hands the sort a token that is CHEAPER to
+// compare than the text, not merely cheaper to build: two loads from one
+// contiguous array against a *StructVal deref, a slice header load, an
+// interface unpack and a type switch. Both sides of the trade improve, so
+// the crossover disappears instead of moving.
+//
+// THE ORDER IS UNCHANGED, which is what makes this a speed choice rather
+// than a behaviour one. projectedOrderOf builds p only when every key
+// shares one *StructType and one dynamic type in field 0, and under those
+// two conditions keyCmp.keys is forced through its field loop to
+// keyCmp.field, which takes the same case for both sides and compares the
+// same two values p holds. So p[i] != p[j] is exactly "field 0 settles
+// it", with the same sign; a tie in p is exactly "field 0 ties", and
+// falls through to the general comparator, which redoes that field --
+// cheap, and only on the pairs that need what comes after it.
+//
+// THE DECLINE STILL REACHES c. Only a pair that field 0 settles skips
+// keys, and such a pair cannot decline: under projectedOrderOf's two
+// conditions field 0 is a kind keyCmp answers outright. Every pair that
+// could declare a decline -- a later field of two dynamic types, a nested
+// pointer -- ties in p and goes the long way.
+//
+// The receiver is a POINTER for the reason keyOrder's are, and Len comes
+// from the embedded keyOrder.
+type projectedOrder[T int | int64 | rune | byte | string] struct {
+	*keyOrder
+	cmp *keyCmp
+	p   []T
+}
+
+func (s *projectedOrder[T]) Less(i, j int) bool {
+	if a, b := s.p[i], s.p[j]; a != b {
+		return a < b
+	}
+	return s.cmp.keys(s.decoded[i], s.decoded[j]) < 0
+}
+
+// Swap moves p with everything else keyOrder keeps in step. A projection
+// left behind would pair every key with another key's sort token, which
+// -- unlike a dropped decoded or vals -- would still produce output the
+// sort itself calls sorted.
+func (s *projectedOrder[T]) Swap(i, j int) {
+	s.keyOrder.Swap(i, j)
+	s.p[i], s.p[j] = s.p[j], s.p[i]
+}
+
+// projectMinKeys is the key count from which a projection is built, and
+// it is a MEASUREMENT rather than a principle: below it the scan and the
+// array it fills cost more than the comparisons they save.
+//
+// It cannot be read off BenchmarkSortMapKeys, because at four keys both
+// of that benchmark's arms take the same path -- this constant is what
+// decides which -- so the numbers below come from a throwaway harness
+// that forced the projection at every count. ns per key, Apple M3,
+// minimum of six runs, with and without it:
+//
+//	keys           2     4     8    16    64   256  1024
+//	 1 int field
+//	  general   46.0  33.1  35.8  42.8  54.5  73.3 102.2
+//	  projected 52.7  36.2  32.7  31.7  32.9  35.5  42.4
+//	 1 string field
+//	  general   47.8  41.4  38.8  46.6  66.1  91.4 133.4
+//	  projected 58.2  45.7  39.3  42.7  55.7  71.2  97.4
+//
+// EIGHT IS THE FIRST COUNT THAT IS NOT A LOSS, and it is the same eight
+// for both field types. Four costs 9-10% and two costs 15-22%, which are
+// the only gaps here bigger than the noise. What that buys is the two-
+// to four-key map a shell actually ranges, left on the path it was
+// already fastest on -- the same reason newKeyArena is not built below
+// three keys.
+const projectMinKeys = 8
+
+// projectedOrderOf is the projected sort for these keys, or nil when they
+// do not project and the general field-wise order has to run.
+//
+// THE TWO CONDITIONS ARE WHAT MAKE THE PROJECTION FAITHFUL, and both are
+// checked over every key rather than assumed from the first:
+//
+//	one *StructType   keyCmp.keys declines outright on two of them, so a
+//	                  projected sort that skipped keys could return an
+//	                  order with the decline never recorded. Requiring one
+//	                  type means the pairs that would have declared it are
+//	                  exactly the pairs that still call keys.
+//	one dynamic type  keyCmp.field compares the concrete types first and
+//	  in field 0      declines when they differ. Ints and strings both
+//	                  project, but an int against a string must not: fmt
+//	                  orders that pair by which type was linked lower.
+//
+// A NIL KEY REFUSES THE PROJECTION rather than being given a token. It
+// sorts before every other key, which no value of the field's type can be
+// made to mean, and it has no field 0 to read in any case.
+//
+// THE KINDS THAT PROJECT are the integers and strings, which is narrower
+// than keyCmp.field's own switch and deliberately so. A float would need
+// cmp.Compare's NaN rule, and NaN breaks the != that the fast path is --
+// two NaN tokens are unequal and neither is less, so Less would answer
+// both ways for one pair and the sort would be free to produce anything.
+// A bool discriminates two ways, so nearly every pair would tie and pay
+// for the projection twice over. Both fall to the general comparator,
+// which already answers for them.
+//
+// It reads the FIRST field only. fmtsort compares fields in order and
+// stops at the first that differs, so field 0 settles most pairs of most
+// maps; projecting further fields would cost another array and another
+// scan to shorten a tail that is already rare.
+func projectedOrderOf(pair *keyOrder, c *keyCmp) sort.Interface {
+	if len(pair.keys) < projectMinKeys {
+		return nil
+	}
+	sv := pair.decoded[0]
+	// A zero-field struct cannot reach here with two distinct keys -- it
+	// has one value -- but the read below indexes Vals, so it is checked
+	// rather than argued. Every other key shares this one's type and so
+	// its arity, which is the same premise keyCmp.keys ranges on.
+	if sv == nil || len(sv.Vals) == 0 {
+		return nil
+	}
+	switch sv.Vals[0].(type) {
+	case int:
+		return projectedBy[int](pair, c)
+	case int64:
+		return projectedBy[int64](pair, c)
+	case rune: // int32
+		return projectedBy[rune](pair, c)
+	case byte: // uint8
+		return projectedBy[byte](pair, c)
+	case string:
+		return projectedBy[string](pair, c)
+	}
+	return nil
+}
+
+// projectedBy builds the projection for one field type and wraps it, or
+// returns nil the moment a key disagrees about its *StructType or about
+// the type in field 0.
+//
+// The token is the FIELD'S OWN TYPE, not a widened one. Widening the
+// integers into a single []int64 would collapse four instantiations into
+// one, at the cost of a conversion per key and of an implied claim -- that
+// every integer field orders the same way once widened -- which holds for
+// these four and would quietly stop holding the day a uint64 field was
+// added to the switch above.
+//
+// A PROJECTION THAT SEPARATES NOTHING IS REFUSED, which is the degenerate
+// case rather than a tuned exception: when every key carries the same
+// field 0 -- map[P]V keyed by P{Kind, Name} with one Kind in it -- no
+// comparison is ever settled by p, every one of them pays for the array
+// and then does the general comparison anyway, and the sort comes out
+// slower than if nothing had been projected. The benchmark's tie10 row
+// prices it with this check disabled: 27% at eight keys and 13% at
+// sixty-four, against the general order. Seeing it costs one comparison
+// per key inside a loop that is already touching every key, and it is the
+// only shape where a projection can lose at all.
+//
+// FEWER TIES THAN THAT ARE LEFT ALONE. Two distinct values over a
+// thousand keys still ties about half its comparisons, and half of a
+// large win is still a win; there is no cheap way to count distinct
+// values, and the all-equal case is the only one worth a check that comes
+// free.
+func projectedBy[T int | int64 | rune | byte | string](pair *keyOrder, c *keyCmp) sort.Interface {
+	t := pair.decoded[0].Type
+	p := make([]T, len(pair.decoded))
+	same := true
+	for i, sv := range pair.decoded {
+		if sv == nil || sv.Type != t {
+			return nil
+		}
+		v, ok := sv.Vals[0].(T)
+		if !ok {
+			return nil
+		}
+		p[i] = v
+		same = same && v == p[0]
+	}
+	if same {
+		return nil
+	}
+	return &projectedOrder[T]{keyOrder: pair, cmp: c, p: p}
+}
 
 // textOrder is the fallback both declining paths take: the keys ordered
 // as the text they render to, which is what a struct-keyed map was

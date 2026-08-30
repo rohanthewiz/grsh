@@ -2941,6 +2941,330 @@ func TestADeclinedMapRangesInRenderedTextOrder(t *testing.T) {
 	}
 }
 
+// THE TEST THE PROJECTION RESTS ON: a projected sort and the general
+// field-wise sort must produce the SAME permutation, and reach the same
+// verdict on declining.
+//
+// projectedOrder claims to be a speed choice and nothing else. That claim
+// is not observable from the outside -- both paths order the same maps
+// the same way when they agree, so a projection that got a pair wrong
+// would show up only as a range that disagreed with fmt somewhere in the
+// middle of a large map. Running BOTH sorters over one map and comparing
+// slot by slot is what turns it into an assertion.
+//
+// The equality is exact rather than approximate, and it is exact even for
+// a map that DECLINES: the two Less functions agree pointwise under
+// projectedOrderOf's preconditions, so one sort algorithm driven by them
+// makes the same decisions in the same order and lands on the same
+// permutation, meaningless order included.
+//
+// FIELD 0 DRAWS FROM A SMALL SET so ties are common: a tie is what sends
+// a comparison down to the general comparator, and a test whose keys all
+// differ in field 0 would never take that path. FIELD 1 IS MIXED-TYPE on
+// purpose -- that is the decline the projection has to leave findable.
+func TestAProjectedOrderIsTheGeneralOrder(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B string
+}`, "P")
+	// One bucket per trial. The last is mixed and must be REFUSED, which
+	// is the other half of what is being tested: a projection taken where
+	// fmt orders by the address of a type would be silently wrong.
+	firsts := [][]Value{
+		{0, 1, 2, -1, 1 << 40},
+		{int64(0), int64(-3), int64(1 << 41)},
+		{'a', 'b', 'c'},
+		{byte(0), byte(9), byte(200)},
+		{"", "a", "zz"},
+		{0, "a", 'b', byte(9), int64(3), true, 0.5, nil},
+	}
+	seconds := []Value{nil, 0, 1, "a", "b", true, 2.5}
+	const seed = 20260829
+	rng := rand.New(rand.NewSource(seed))
+	var taken, refused, declined, tied int
+	for _, n := range []int{8, 9, 40} {
+		for b, first := range firsts {
+			for trial := 0; trial < 40; trial++ {
+				keys := make([][]Value, n)
+				vals := make([]Value, n)
+				for i := range keys {
+					if rng.Intn(16) == 0 {
+						// The nil key, which sorts before every other and
+						// has no field 0 to project.
+						keys[i] = nil
+					} else {
+						keys[i] = []Value{first[rng.Intn(len(first))], seconds[rng.Intn(len(seconds))]}
+					}
+					vals[i] = rng.Intn(1000)
+				}
+				m := mapOfStructKeys(t, st, reflect.TypeFor[int](), keys, vals)
+				mk := m.MapKeys()
+				if len(mk) < projectMinKeys {
+					continue // deduplicated below the threshold
+				}
+
+				// Two independent copies: same map, same keys, one sorted
+				// each way. Each gets its own arena, so neither can be
+				// reading structs the other permuted.
+				pp := &keyOrder{keys: slices.Clone(mk), decoded: decodeForOrder(t, st, mk)}
+				gp := &keyOrder{keys: slices.Clone(mk), decoded: decodeForOrder(t, st, mk)}
+				var pc, gc keyCmp
+				s := projectedOrderOf(pp, &pc)
+				if s == nil {
+					refused++
+					continue
+				}
+				if b == len(firsts)-1 {
+					t.Fatalf("n=%d trial %d: the mixed-type bucket projected, "+
+						"which is the case fmt answers with a type's address", n, trial)
+				}
+				taken++
+				if firstFieldsRepeat(pp.decoded) {
+					tied++
+				}
+				sort.Sort(s)
+				sort.Sort(&fieldOrder{keyOrder: gp, cmp: &gc})
+				if pc.declined {
+					declined++
+				}
+				if pc.declined != gc.declined {
+					t.Fatalf("n=%d trial %d: the projected sort declined=%v, the general one declined=%v",
+						n, trial, pc.declined, gc.declined)
+				}
+				for i := range pp.decoded {
+					if pp.keys[i].Interface() != gp.keys[i].Interface() {
+						t.Fatalf("n=%d trial %d, slot %d: projected %s, general %s -- "+
+							"the projection is supposed to change speed and nothing else",
+							n, trial, i, pp.decoded[i], gp.decoded[i])
+					}
+				}
+			}
+		}
+	}
+	// Every arm counted, because each one is a way this test could be
+	// asserting nothing: no projection taken, no map that ties in field 0
+	// and therefore never reaches the general comparator underneath, no
+	// decline, or nothing refused.
+	if taken == 0 || refused == 0 || declined == 0 || tied == 0 {
+		t.Errorf("%d projected, %d refused, %d declined, %d with a repeated first field; "+
+			"every arm has to be reached or this test is asserting less than it looks",
+			taken, refused, declined, tied)
+	}
+}
+
+// decodeForOrder decodes a map's keys the way sortMapKeys does, so a test
+// can drive the two sorters directly instead of through the function that
+// chooses between them.
+func decodeForOrder(t *testing.T, st *StructType, keys []reflect.Value) []*StructVal {
+	t.Helper()
+	dec := make([]*StructVal, len(keys))
+	arena := newKeyArena(st, len(keys))
+	for i, k := range keys {
+		dec[i] = decodeMintedKey(k, arena)
+	}
+	return dec
+}
+
+// firstFieldsRepeat reports whether two keys share a field 0, which is
+// what makes a projected comparison fall through to the general one.
+func firstFieldsRepeat(decoded []*StructVal) bool {
+	seen := make(map[Value]bool, len(decoded))
+	for _, sv := range decoded {
+		if sv == nil || len(sv.Vals) == 0 {
+			continue
+		}
+		if seen[sv.Vals[0]] {
+			return true
+		}
+		seen[sv.Vals[0]] = true
+	}
+	return false
+}
+
+// A TIE IN THE PROJECTED FIELD MUST FALL THROUGH to the fields behind it.
+//
+// The projection answers only when field 0 differs; every other pair has
+// to reach keyCmp, which is what orders those. A Less that returned its
+// projection's verdict unconditionally would leave this map in an order
+// the sort itself calls sorted and that nothing else agrees with.
+//
+// A takes TWO values rather than one, which is what makes this a test of
+// the projection at all: projectedBy refuses a field that separates
+// nothing, so a constant A would send the whole map down the general path
+// and this would test it twice. Two values keep the projection and still
+// tie four keys in five.
+func TestAProjectedTieOrdersOnTheFieldsBehindIt(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B string
+}`, "P")
+	// Past projectMinKeys, or the projection is never built.
+	names := []string{"m", "d", "k", "a", "z", "q", "b", "f", "t", "c"}
+	m := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	firstOf := func(i int) int {
+		if i%5 == 0 {
+			return 9
+		}
+		return 7
+	}
+	for i, s := range names {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{firstOf(i), s}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		m.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+	}
+	// A ascending first, and B within each run of it.
+	var sevens, nines []string
+	for i, s := range names {
+		if firstOf(i) == 7 {
+			sevens = append(sevens, fmt.Sprintf("P{A: 7, B: %s}", s))
+		} else {
+			nines = append(nines, fmt.Sprintf("P{A: 9, B: %s}", s))
+		}
+	}
+	sort.Strings(sevens)
+	sort.Strings(nines)
+	want := append(sevens, nines...)
+
+	mk := m.MapKeys()
+	// Said out loud, because everything below is about a path this test
+	// would otherwise only be assumed to take.
+	if projectedOrderOf(&keyOrder{keys: mk, decoded: decodeForOrder(t, st, mk)}, &keyCmp{}) == nil {
+		t.Fatal("these keys do not project, so the tie this test is about is never reached")
+	}
+	decoded := sortMapKeys(mk, nil)
+	got := make([]string, len(decoded))
+	for i, sv := range decoded {
+		got[i] = sv.String()
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("keys sharing a first field ordered as\n  %s\nwant\n  %s",
+			strings.Join(got, " "), strings.Join(want, " "))
+	}
+}
+
+// A FIRST FIELD THAT SEPARATES NOTHING REFUSES THE PROJECTION, and the
+// map still orders. The refusal is a speed choice -- every comparison
+// would tie and pay for the array twice over -- so what has to be pinned
+// is that it costs no order: these keys are settled entirely by B.
+func TestAConstantFirstFieldRefusesTheProjection(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+	B string
+}`, "P")
+	names := []string{"m", "d", "k", "a", "z", "q", "b", "f", "t", "c"}
+	m := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	for i, s := range names {
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{7, s}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		m.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+	}
+	mk := m.MapKeys()
+	if s := projectedOrderOf(&keyOrder{keys: mk, decoded: decodeForOrder(t, st, mk)}, &keyCmp{}); s != nil {
+		t.Error("a constant first field projected, which can only cost time: " +
+			"no comparison is settled by it and every one of them pays for the array")
+	}
+	want := make([]string, len(names))
+	for i, s := range slices.Sorted(slices.Values(names)) {
+		want[i] = fmt.Sprintf("P{A: 7, B: %s}", s)
+	}
+	decoded := sortMapKeys(mk, nil)
+	got := make([]string, len(decoded))
+	for i, sv := range decoded {
+		got[i] = sv.String()
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ordered as\n  %s\nwant\n  %s", strings.Join(got, " "), strings.Join(want, " "))
+	}
+}
+
+// A FIELD 0 OF TWO DYNAMIC TYPES MUST REFUSE THE PROJECTION and still
+// decline, which is the failure mode a projection introduces: it skips
+// the comparator on every pair field 0 settles, so a projection built
+// over a field fmt orders by a TYPE'S ADDRESS would hand back a confident
+// order for a map that has none.
+//
+// The assertion is the text-order fallback, which is only reachable
+// through a decline -- and the two orders disagree on these keys, so it
+// fails if the decline is missed rather than passing on a coincidence.
+func TestAMixedFirstFieldRefusesTheProjectionAndDeclines(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+}`, "P")
+	const nk = 40
+	m := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+	want := make([]string, 0, nk)
+	for i := 0; i < nk; i++ {
+		// Half ints and half strings in one field. fmt orders that pair
+		// by which of int and string was linked at the lower address.
+		var f Value = i
+		if i%2 == 1 {
+			f = strconv.Itoa(i)
+		}
+		k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{f}})
+		if err != nil {
+			t.Fatalf("encoding: %v", err)
+		}
+		m.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+		want = append(want, fmt.Sprintf("P{A: %v}", f))
+	}
+	// The rendered text of an int field and of a string field are the
+	// same bytes here, which is why the fallback can order them at all.
+	sort.Strings(want)
+
+	// Ten runs from ten permutations, because determinism is the whole
+	// property a declined map still has.
+	for run := 0; run < 10; run++ {
+		decoded := sortMapKeys(m.MapKeys(), nil)
+		got := make([]string, len(decoded))
+		for i, sv := range decoded {
+			got[i] = sv.String()
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("run %d ordered as\n  %s\nwant\n  %s -- a mixed first field was not declined",
+				run, strings.Join(got, " "), strings.Join(want, " "))
+		}
+	}
+}
+
+// CROSSING projectMinKeys MUST NOT CHANGE THE ANSWER. The threshold is a
+// measurement, so it is free to move; what it may never do is move an
+// order with it, and a map of seven keys and a map of eight take
+// different paths through sortMapKeys for no reason a script can see.
+func TestTheProjectionThresholdChangesNoOrder(t *testing.T) {
+	st := declare(t, `type P struct {
+	A int
+}`, "P")
+	for _, nk := range []int{projectMinKeys - 2, projectMinKeys - 1, projectMinKeys, projectMinKeys + 1} {
+		m := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
+		want := make([]string, nk)
+		for i := 0; i < nk; i++ {
+			// Starting at 8 straddles a digit boundary, so the field-wise
+			// order and the rendered-text order DISAGREE -- text puts 10
+			// before 8 -- and an order that came from the wrong path is
+			// visible here rather than hidden behind a coincidence.
+			k, err := structKeyOf(&StructVal{Type: st, Vals: []Value{i + 8}})
+			if err != nil {
+				t.Fatalf("encoding: %v", err)
+			}
+			m.SetMapIndex(intoKeyStore(k, st.keyT), reflect.ValueOf(i))
+			want[i] = fmt.Sprintf("P{A: %d}", i+8)
+		}
+		decoded := sortMapKeys(m.MapKeys(), nil)
+		got := make([]string, len(decoded))
+		for i, sv := range decoded {
+			got[i] = sv.String()
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("%d keys ordered as\n  %s\nwant\n  %s", nk,
+				strings.Join(got, " "), strings.Join(want, " "))
+		}
+	}
+}
+
 // EVERY SCALAR KEY KIND, against fmt, over randomised maps.
 //
 // A range used to leave all of these in the map's own randomised order --

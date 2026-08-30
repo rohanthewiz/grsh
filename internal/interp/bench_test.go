@@ -802,8 +802,16 @@ var (
 // It is also what prices the trade sortMapKeys made when it stopped
 // ordering by rendered text: the render was linear and the comparisons
 // that replaced it are n log n, so the struct rows are the measurement
-// that says where the two cross. The table in sortMapKeys' doc is this
-// benchmark, both ways.
+// that said where the two crossed -- and now that projectedOrder has
+// closed the crossing, the measurement that says it is closed.
+//
+// The table in sortMapKeys' doc is this benchmark THREE ways. Two of them
+// are reachable from here: raising projectMinKeys out of reach gives the
+// unprojected row, and the row as it stands gives the projected one. The
+// text row is not, because that order is no longer in the tree except as
+// a decline's fallback; it was re-measured in a throwaway harness that
+// pairs this benchmark's decode with the render and sort textOrder still
+// carries.
 //
 // EACH ITERATION RE-SCRAMBLES, by copying a fixed unsorted permutation
 // over the working slice. sortMapKeys sorts in place, so without the copy
@@ -818,10 +826,40 @@ var (
 func BenchmarkSortMapKeys(b *testing.B) {
 	names := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
 	counts := []int{4, 16, 64, 256, 1024}
+	// The struct rows carry an extra column at 8, which is where
+	// projectMinKeys sits: the threshold is a measurement, and this is
+	// the measurement it has to be read off.
+	structCounts := []int{4, 8, 16, 64, 256, 1024}
 
-	for _, nf := range []int{1, 10} {
-		src := "type P struct {\n"
-		for i := 0; i < nf; i++ {
+	// THE SHAPES THAT MOVE THE ANSWER are the width of the key and what
+	// its FIRST field holds, because projectedOrder lifts that one field
+	// out of its interface and the sort reads nothing else until two keys
+	// tie in it.
+	//
+	//	f1 f10    one and ten int fields, every key differing in the
+	//	          first -- the projection's best case and the render's
+	//	          worst, which is what the sortMapKeys table is read
+	//	          against
+	//	s1        a string first field: the other type that projects, and
+	//	          the one a shell writes when it keys a map by a name
+	//	tie10     ten fields with the first CONSTANT, so every comparison
+	//	          ties in the projection and pays for it before doing the
+	//	          general comparison anyway. It is the case a projection
+	//	          can only lose on, and it is here to price that loss
+	//	          rather than to leave it asserted.
+	for _, sh := range []struct {
+		name  string
+		nf    int
+		ftype string
+		field func(j int) Value // field 0 of the j'th key
+	}{
+		{"f1", 1, "int", func(j int) Value { return j * 100 }},
+		{"f10", 10, "int", func(j int) Value { return j * 100 }},
+		{"s1", 1, "string", func(j int) Value { return fmt.Sprintf("key-%06d", j) }},
+		{"tie10", 10, "int", func(j int) Value { return 0 }},
+	} {
+		src := "type P struct {\n\t" + names[0] + " " + sh.ftype + "\n"
+		for i := 1; i < sh.nf; i++ {
 			src += "\t" + names[i] + " int\n"
 		}
 		src += "}\n_ = map[P]int{}\n"
@@ -835,13 +873,16 @@ func BenchmarkSortMapKeys(b *testing.B) {
 		}
 		st := v.(*StructType)
 
-		for _, nk := range counts {
+		for _, nk := range structCounts {
 			mp := reflect.MakeMap(reflect.MapOf(st.keyT, reflect.TypeFor[int]()))
 			for j := 0; j < nk; j++ {
-				vals := make([]Value, nf)
+				vals := make([]Value, sh.nf)
 				for i := range vals {
 					vals[i] = j*100 + i
 				}
+				// The later fields still differ per key, so a constant
+				// first field ties without ever making two keys equal.
+				vals[0] = sh.field(j)
 				k, err := structKeyOf(&StructVal{Type: st, Vals: vals})
 				if err != nil {
 					b.Fatalf("encoding a key: %v", err)
@@ -851,7 +892,7 @@ func BenchmarkSortMapKeys(b *testing.B) {
 			keys := mp.MapKeys()
 			work := make([]reflect.Value, len(keys))
 
-			b.Run(fmt.Sprintf("struct/f%d/k%d", nf, nk), func(b *testing.B) {
+			b.Run(fmt.Sprintf("struct/%s/k%d", sh.name, nk), func(b *testing.B) {
 				b.ReportAllocs()
 				for b.Loop() {
 					copy(work, keys)
@@ -859,7 +900,7 @@ func BenchmarkSortMapKeys(b *testing.B) {
 				}
 				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
 			})
-			b.Run(fmt.Sprintf("copyonly/f%d/k%d", nf, nk), func(b *testing.B) {
+			b.Run(fmt.Sprintf("copyonly/%s/k%d", sh.name, nk), func(b *testing.B) {
 				for b.Loop() {
 					copy(work, keys)
 				}
