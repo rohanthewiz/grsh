@@ -514,38 +514,54 @@ func TestReefExplainHintEndToEnd(t *testing.T) {
 }
 
 // TestTutorEndToEnd drives `grsh tutor` through the real binary on a real
-// pty — the Phase-1 proof that the interceptor seam, the output tee, and
-// the verifiers work together at an actual prompt rather than only in
-// unit tests. It walks the demo lesson: a miss (which must NOT advance),
-// then the three correct answers, then the completion banner and a clean
-// exit without the user typing anything to leave.
+// pty — the proof that the interceptor seam, the output tee, the
+// verifiers and the embedded content work together at an actual prompt
+// rather than only in unit tests. It walks chapter 1 whole: a miss (which
+// must NOT advance), then all six correct answers, then the completion
+// banner and a clean exit without the user typing anything to leave.
 func TestTutorEndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a binary and drives a pty")
 	}
 	p := startShellArgs(t, []string{"tutor"})
 
-	p.waitFor("grsh tutor")           // intro
-	p.waitFor("A three-step tour")    // step 1 panel
-	p.waitFor("Print the word hello") // step 1 task
-	p.waitFor("grsh ")                // the real prompt, not a simulation
+	p.waitFor("grsh tutor")              // intro
+	p.waitFor("It's just a shell")       // chapter 1's title in the panel rule
+	p.waitFor("Start by looking around") // step 1 task
+	p.waitFor("grsh ")                   // the real prompt, not a simulation
 
 	// A wrong answer is graded as a miss and the step must NOT advance:
 	// the shell really ran the command, it just isn't the exercise.
 	p.send("printf 'good%s\\n' bye\r")
 	p.waitFor("goodbye")   // the user's command really ran
 	p.waitFor("not quite") // ...and was graded a miss
-	p.send("echo hello\r") //
-	p.waitFor("nice")      // step 1 passes
-	p.waitFor("Print 42")  // step 2 panel followed immediately
-	p.send("fmt.Println(6*7)\r")
-	p.waitFor("nice")
-	p.waitFor("capture `echo bridge`") // step 3 panel
 
-	// The bridge: $(...) captured into Go, printed through fmt. This is
-	// the step that proves the tee sees output produced by a child
-	// process reached through a Go expression.
-	p.send("fmt.Println($(echo bridge))\r")
+	p.send("ls\r")
+	p.waitFor("nice")       // step 1 passes
+	p.waitFor("Count them") // step 2's panel follows immediately
+
+	p.send("grep -c 500 access.log\r")
+	p.waitFor("17")
+	p.waitFor("nice")
+	p.waitFor("with a pipe")
+
+	p.send("ls *.go | wc -l\r")
+	p.waitFor("nice")
+	p.waitFor("errs.txt")
+
+	p.send("grep 500 access.log > errs.txt\r")
+	p.waitFor("nice")
+	p.waitFor("short-circuit")
+
+	p.send("test -f access.log && echo found\r")
+	p.waitFor("found")
+	p.waitFor("nice")
+	p.waitFor("Single quotes")
+
+	// The last step's fixture data is graded byte for byte (output-exact),
+	// which is what makes a deterministic playground load-bearing.
+	p.send("awk '{print $1}' access.log | head -1\r")
+	p.waitFor("10.0.0.1")
 	p.waitFor("nice")
 	p.waitFor("Lesson complete.")
 
@@ -573,7 +589,7 @@ func TestTutorMetaCommandsEndToEnd(t *testing.T) {
 	p := startShellArgs(t, []string{"tutor"})
 
 	p.waitFor("Playground:")       // the intro names the throwaway dir
-	p.waitFor("A three-step tour") // step 1 panel
+	p.waitFor("It's just a shell") // chapter 1's panel
 	p.waitFor("grsh ")
 
 	// The prompt really is inside the playground: `ls *.go` finds the
@@ -589,7 +605,7 @@ func TestTutorMetaCommandsEndToEnd(t *testing.T) {
 
 	p.send(":skip\r")
 	p.waitFor("skipped")
-	p.waitFor("Print 42") // step 2's panel follows immediately
+	p.waitFor("Count them") // step 2's panel follows immediately
 
 	p.send(":quit\r")
 	p.waitFor("your place is saved")

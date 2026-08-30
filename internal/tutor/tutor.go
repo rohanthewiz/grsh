@@ -198,10 +198,19 @@ func (e *engine) printPanel(w io.Writer, step *Step) {
 			fmt.Fprintln(w)
 			continue
 		}
-		fmt.Fprintf(w, "  %s\n", line)
+		fmt.Fprintf(w, "  %s\n", e.st.inline(line))
 	}
 	if step.Try != "" {
-		fmt.Fprintf(w, "\n  %s %s\n", e.st.label("try:"), e.st.code(step.Try))
+		// A `try:` may be a whole block (chapter 3 hands the student a
+		// three-line `for`), so the label goes on the first line and the
+		// rest is aligned under it — the shape the student has to type.
+		for i, line := range strings.Split(step.Try, "\n") {
+			if i == 0 {
+				fmt.Fprintf(w, "\n  %s %s\n", e.st.label("try:"), e.st.code(line))
+				continue
+			}
+			fmt.Fprintf(w, "       %s\n", e.st.code(line))
+		}
 	}
 	fmt.Fprintln(w)
 }
@@ -370,6 +379,59 @@ func (s style) ok(t string) string    { return s.wrap("32", t) }
 func (s style) warn(t string) string  { return s.wrap("33", t) }
 func (s style) label(t string) string { return s.wrap("36", t) }
 func (s style) code(t string) string  { return s.wrap("1;36", t) }
+
+// inline renders a prose line's markdown emphasis: `backticked spans` in
+// the code colour, **starred spans** in bold.
+//
+// Lesson prose is markdown-shaped because chapters are written as
+// markdown, and these two marks are the only inline markup a chapter is
+// allowed to use. The two are treated differently with color off, which
+// is the whole reason this is a function rather than a regexp:
+//
+//   - backticks STAY. They are the only emphasis a plain terminal has,
+//     and a NO_COLOR reader who lost them would be reading
+//     `ls *.go | wc -l` as ordinary prose.
+//   - stars GO. Emphasis has no plain-text convention worth preserving;
+//     literal asterisks would just be noise around the word they meant to
+//     lift.
+//
+// Spans do not nest, and an unclosed mark is left exactly as written
+// rather than swallowing the rest of the line.
+func (s style) inline(line string) string {
+	var b strings.Builder
+	for {
+		tick, star := strings.Index(line, "`"), strings.Index(line, "**")
+		switch {
+		case tick < 0 && star < 0:
+			b.WriteString(line)
+			return b.String()
+
+		case star < 0 || (tick >= 0 && tick < star):
+			body, rest, ok := strings.Cut(line[tick+1:], "`")
+			if !ok {
+				b.WriteString(line)
+				return b.String()
+			}
+			b.WriteString(line[:tick])
+			if s.on {
+				b.WriteString(s.code(body))
+			} else {
+				b.WriteString("`" + body + "`")
+			}
+			line = rest
+
+		default:
+			body, rest, ok := strings.Cut(line[star+2:], "**")
+			if !ok {
+				b.WriteString(line)
+				return b.String()
+			}
+			b.WriteString(line[:star])
+			b.WriteString(s.bold(body)) // identity with color off
+			line = rest
+		}
+	}
+}
 
 // rule draws "── Title ────────── 1/3 ──", padding the middle so the
 // counter lands at the right edge. Padding is computed on the plain text,

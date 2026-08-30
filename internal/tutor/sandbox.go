@@ -37,10 +37,12 @@ type sandbox struct {
 //	├── greet.go        three .go files, so `ls *.go | wc -l` is 3
 //	├── main.go
 //	├── util.go
-//	└── notes/          a subtree, for glob and filepath work
-//	    ├── monday.md
-//	    ├── tuesday.md
-//	    └── archive/old.md
+//	├── notes/          a subtree, for glob and filepath work
+//	│   ├── monday.md
+//	│   ├── tuesday.md
+//	│   └── archive/old.md
+//	└── old logs/       a name with a space (chapter 6)
+//	    └── legacy.log
 func fixtures() map[string]string {
 	f := map[string]string{
 		"access.log": accessLog(),
@@ -55,6 +57,12 @@ func fixtures() map[string]string {
 		"notes/monday.md":      "# Monday\n\n- ship the parser\n",
 		"notes/tuesday.md":     "# Tuesday\n\n- ship the classifier\n- write the tutor\n",
 		"notes/archive/old.md": "# Old\n\nsuperseded\n",
+
+		// A path with a space in it, for chapter 6. In bash this is where
+		// the quoting dance begins; the chapter's whole point is that
+		// `d := "old logs"` then `ls {d}` needs no quoting at all, so the
+		// fixture has to be a real directory with a real space in its name.
+		"old logs/legacy.log": "10.0.0.9 - - [01/Jan/2020:00:00:00 +0000] \"GET /old HTTP/1.0\" 200 11\n",
 	}
 	return f
 }

@@ -93,7 +93,10 @@ func TestProgressDegradesToNop(t *testing.T) {
 // index: editing the curriculum must never teleport a returning student
 // into the middle of a step they have not seen.
 func TestResumeAt(t *testing.T) {
-	l := demoLesson()
+	// A fixture rather than a shipped chapter: resumeAt is engine
+	// behaviour, and pinning it to real content would make every
+	// curriculum edit look like an engine regression.
+	l := Lesson{ID: "t", Steps: []Step{{ID: "shell-echo"}, {ID: "go-expr"}, {ID: "bridge"}}}
 	tests := []struct {
 		name  string
 		rec   Record

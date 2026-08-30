@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rohanthewiz/grsh/internal/repl"
 	"github.com/rohanthewiz/grsh/internal/runner"
 )
 
@@ -55,42 +56,74 @@ func twoStepLesson() Lesson {
 }
 
 // TestContentSolutionsPass is the highest-value test in the package: every
-// shipped step's canonical solution must satisfy that step's own verifier,
-// run through a real session. A lesson whose answer doesn't work fails CI
-// rather than a student.
+// shipped step's canonical solution must satisfy that step's own verifier.
+// A lesson whose answer doesn't work fails CI rather than a student.
+//
+// A chapter runs as a chapter: one fresh playground, one session, the
+// solutions submitted IN ORDER — because that is the only thing a student
+// can do, and because the curriculum is written that way on purpose.
+// Chapter 4 captures a count into `errs` and splices it back three steps
+// later; the capstone builds a report, saves the session as a script, and
+// sources it again. Grading each step in isolation would forbid exactly
+// the composition the language is for.
+//
+// Units go through repl.UnitLog rather than straight to Eval, so `?count`
+// and `session save` — prompt affordances that never reach the
+// interpreter — are checked on the same path the student's keystrokes
+// take, not on a reimplementation of it that could quietly drift.
 func TestContentSolutionsPass(t *testing.T) {
 	for _, l := range lessons() {
-		for i := range l.Steps {
-			st := l.Steps[i]
-			t.Run(l.ID+"/"+st.ID, func(t *testing.T) {
-				if st.Solution == "" {
-					t.Fatal("step has no solution to check")
-				}
-				// Each step gets its own playground, so a solution that
-				// writes a file is graded against fixtures in the state the
-				// student would meet them — and cannot leak into the next
-				// step's check. (Steps whose solutions must compose are a
-				// content-design question, not something to paper over by
-				// sharing a directory here.)
-				box, err := newSandbox()
-				if err != nil {
-					t.Fatalf("playground: %v", err)
-				}
-				defer box.cleanup()
+		t.Run(l.ID, func(t *testing.T) {
+			box, err := newSandbox()
+			if err != nil {
+				t.Fatalf("playground: %v", err)
+			}
+			defer box.cleanup()
 
-				cap := newCapture(64 << 10)
-				sess := runner.NewSession(runner.Options{
-					ScriptName: "tutor-check",
-					Stdout:     cap,
-					Stderr:     cap,
-				})
-				evalErr := sess.Eval(st.Solution)
+			cap := newCapture(64 << 10)
+			sess := runner.NewSession(runner.Options{
+				ScriptName: "tutor-check",
+				Stdout:     cap,
+				Stderr:     cap,
+			})
+			units := repl.NewUnitLog()
+
+			for i := range l.Steps {
+				st := l.Steps[i]
+				if st.Solution == "" {
+					t.Errorf("%s: step has no solution to check", st.ID)
+					continue
+				}
+				// The capture is reset per step exactly as BeforePrompt does
+				// it, so a step is graded on its own output and never on the
+				// previous step's leftovers.
+				cap.Reset()
+				evalErr := units.Submit(st.Solution, sess, io.Discard, io.Discard)
 				a := Attempt{Input: st.Solution, Output: cap.String(), Err: evalErr, Sess: sess, Dir: box.dir}
 				if !st.Verify.Verify(a) {
-					t.Errorf("solution %q failed its own verifier (%s)\noutput: %q\nerr: %v",
-						st.Solution, st.Verify.Spec(), cap.String(), evalErr)
+					t.Errorf("%s: solution %q failed its own verifier (%s)\noutput: %q\nerr: %v",
+						st.ID, st.Solution, st.Verify.Spec(), cap.String(), evalErr)
 				}
-			})
+			}
+		})
+	}
+}
+
+// TestContentParses is the guard on the format itself. lessons() panics on
+// a malformed chapter — the right call for content compiled into the
+// binary — so this test is what turns that panic into a failing build
+// instead of a failing `grsh tutor`.
+func TestContentParses(t *testing.T) {
+	all := lessons()
+	if len(all) != 8 {
+		t.Errorf("%d chapters embedded, want the 8 the curriculum plans", len(all))
+	}
+	for _, l := range all {
+		if l.Title == "" {
+			t.Errorf("%s: no title", l.ID)
+		}
+		if len(l.Steps) < 4 {
+			t.Errorf("%s: %d steps — a chapter that short is probably a parse failure", l.ID, len(l.Steps))
 		}
 	}
 }

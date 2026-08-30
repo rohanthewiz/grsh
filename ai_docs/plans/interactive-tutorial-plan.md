@@ -110,9 +110,12 @@ exercise is deterministic: a fake `access.log` (with some 500 lines, for the
 README's own grep example), three small `.go` files, a `data.json`, a
 `notes/` subtree for glob/filepath work. The tutor session starts `cd`'d
 there; `:quit` and normal exit clean it up (keep it on crash for debugging).
-Exercises never touch the user's real home except the final chapter, which
-deliberately writes `~/.grsh_tutor_graduate.grsh` via `session save` —
-that's the capstone.
+
+Phase 3 added an `old logs/` directory whose name contains a space, for
+chapter 6's word-splitting steps, and settled the capstone's output: it
+writes `report.grsh` **inside the playground** and sources it back, rather
+than leaving `~/.grsh_tutor_graduate.grsh` in the student's home. Nothing
+in the curriculum touches the user's real files.
 
 ## Curriculum (8 chapters, mapping to docs/LANGUAGE.md)
 
@@ -208,9 +211,30 @@ progress must never cost a student their lesson.
    editing content can't teleport a returning student. Notes for Phase
    3: `Attempt` now carries `Dir` (the sandbox root, for `file`); the
    content self-check runs each solution in its own fresh playground.
-3. **Content** — the 8 chapters, iterating with the self-check test; ANSI
-   panel styling consistent with the existing prompt colors, `NO_COLOR`
-   respected.
+3. ~~**Content**~~ — **done (2026-08-30).** The 8 chapters, 47 steps, as
+   `go:embed`'ed markdown under `internal/tutor/content/` with a loader in
+   `lesson.go`, so writing a lesson never means touching engine code.
+   Format is one `## step: id` heading per step, prose to a `---`, then
+   repeatable directives (`verify:` lines conjoin via `All`, `hint:` lines
+   are the ordered list, an empty value opens an indented block for a
+   multi-line answer); `content/FORMAT.md` is the authoring guide,
+   including the `var`-anchoring note Phase 2 left open. Panel prose
+   renders markdown's two inline marks — backticks in the code colour
+   (kept literal under `NO_COLOR`, the only emphasis a plain terminal
+   has) and `**stars**` in bold (dropped under `NO_COLOR`, since
+   emphasis has no plain-text convention). `TestContentSolutionsPass` now
+   runs a chapter AS a chapter — one playground, one session, solutions in
+   order — because the curriculum composes on purpose (chapter 4 captures
+   into a variable it splices three steps later; the capstone saves the
+   session and sources it back), and per-step isolation would forbid
+   exactly what the language is for. Units go through a new
+   `repl.UnitLog`, so `?count` and `session save` are checked on the same
+   dispatch a student's keystrokes take rather than a reimplementation.
+   One deviation from the sketch above: the capstone writes `report.grsh`
+   inside the playground and closes the loop with `source report.grsh`
+   rather than writing into the student's home — a tutorial leaving files
+   in `~` is a surprise, and sourcing proves the round trip in the same
+   session that made it.
 4. **Polish** — resume UX, completion banner, README section, e2e/golden
    tests.
 5. *(Optional, later)* **Web tour** — rweb server + `grsh.NewSession` per
@@ -223,10 +247,16 @@ progress must never cost a student their lesson.
   continuation (`Pending`) or Ctrl+C semantics; the repl seam tests plus two
   pty end-to-end runs (`TestTutorEndToEnd`, `TestTutorMetaCommandsEndToEnd`)
   guard it.
-- **Output-based grading brittleness**: environment leaks into output (`ls`
-  ordering, locale). Mitigation: fixtures + regexp verifiers + prefer
-  `var`/`file`/`status` checks where possible.
+- ~~**Output-based grading brittleness**~~: handled in content rather than
+  in the engine — `FORMAT.md` says to prefer `var`/`file`/`status` where a
+  step allows the choice, and the chapters do. The remaining output checks
+  run against the deterministic playground and are regexps, except three
+  `output-exact` steps whose bytes are the lesson.
 - ~~**`runner.Options` writers**~~: it already exposed them; the tee was
   pure addition.
-- **Jobs chapter timing**: background-job steps need generous, non-flaky
-  waits; keep them demo-flavored.
+- ~~**Jobs chapter timing**~~: chapter 7 backgrounds `sleep 30`, lists it,
+  kills it with `%%` (no job number to guess), lists again, and ends on a
+  `wait` with nothing left to collect. Nothing in it waits on a timer, and
+  the last two steps are `any-input` demos as planned. Ctrl+Z / `fg` / `bg`
+  are described for after the tutor rather than graded — a terminal
+  handoff is not something a scripted check can honestly assert.
