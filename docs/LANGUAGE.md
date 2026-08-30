@@ -357,8 +357,18 @@ All compound assignments work, including the bitwise set
 
 - Values are native Go values; ints are `int`, floats `float64`. Mixed
   int/float arithmetic promotes to `float64`.
-- Ranging over a **string-keyed map iterates in sorted key order** —
-  scripts are deterministic by default.
+- **Ranging a map iterates in `fmt`'s order** — the same order
+  `fmt.Println(m)` prints, so a range and a print of one map agree, and
+  a script sees the same order on every run. That covers ints, floats,
+  strings, bools, struct keys (field by field), and a `map[any]V` whose
+  keys share one type. Scripts are deterministic by default.
+
+  Three key types are the exception, and cannot be otherwise: a map keyed
+  by a **pointer, a channel, or an `unsafe.Pointer`** ranges in Go's own
+  randomised order, because `fmt` orders those by a machine address that
+  changes between runs. A key mixing two dynamic types — `map[any]V`
+  holding both an `int` and a `string` — falls back to the order the keys
+  RENDER in, which is deterministic but is not `fmt`'s.
 - `type` declarations create dynamic struct types; `fmt.Println(v)`
   prints them as `Name{Field: val, ...}`.
 - **`== nil` unwraps reference values.** A nil map, slice, func, chan or

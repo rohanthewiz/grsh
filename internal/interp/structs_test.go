@@ -2528,15 +2528,35 @@ func TestAStructKeyedMapDeclinesWhereFmtUsesAnAddress(t *testing.T) {
 		}
 	})
 
-	t.Run("a field type the comparator does not know", func(t *testing.T) {
-		// uint is not a type a script can WRITE, but a stdlib call hands
-		// them back and a field takes whatever it is given.
-		m := mapOfStructKeys(t, st, intT, [][]Value{{uint(1)}, {uint(2)}}, []Value{1, 2})
+	t.Run("a field holding a pointer", func(t *testing.T) {
+		// A POINTER IS THE RESIDUE. keyCmp.rv orders every other shape a
+		// field can hold -- a named int, a complex, an array, a native
+		// struct -- so what is left declining is what fmt itself answers
+		// with a machine address, and a pointer is the reachable one:
+		// errors.New hands a script two of them.
+		//
+		// This subtest used to hold a uint, on the grounds that keyCmp
+		// had no case for it. It has one now, by kind, so the uint moved
+		// to TestAFieldOfANamedTypeOrdersByItsKind and the decline is
+		// asserted where it is still true.
+		a, b := new(int), new(int)
+		m := mapOfStructKeys(t, st, intT, [][]Value{{a}, {b}}, []Value{1, 2})
 		if _, ok := appendStructKeyedMap(nil, m); ok {
-			t.Error("ordered a field type keyCmp has no case for")
+			t.Error("ordered two pointer fields, which fmt orders by address")
 		}
 		if got, want := string(appendValue(nil, m.Interface())), fmt.Sprintf("%v", m.Interface()); got != want {
 			t.Errorf("after declining, got %q, fmt says %q", got, want)
+		}
+	})
+
+	t.Run("a field holding a channel", func(t *testing.T) {
+		// The other address kind, and the one fmtsort treats slightly
+		// differently: it checks nil first, then compares addresses. Both
+		// halves land on the same decline here.
+		m := mapOfStructKeys(t, st, intT,
+			[][]Value{{make(chan int)}, {make(chan int)}}, []Value{1, 2})
+		if _, ok := appendStructKeyedMap(nil, m); ok {
+			t.Error("ordered two channel fields, which fmt orders by address")
 		}
 	})
 }
@@ -3337,6 +3357,443 @@ func TestMayNotEqualItselfNamesTheKeysMapIndexCannotFind(t *testing.T) {
 		if got := mayNotEqualItself(c.t); got != c.want {
 			t.Errorf("mayNotEqualItself(%s) = %v, want %v", c.t, got, c.want)
 		}
+	}
+}
+
+// ---- the key kinds that used to have no order ----
+
+// THE TEST THAT SAYS WHICH KEY KINDS GET AN ORDER, and it is written as a
+// table because the interesting half is the NOs.
+//
+// A wrong YES here is a script seeing an order that changes between runs
+// while looking stable in testing; a wrong NO is the disagreement with
+// fmt this whole path exists to remove. Neither is visible from a test
+// that only checks the kinds it happens to think of, so every kind a Go
+// map key can have is listed, and the three that are left unordered are
+// listed as such rather than omitted.
+//
+// The YES arm is checked by ordering a deliberately reversed slice and
+// requiring fmt's order out. The NO arm is checked by requiring the same
+// reversed slice back UNTOUCHED -- not merely "some order", which a sort
+// that silently ran would also satisfy.
+func TestWhichKeyKindsGetAnOrder(t *testing.T) {
+	type native struct {
+		A int
+		B string
+	}
+	// Each case's keys are given in DESCENDING fmt order, so an ordered
+	// kind must reverse them and an unordered one must not move them.
+	cases := []struct {
+		name    string
+		ordered bool
+		keys    []any
+	}{
+		{"int", true, []any{2, 1, -3}},
+		{"int64", true, []any{int64(2), int64(1), int64(-3)}},
+		{"uint32", true, []any{uint32(1 << 31), uint32(9), uint32(2)}},
+		{"float64", true, []any{2.5, 1.0, math.NaN()}},
+		{"string", true, []any{"b", "aa", "a"}},
+		{"bool", true, []any{true, false}},
+		{"rune", true, []any{'z', 'b', 'a'}},
+		// NAMED types, whose Kind is what fmtsort switches on. A
+		// time.Duration ordered by its rendered text would put 1h before
+		// 1ms; this is the case a script actually reaches, through a
+		// map[any]V key.
+		{"time.Duration", true, []any{time.Hour, time.Second, time.Millisecond}},
+		{"time.Month", true, []any{time.December, time.March, time.January}},
+		// The three kinds this session added. fmtsort orders a complex by
+		// real then imag, and an array and a struct element by element.
+		{"complex128", true, []any{complex(2, 0), complex(1, 5), complex(1, 2)}},
+		{"[3]int", true, []any{[3]int{2, 0, 0}, [3]int{1, 9, 9}, [3]int{1, 2, 3}}},
+		{"native struct", true, []any{
+			native{2, "a"}, native{1, "b"}, native{1, "a"},
+		}},
+		{"[2]any of one type", true, []any{[2]any{2, 0}, [2]any{1, 9}, [2]any{1, 2}}},
+		{"[2]any holding a nil", true, []any{[2]any{1, 0}, [2]any{nil, 9}, [2]any{nil, 2}}},
+		// THE RESIDUE. fmt orders these three by a machine address, so
+		// its own order changes between runs and there is nothing to
+		// reproduce -- and unlike every other decline, the rendered text
+		// is no fallback either, because the text of a pointer IS the
+		// address. They keep the map's own order.
+		{"pointer", false, []any{new(int), new(int), new(int)}},
+		{"chan", false, []any{make(chan int), make(chan int), make(chan int)}},
+		{"unsafe.Pointer", false, []any{
+			unsafe.Pointer(new(int)), unsafe.Pointer(new(int)), unsafe.Pointer(new(int)),
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			kt := reflect.TypeOf(c.keys[0])
+			given := make([]reflect.Value, len(c.keys))
+			for i, k := range c.keys {
+				given[i] = reflect.ValueOf(k)
+			}
+			keys := slices.Clone(given)
+			if decoded := sortMapKeys(keys, nil); decoded != nil {
+				t.Fatalf("a %s key was decoded; only a minted struct key is", kt)
+			}
+			if !c.ordered {
+				// Identity, element by element: a pointer's own text is
+				// not stable enough to compare, and the claim is that
+				// nothing moved rather than that something equal is here.
+				for i := range keys {
+					if keys[i].Pointer() != given[i].Pointer() {
+						t.Fatalf("%s keys were reordered; fmt orders them by address, so there is no order to reproduce", kt)
+					}
+				}
+				return
+			}
+			// fmt's order, read off fmt itself: a map of these keys
+			// printed by fmt names the order fmtsort chose.
+			m := reflect.MakeMap(reflect.MapOf(kt, reflect.TypeFor[int]()))
+			for _, k := range given {
+				m.SetMapIndex(k, reflect.ValueOf(1))
+			}
+			b := []byte("map[")
+			for i, k := range keys {
+				if i > 0 {
+					b = append(b, ' ')
+				}
+				b = appendValue(b, k.Interface())
+				b = append(b, ':', '1')
+			}
+			b = append(b, ']')
+			if got, want := string(b), fmt.Sprintf("%v", m.Interface()); got != want {
+				t.Fatalf("ranged  %s\nfmt     %s", got, want)
+			}
+		})
+	}
+}
+
+// keyCmp.rv mirrors internal/fmtsort's compare, an unexported standard
+// library detail, so the mirror is held against fmt itself rather than
+// against a hand-written expectation -- the same discipline
+// TestAStructKeyedMapMatchesFmt applies to the struct-key half.
+//
+// It compares PAIRS rather than whole maps, which is what makes it a test
+// of the comparator instead of a second test of the sort: every pair of
+// values in the pool goes into a two-entry map, and fmt's printing of
+// that map says which of the two fmtsort put first.
+//
+// The pool is deliberately one type per case, because a map holding two
+// dynamic types is the decline this cannot check against fmt -- fmt's
+// answer there is a type address. Those are counted, required to occur,
+// and checked only for having declined.
+func TestKeyCmpMirrorsFmtOverEveryComparableKind(t *testing.T) {
+	type inner struct {
+		N int
+		S string
+	}
+	type outer struct {
+		I inner
+		F float64
+		A [2]int
+	}
+	pool := []any{
+		0, 1, -1, 1 << 40,
+		int64(0), int64(-1 << 41),
+		// ^uint(0) has its top bit set, so an Int() comparison of the same
+		// bits would sort it FIRST instead of last. uint64 needs a
+		// same-typed companion of its own: a pool entry only ever meets
+		// values of its own type here.
+		uint(0), uint(1), ^uint(0), uint64(1), uint64(1 << 63),
+		byte(0), byte(255), 'a', 'b',
+		0.0, -0.0, 1.5, -1.5, math.Inf(1), math.Inf(-1), math.NaN(),
+		float32(1.5), float32(-1.5),
+		complex(0.0, 0.0), complex(1.0, 2.0), complex(1.0, -2.0), complex(2.0, 0.0),
+		complex64(complex(1, 2)),
+		"", "a", "b", "10", "2",
+		true, false,
+		time.Duration(0), time.Second, time.Hour, time.January, time.December,
+		[3]int{0, 0, 0}, [3]int{1, 2, 3}, [3]int{1, 2, 4}, [3]int{2, 0, 0},
+		inner{1, "a"}, inner{1, "b"}, inner{2, "a"},
+		outer{inner{1, "a"}, 0.5, [2]int{1, 2}},
+		outer{inner{1, "a"}, 0.5, [2]int{1, 3}},
+		outer{inner{1, "a"}, 1.5, [2]int{1, 2}},
+		[2]any{1, "a"}, [2]any{1, "b"}, [2]any{2, "a"},
+		// A NIL INSIDE a composite, which is the only way rv's interface
+		// case is reached at all: a bare interface KEY goes through
+		// keyCmp.field, which answers for nil itself. fmtsort's nilCompare
+		// puts these two below every non-nil element, and it settles the
+		// pair before the dynamic types are ever compared -- so these
+		// order against the int-first entries above rather than declining.
+		[2]any{nil, 1}, [2]any{nil, 2},
+	}
+	intT := reflect.TypeFor[int]()
+	var same, declined int
+	for i, a := range pool {
+		for j, b := range pool {
+			if i == j {
+				continue
+			}
+			av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
+			var c keyCmp
+			got := c.rv(av, bv)
+			if av.Type() != bv.Type() {
+				if !c.declined {
+					t.Fatalf("%T against %T: two dynamic types is fmt's address rule and must decline", a, b)
+				}
+				declined++
+				continue
+			}
+			if c.declined {
+				t.Fatalf("%T: declined on a pair of its own type", a)
+			}
+			same++
+			// fmt's verdict, read off a two-entry map. Two keys that
+			// compare EQUAL -- two NaNs, and 0.0 against -0.0 -- are
+			// still distinct entries whose relative order fmt does not
+			// fix either, so those are checked for equality and no more.
+			if got == 0 {
+				if r := c.rv(bv, av); r != 0 {
+					t.Fatalf("%v against %v: equal one way and %d the other", a, b, r)
+				}
+				continue
+			}
+			m := reflect.MakeMap(reflect.MapOf(av.Type(), intT))
+			m.SetMapIndex(av, reflect.ValueOf(1))
+			m.SetMapIndex(bv, reflect.ValueOf(2))
+			if m.Len() != 2 {
+				// The two are == to each other despite comparing
+				// non-zero, which nothing in the pool should manage.
+				t.Fatalf("%v and %v are one map entry but compare %d", a, b, got)
+			}
+			text := fmt.Sprintf("%v", m.Interface())
+			first := strings.HasPrefix(text, "map["+fmt.Sprintf("%v", a)+":1 ")
+			if wantFirst := got < 0; first != wantFirst {
+				t.Fatalf("rv(%v, %v) = %d, but fmt printed %s", a, b, got, text)
+			}
+		}
+	}
+	if same == 0 || declined == 0 {
+		t.Fatalf("the pool exercised %d same-type pairs and %d cross-type ones; both arms are needed", same, declined)
+	}
+}
+
+// A NAMED type is the reachable half of this session's change, and it is
+// reachable through the one door a script has to these kinds: a map[any]V
+// key boxes whatever a stdlib call handed back.
+//
+// keyCmp.field matches on GO TYPE, so `case int64` does not catch a
+// time.Duration and the map declined to the rendered-text order -- which
+// puts 1h0m0s before 1ms, because 'h' < 'm'. fmt switches on KIND and
+// puts 1ms first. The two disagreed, visibly, in a script anyone could
+// write.
+func TestAFieldOfANamedTypeOrdersByItsKind(t *testing.T) {
+	t.Run("as a map[any] key", func(t *testing.T) {
+		m := reflect.ValueOf(map[any]int{
+			time.Hour: 1, time.Second: 2, time.Millisecond: 3, time.Minute: 4,
+		})
+		want := "map[1ms:3 1s:2 1m0s:4 1h0m0s:1]"
+		if got := fmt.Sprintf("%v", m.Interface()); got != want {
+			t.Fatalf("fmt itself prints %s, so this test's premise is stale", got)
+		}
+		for run := 0; run < 10; run++ {
+			keys, vals := mapKeysAndVals(m)
+			sortMapKeys(keys, vals)
+			b := []byte("map[")
+			for i, k := range keys {
+				if i > 0 {
+					b = append(b, ' ')
+				}
+				b = appendValue(b, k.Interface())
+				b = append(b, ':')
+				b = appendValue(b, vals[i].Interface())
+			}
+			if got := string(append(b, ']')); got != want {
+				t.Fatalf("run %d ranged %s, want %s", run, got, want)
+			}
+		}
+	})
+
+	t.Run("as a struct key's field", func(t *testing.T) {
+		// The same question one level down: keyCmp.field is what orders a
+		// script struct's fields, and a field takes whatever a stdlib
+		// call handed back. uint is here because it is what this used to
+		// decline on -- see TestAStructKeyedMapDeclinesWhereFmtUsesAnAddress.
+		st := declare(t, `type P struct {
+	A int
+}`, "P")
+		intT := reflect.TypeFor[int]()
+		for _, fields := range [][][]Value{
+			{{time.Hour}, {time.Second}, {time.Millisecond}},
+			{{uint(3)}, {uint(1)}, {uint(2)}},
+			{{time.December}, {time.January}},
+		} {
+			vals := make([]Value, len(fields))
+			for i := range vals {
+				vals[i] = i
+			}
+			m := mapOfStructKeys(t, st, intT, fields, vals)
+			got, ok := appendStructKeyedMap(nil, m)
+			if !ok {
+				t.Fatalf("%v: declined a field type fmtsort orders by kind", fields)
+			}
+			if want := fmt.Sprintf("%v", m.Interface()); string(got) != want {
+				t.Fatalf("%v:\n got %s\nwant %s", fields, got, want)
+			}
+		}
+	})
+}
+
+// THE DECLINE IS FOUND BY THE SORT, one level further down than
+// sortMapKeys makes that argument: a composite key is compared element by
+// element and stops at the first element that differs, so a pointer in
+// the LAST field costs nothing on any pair an earlier field settles.
+//
+// time.Time is the case that matters, because it is what a script gets
+// from time.Now: three unexported fields, wall, ext and a *Location. A
+// pre-pass over the type would see the pointer and give up on every
+// time-keyed map; comparing as it goes gives up only on two times that
+// are identical in wall and ext, which differ only by location.
+func TestATimeKeyedMapOrdersOnTheFieldsBeforeItsPointer(t *testing.T) {
+	base := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	m := reflect.ValueOf(map[any]int{
+		base.Add(2 * time.Hour): 2,
+		base:                    0,
+		base.Add(time.Hour):     1,
+	})
+	want := fmt.Sprintf("%v", m.Interface())
+	for run := 0; run < 10; run++ {
+		keys, vals := mapKeysAndVals(m)
+		sortMapKeys(keys, vals)
+		b := []byte("map[")
+		for i, k := range keys {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = appendValue(b, k.Interface())
+			b = append(b, ':')
+			b = appendValue(b, vals[i].Interface())
+		}
+		if got := string(append(b, ']')); got != want {
+			t.Fatalf("run %d ranged %s\n            fmt %s", run, got, want)
+		}
+	}
+	// THE OTHER HALF OF THE CLAIM: a pair that DOES reach the pointer
+	// declines rather than inventing an answer. In changes only loc, so
+	// wall and ext tie and loc is the field that decides -- which is
+	// exactly the pair a field-wise comparison cannot answer.
+	//
+	// FixedZone rather than LoadLocation: this must not depend on a
+	// zoneinfo database being installed.
+	other := base.In(time.FixedZone("elsewhere", 0))
+	if base.Location() == other.Location() {
+		t.Fatal("In kept the same *Location; this test needs two Times differing only in location")
+	}
+	var c keyCmp
+	if r := c.rv(reflect.ValueOf(base), reflect.ValueOf(other)); !c.declined {
+		t.Fatalf("two Times differing only in *Location compared %d; fmt answers that by address", r)
+	}
+}
+
+// A COMPOSITE KEY CAN DECLINE, and when it does the answer has to be
+// deterministic rather than fmt's. An array of `any` holding two
+// different dynamic types is the reachable shape: fmt orders those two by
+// the addresses of `int` and `string`, which changes between builds, so
+// the fallback renders the keys and orders by the text.
+//
+// The expected order -- "[1 a]" before "[a 1]" -- is the text one, which
+// is neither numeric nor fmt's, so it could only come from the fallback
+// having run.
+func TestACompositeKeyedMapDeclinesToTextOrder(t *testing.T) {
+	m := reflect.ValueOf(map[[2]any]int{
+		{"a", 1}: 1,
+		{1, "a"}: 2,
+		{1, 2}:   3,
+	})
+	want := []string{"[1 2]", "[1 a]", "[a 1]"}
+	for run := 0; run < 10; run++ {
+		keys, vals := mapKeysAndVals(m)
+		if decoded := sortMapKeys(keys, vals); decoded != nil {
+			t.Fatal("an array key was decoded")
+		}
+		got := make([]string, len(keys))
+		for i, k := range keys {
+			got[i] = string(appendValue(nil, k.Interface()))
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("run %d ranged as %v, want %v -- the text-order fallback did not run", run, got, want)
+		}
+	}
+}
+
+// The script-level half, and the only end-to-end reach a script has to
+// any of this: map[any]V, keyed by values a registered stdlib call handed
+// back. A range and a print of the same map, in the same script, which is
+// where a user meets a disagreement between them.
+func TestAScriptRangesAMapKeyedByNamedTypes(t *testing.T) {
+	out, err := eval(t, `m := map[any]int{}
+m[time.Hour] = 1
+m[time.Second] = 2
+m[time.Millisecond] = 3
+m[time.Minute] = 4
+fmt.Println(m)
+for k, v := range m {
+	fmt.Println(k, v)
+}`, nil)
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	want := "map[1ms:3 1s:2 1m0s:4 1h0m0s:1]\n1ms 3\n1s 2\n1m0s 4\n1h0m0s 1\n"
+	if out != want {
+		t.Errorf("got:\n%swant:\n%s", out, want)
+	}
+}
+
+// A NESTED STRUCT FIELD ORDERS BY ITS OWN FIELDS, which keyCmp.field has
+// always done -- and which the reflect fallback added beneath it could
+// silently take away, because a *StructVal is a POINTER and rv orders
+// pointers by declining. The case order inside field is therefore
+// load-bearing in a way it was not before, and nothing pinned it: no test
+// built a map whose key had a struct field and then asked what ORDER it
+// came out in. A probe pass found the gap; this closes it.
+//
+// The keys are chosen to tell the two answers apart rather than merely to
+// be true of one. In{N: 10} against In{N: 2} is where field order and
+// TEXT order disagree -- '0' < '}' puts 10 first as text, comparing N
+// puts 2 first -- so a decline would leave the keys the other way round
+// and be caught, where equal-length numbers would pass either way.
+func TestANestedStructKeyFieldOrdersFieldWise(t *testing.T) {
+	in, _, err := evalKeep(t, `type In struct {
+	N int
+}
+type P struct {
+	A In
+}`, nil)
+	if err != nil {
+		t.Fatalf("declaring: %v", err)
+	}
+	get := func(name string) *StructType {
+		t.Helper()
+		v, ok := in.globals.Get(name)
+		if !ok {
+			t.Fatalf("%s was not defined", name)
+		}
+		return v.(*StructType)
+	}
+	inT, pT := get("In"), get("P")
+
+	fields := make([][]Value, 0, 3)
+	for _, n := range []int{10, 2, 1} {
+		fields = append(fields, []Value{&StructVal{Type: inT, Vals: []Value{n}}})
+	}
+	m := mapOfStructKeys(t, pT, reflect.TypeFor[int](), fields, []Value{1, 2, 3})
+
+	got, ok := appendStructKeyedMap(nil, m)
+	if !ok {
+		t.Fatal("declined a key whose field is a nested struct; fmt orders those by the nested fields")
+	}
+	// fmt's own answer, which for this map is reproducible: the two keys
+	// carry the same *StructType, so fmtsort's address step ties and it
+	// goes on to the fields.
+	if want := fmt.Sprintf("%v", m.Interface()); string(got) != want {
+		t.Fatalf("\n got %s\nwant %s", got, want)
+	}
+	// And the answer is the FIELD order, not the text order the fallback
+	// would have produced.
+	if want := "map[P{A: In{N: 1}}:3 P{A: In{N: 2}}:2 P{A: In{N: 10}}:1]"; string(got) != want {
+		t.Fatalf("\n got %s\nwant %s", got, want)
 	}
 }
 

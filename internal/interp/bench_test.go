@@ -10,6 +10,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/rohanthewiz/grsh/internal/shellexec"
 )
@@ -905,6 +906,69 @@ func BenchmarkSortMapKeys(b *testing.B) {
 			}
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
 		})
+	}
+
+	// THE KINDS THAT USED TO COST NOTHING BECAUSE THEY DID NOTHING: a
+	// complex, array or native-struct key was left in the map's own
+	// order, and the `any` row is the one a script actually reaches --
+	// map[any]V keyed by whatever a stdlib call handed back.
+	//
+	// There is no before/after pair to run here, so read these against
+	// the int row above: that is the same sort with the cheapest possible
+	// comparison, and the gap is what the comparison costs. The array and
+	// struct rows go through keyCmp.rv, which recurses per element; the
+	// complex row goes through cmpComplexKeys, which does not.
+	type composite struct {
+		A int
+		B string
+	}
+	for _, c := range []struct {
+		name string
+		m    func(nk int) reflect.Value
+	}{
+		{"complex", func(nk int) reflect.Value {
+			m := make(map[complex128]int, nk)
+			for j := 0; j < nk; j++ {
+				m[complex(float64(j*7919%nk), float64(j))] = j
+			}
+			return reflect.ValueOf(m)
+		}},
+		{"array", func(nk int) reflect.Value {
+			m := make(map[[4]int]int, nk)
+			for j := 0; j < nk; j++ {
+				m[[4]int{j * 7919 % nk, j, j, j}] = j
+			}
+			return reflect.ValueOf(m)
+		}},
+		{"nativestruct", func(nk int) reflect.Value {
+			m := make(map[composite]int, nk)
+			for j := 0; j < nk; j++ {
+				m[composite{j * 7919 % nk, "s"}] = j
+			}
+			return reflect.ValueOf(m)
+		}},
+		{"anynamedint", func(nk int) reflect.Value {
+			// One dynamic type throughout, so the type-address step ties
+			// and the sort runs to completion rather than declining.
+			m := make(map[any]int, nk)
+			for j := 0; j < nk; j++ {
+				m[time.Duration(j*7919%nk)] = j
+			}
+			return reflect.ValueOf(m)
+		}},
+	} {
+		for _, nk := range counts {
+			keys := c.m(nk).MapKeys()
+			work := make([]reflect.Value, len(keys))
+			b.Run(fmt.Sprintf("%s/k%d", c.name, nk), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					copy(work, keys)
+					sortSink = sortMapKeys(work, nil)
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*nk), "ns/key")
+			})
+		}
 	}
 }
 

@@ -1384,10 +1384,147 @@ func (c *keyCmp) field(a, b Value) int {
 		// so fmtsort recurses into T-then-F exactly as at the top level.
 		// A typed nil *StructVal is NOT the nil case above -- that one is
 		// a nil interface -- and keys answers for it.
+		//
+		// This case has to come BEFORE the reflect fallback, not after
+		// it: a *StructVal is a POINTER, so rv would compare two decoded
+		// structs by their addresses and decline, throwing away the one
+		// nesting fmt orders reproducibly.
 		if y, ok := b.(*StructVal); ok {
 			return c.keys(x, y)
 		}
 	}
+	// EVERYTHING ELSE GOES THROUGH REFLECT, which is the same comparison
+	// arrived at the slow way. The switch above is a fast path for the
+	// types a script writes directly, and it matches on GO TYPE -- so a
+	// value whose type is merely a named version of one of them, a
+	// time.Duration where the case says int64, falls out of it. Declining
+	// there was a real disagreement with fmt, which switches on KIND and
+	// puts 1ms before 1h: see TestAFieldOfANamedTypeOrdersByItsKind.
+	//
+	// rv also reaches the shapes the switch has no case for at all --
+	// complex, an array, a native struct -- and declines the ones fmt
+	// answers by an address, so the decline this replaces is still
+	// produced wherever it was the right answer.
+	return c.rv(reflect.ValueOf(a), reflect.ValueOf(b))
+}
+
+// rv is fmtsort's compare over reflect.Values: the general form of field
+// above, reached when the fast switch has no case for what it was handed.
+//
+// IT IS THE SAME MIRROR keys and field are, held to fmtsort by the same
+// tests, and it closes the kinds those two could not name. A Value is an
+// `any`, so field can only ask "is this exactly an int64"; a reflect.Value
+// can ask for the KIND, which is the question fmtsort itself asks. That
+// difference is the whole reason this exists:
+//
+//	                      field alone   with rv
+//	time.Duration keys      declined    ordered 1ms < 1s < 1m0s
+//	time.Time keys          declined    ordered by wall, then ext
+//	complex, array          declined    ordered element by element
+//	native struct           declined    ordered field by field
+//	pointer, chan           declined    declined -- see below
+//
+// IT MUST NEVER CALL Interface(). Struct recursion descends into
+// UNEXPORTED fields -- time.Time is wall, ext and a *Location, none of
+// them exported -- and Interface panics on a Value obtained that way,
+// where Int, Uint, Float, Complex, Bool, String, Len, Index, NumField,
+// Field and Elem all read it fine. fmtsort carries the same rule at the
+// top of its file, and for the same reason.
+//
+// WHAT IT DECLINES is what fmt answers with a machine address: a pointer,
+// a channel, an unsafe.Pointer, and two values whose types differ at all
+// (which is how the interface case's compare-the-dynamic-type-first step
+// is spelled here). A decline is not a failure -- the callers fall back
+// to the rendered text, which is deterministic where an address is not.
+//
+// A DECLINED PAIR IS STILL COMPARED, and the answer it returns is 0.
+// That matters for the composite cases: `for i := range` stops at the
+// first field that differs, so a struct whose LAST field is a pointer is
+// ordered by its earlier fields on every pair those settle, and declines
+// only on the pairs that actually reach the pointer. Two times in one
+// location differ in wall or ext long before their *Location, so they
+// order; two times that differ ONLY in location decline. That is the
+// same "found by the sort, not by a pre-pass" argument sortMapKeys makes,
+// one level down.
+//
+// The default arm DECLINES RATHER THAN PANICS, where fmtsort panics. A
+// key type is comparable, so a slice, map or func cannot reach here
+// through a map key -- but this is reachable from field, which is handed
+// whatever a script put in a struct field, and a panic there would report
+// the panic instead of the map.
+func (c *keyCmp) rv(a, b reflect.Value) int {
+	if a.Type() != b.Type() {
+		// fmtsort reaches the same fork through its interface case, where
+		// it orders two dynamic types by the address of their
+		// reflect.Type. That address is what makes it unreproducible.
+		c.declined = true
+		return 0
+	}
+	switch a.Kind() {
+	case reflect.String:
+		return cmp.Compare(a.String(), b.String())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return cmp.Compare(a.Int(), b.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return cmp.Compare(a.Uint(), b.Uint())
+	case reflect.Float32, reflect.Float64:
+		// cmp.Compare's NaN rule again -- NaN low, two NaNs equal --
+		// which is fmtsort's floatCompare. A float32 is widened to 64
+		// here, and that is exact for ordering: widening is monotonic,
+		// so it cannot reorder a pair. (Rendering a float32 is the
+		// opposite case, and appendMapValue says why.)
+		return cmp.Compare(a.Float(), b.Float())
+	case reflect.Complex64, reflect.Complex128:
+		// Real part, then imaginary -- fmtsort's rule. It never declines:
+		// a complex is two floats and nothing else, so a complex-keyed
+		// map is ordered outright.
+		x, y := a.Complex(), b.Complex()
+		if r := cmp.Compare(real(x), real(y)); r != 0 {
+			return r
+		}
+		return cmp.Compare(imag(x), imag(y))
+	case reflect.Bool:
+		switch x, y := a.Bool(), b.Bool(); {
+		case x == y:
+			return 0
+		case x:
+			return 1
+		default:
+			return -1
+		}
+	case reflect.Array:
+		// Element by element. The two arrays are the same type, so they
+		// are the same length, and fmtsort's trailing "otherwise identical
+		// arrays compare by length" cannot be reached from here either.
+		for i := 0; i < a.Len(); i++ {
+			if r := c.rv(a.Index(i), b.Index(i)); r != 0 {
+				return r
+			}
+		}
+		return 0
+	case reflect.Struct:
+		// Field by field, in declaration order, exported or not.
+		for i := 0; i < a.NumField(); i++ {
+			if r := c.rv(a.Field(i), b.Field(i)); r != 0 {
+				return r
+			}
+		}
+		return 0
+	case reflect.Interface:
+		// Nil low, both nil equal -- fmtsort's nilCompare -- and then the
+		// dynamic values, whose types the head of this function compares
+		// for us.
+		switch {
+		case a.IsNil() && b.IsNil():
+			return 0
+		case a.IsNil():
+			return -1
+		case b.IsNil():
+			return 1
+		}
+		return c.rv(a.Elem(), b.Elem())
+	}
+	// Pointer, Chan, UnsafePointer, and anything a map key cannot be.
 	c.declined = true
 	return 0
 }

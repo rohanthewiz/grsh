@@ -1036,11 +1036,15 @@ func mayNotEqualItself(t reflect.Type) bool {
 // struct is exactly what the range variable must be. Kept apart, every
 // key of every range was decoded twice.
 //
-// THE ORDER IS fmt's, for every key type a script can spell. A
-// struct-keyed map is ordered field by field by keyCmp -- the same
-// comparator appendStructKeyedMap uses to reproduce internal/fmtsort --
-// and everything else goes to orderScalarKeys, so `for k := range m` and
+// THE ORDER IS fmt's, for every key type but three. A struct-keyed map is
+// ordered field by field by keyCmp -- the same comparator
+// appendStructKeyedMap uses to reproduce internal/fmtsort -- and
+// everything else goes to orderNativeKeys, so `for k := range m` and
 // `fmt.Println(m)` visit the entries in the same order.
+//
+// The three are POINTER, CHANNEL and unsafe.Pointer keys, which fmt
+// itself orders by a machine address; those range in the map's own order,
+// and scalarKeyCmp says why they are the whole residue.
 //
 // Neither was true before. A struct-keyed map was ordered by each key's
 // RENDERED TEXT, which puts P{N: 10} before P{N: 2} because '0' < '}',
@@ -1145,7 +1149,7 @@ func sortMapKeys(keys, vals []reflect.Value) []*StructVal {
 	if kt == nil {
 		// Every non-struct key: nothing to decode, so the sort is the
 		// whole job and the caller reads the map's own keys.
-		orderScalarKeys(keys, vals)
+		orderNativeKeys(keys, vals)
 		// nil: the script's keys are the map's own, so the caller has
 		// nothing to read here.
 		return nil
@@ -1205,13 +1209,15 @@ func sortMapKeys(keys, vals []reflect.Value) []*StructVal {
 	return decoded
 }
 
-// orderScalarKeys puts a map's keys in fmt's order when the key type is
+// orderNativeKeys puts a map's keys in fmt's order when the key type is
 // one fmt orders reproducibly, and leaves them alone when it is not.
 //
-// This is the whole job for a scalar-keyed map. There is nothing to
-// decode -- a script's int key IS the map's int key -- so the keys are
-// sorted in place, the caller reads them directly, and for every key type
-// that cannot hold a NaN no memory is touched at all.
+// NATIVE means every key type that is not a minted script struct -- the
+// keys sortMapKeys hands over undecoded. This is the whole job for such a
+// map. There is nothing to decode -- a script's int key IS the map's int
+// key -- so the keys are sorted in place, the caller reads them directly,
+// and for every SCALAR key type that cannot hold a NaN no memory is
+// touched at all.
 // BenchmarkSortMapKeys, ns per key, Apple M3, minimum of six runs, zero
 // allocations at every count:
 //
@@ -1238,15 +1244,38 @@ func sortMapKeys(keys, vals []reflect.Value) []*StructVal {
 // to range, and fmtsort orders one; there is no reason to be narrower
 // than the thing being reproduced.
 //
+// THE KINDS SPLIT THREE WAYS, and the split is what this function is:
+//
+//	scalar       int, uint, float, complex, string, bool
+//	             one comparator, no decline possible, sorted right here
+//	declinable   array, native struct, interface
+//	             a comparator that CAN give up, so a fallback follows it
+//	unordered    pointer, chan, unsafe.Pointer
+//	             left in the map's own order; see scalarKeyCmp
+//
+// The middle group is not a second kind of ordering, only a second kind
+// of ANSWER. Each of those three can hold something fmt orders by a
+// machine address -- an element, a field, a dynamic type -- and the
+// comparator gives up when a comparison actually reaches one. Giving up
+// needs somewhere to go, which is the rendered text, and carrying that
+// fallback is the whole reason they keep a path of their own. The two
+// members are orderCompositeKeys and orderInterfaceKeys, which differ
+// only in the comparator they hand to orderDeclinableKeys.
+//
 // WHICH KINDS GET AN ORDER AT ALL, and which are left in the map's own,
 // is scalarKeyCmp's answer; it also holds the comparators themselves,
 // because there are two ways in here and both must sort identically.
-func orderScalarKeys(keys, vals []reflect.Value) {
-	// An interface key needs more than a comparator: its order can be
-	// DECLINED, and a decline has a fallback to run. It keeps its own
-	// function for that.
-	if keys[0].Kind() == reflect.Interface {
+func orderNativeKeys(keys, vals []reflect.Value) {
+	switch keys[0].Kind() {
+	case reflect.Interface:
+		// An interface key can hold two different dynamic types, which is
+		// fmt's address rule and so a decline.
 		orderInterfaceKeys(keys, vals)
+		return
+	case reflect.Array, reflect.Struct:
+		// A composite can hold a pointer at any depth, which is the same
+		// address rule one or more levels down.
+		orderCompositeKeys(keys, vals)
 		return
 	}
 	// A nil comparator is a kind with no reproducible order; the keys are
@@ -1261,7 +1290,7 @@ func orderScalarKeys(keys, vals []reflect.Value) {
 		// second slice on every swap. It costs one allocation for the
 		// sorter, which only the key types mapKeysAndVals singles out
 		// ever pay -- a float, a complex, or an interface key.
-		sort.Sort(&scalarOrder{keys: keys, vals: vals, cmp: cmpKeys})
+		sort.Sort(&pairedOrder{keys: keys, vals: vals, cmp: cmpKeys})
 		return
 	}
 	// The path every string- and int-keyed map takes: no second slice to
@@ -1273,18 +1302,26 @@ func orderScalarKeys(keys, vals []reflect.Value) {
 // kind fmt orders by something no reproduction can predict.
 //
 // The comparators are named functions rather than closures written at the
-// two call sites because there are two call sites: orderScalarKeys sorts
+// two call sites because there are two call sites: orderNativeKeys sorts
 // the keys alone, and sorts them beside their values when the map had to
 // be read in one pass. One definition each is what keeps those two paths
 // provably the same order.
 //
-// WHAT IS LEFT UNORDERED -- a nil return -- is what fmt orders by a
-// MACHINE ADDRESS or by nothing this package can render: pointer, channel
-// and unsafe.Pointer keys, whose text IS an address and so cannot be made
-// deterministic either, and complex, array and native-struct keys, which
-// fmtsort compares element-wise and no script can spell. Those range in
-// the map's own randomised order, exactly as every scalar key did before
-// this existed.
+// WHAT IS LEFT UNORDERED -- a nil return -- is POINTER, CHANNEL AND
+// unsafe.Pointer keys, and they are the whole residue. fmt orders those
+// three by a machine address, so its own order for them changes between
+// runs; and a decline's usual escape, the rendered text, is no escape
+// here, because the text of a pointer IS that address. There is nothing
+// deterministic left to sort by, so such a map ranges in the map's own
+// randomised order.
+//
+// Complex, array and native-struct keys USED TO BE IN THAT LIST, on the
+// grounds that no script can spell one. Two things were wrong with that.
+// fmtsort orders all three reproducibly -- a complex by real then imag,
+// the other two element by element -- so there was an order to reproduce;
+// and "no script can spell it" is not the same as "no script can reach
+// it", because a map[any]V key boxes whatever a stdlib call handed back.
+// They go through orderCompositeKeys now. See keyCmp.rv.
 func scalarKeyCmp(k reflect.Kind) func(a, b reflect.Value) int {
 	switch k {
 	case reflect.String:
@@ -1295,6 +1332,8 @@ func scalarKeyCmp(k reflect.Kind) func(a, b reflect.Value) int {
 		return cmpUintKeys
 	case reflect.Float32, reflect.Float64:
 		return cmpFloatKeys
+	case reflect.Complex64, reflect.Complex128:
+		return cmpComplexKeys
 	case reflect.Bool:
 		return cmpBoolKeys
 	}
@@ -1337,6 +1376,26 @@ func cmpUintKeys(a, b reflect.Value) int { return cmp.Compare(a.Uint(), b.Uint()
 // values held in step, because no NaN key can find its own value again.
 func cmpFloatKeys(a, b reflect.Value) int { return cmp.Compare(a.Float(), b.Float()) }
 
+// cmpComplexKeys orders by the real part and breaks its ties with the
+// imaginary one, which is fmtsort's rule for a complex.
+//
+// It cannot decline. A complex is two floats, cmp.Compare answers for
+// both -- NaN low in each part, exactly as cmpFloatKeys -- so a
+// complex-keyed map is ordered outright rather than through the composite
+// path, and needs no fallback. That is also why it is written here beside
+// the other scalars instead of being left to keyCmp.rv, which holds the
+// identical two lines for a complex sitting INSIDE a key.
+//
+// A complex key can hold a NaN, so mapKeysAndVals hands this one its
+// values to keep in step for the same reason cmpFloatKeys gets them.
+func cmpComplexKeys(a, b reflect.Value) int {
+	x, y := a.Complex(), b.Complex()
+	if r := cmp.Compare(real(x), real(y)); r != 0 {
+		return r
+	}
+	return cmp.Compare(imag(x), imag(y))
+}
+
 // cmpBoolKeys puts false before true, which is fmtsort's rule and Go's
 // own convention everywhere else.
 func cmpBoolKeys(a, b reflect.Value) int {
@@ -1369,26 +1428,106 @@ func cmpBoolKeys(a, b reflect.Value) int {
 // The render is worth nothing to the accepted path, so it is not built
 // until the decline is known -- a map[any]int of plain ints pays one
 // wasted sort and no memory.
+//
+// It goes through keyCmp.field rather than keyCmp.rv, which would answer
+// identically, because field carries a fast path for the types a script
+// writes: an int or a string key is compared without a reflect.Value in
+// sight, and only what field has no case for pays for rv underneath it.
 func orderInterfaceKeys(keys, vals []reflect.Value) {
 	var c keyCmp
-	cmpKeys := func(a, b reflect.Value) int {
+	orderDeclinableKeys(keys, vals, &c, func(a, b reflect.Value) int {
 		return c.field(a.Interface(), b.Interface())
-	}
-	// An interface key can box a NaN, so mapKeysAndVals always hands this
-	// one a vals to keep in step -- both here and in the fallback below.
+	})
+}
+
+// orderCompositeKeys orders the keys of a map whose key is an ARRAY or a
+// NATIVE STRUCT -- a map[[32]byte]T of digests, a map[time.Time]T.
+//
+// These are the keys no script can SPELL: typeIdents has no array type
+// and no foreign struct, so such a map can only arrive from a stdlib call
+// or a registered symbol. That is why they were left unordered until now,
+// and it was the wrong test to apply -- unspellable is not unreachable,
+// and fmtsort orders both kinds element by element, reproducibly, so
+// there was an order to match and a script ranging such a map was not
+// getting it.
+//
+// A composite CAN decline where an int cannot: an element or a field may
+// be a pointer, or an interface holding two different dynamic types. So
+// this takes the same shape orderInterfaceKeys does -- one declinable
+// sort, then the rendered-text fallback -- and for the same reason. What
+// it does NOT do is refuse the whole map because the type contains a
+// pointer somewhere: keyCmp.rv stops at the first element that differs,
+// so a struct whose last field is a *Location still orders on the fields
+// in front of it.
+//
+// WHAT IT COSTS is a comparison that recurses per element where an int's
+// is one load. BenchmarkSortMapKeys, ns per key, Apple M3, minimum of ten
+// runs, with the scalar rows above it for scale:
+//
+//	keys              4     16     64    256   1024
+//	 int            6.4   11.7   20.4   31.0   37.3
+//	 string         6.9   12.0   25.4   36.0   49.0
+//	 complex        8.8   15.4   25.4   34.3   53.1
+//	 [4]int        24.9   46.9   77.0  120.4  150.3
+//	 struct{int;string}
+//	               27.7   54.1   89.7  125.1  155.2
+//	 any(Duration) 29.2   55.1   90.0  128.6  160.2
+//
+// The complex row sits with the scalars because it IS one -- two floats,
+// compared by cmpComplexKeys with no recursion and no decline. The three
+// below it are 3-4x an int, which is the reflect.Value walk: a Kind
+// switch and an Index or Field call per element per comparison. That is
+// the price of an order those maps did not have at all, paid only by maps
+// that reach this function, and none of the maps a script writes directly
+// do.
+//
+// TWO ALLOCATIONS PER MAP, not per key, and they are the escaping keyCmp
+// and the method value built around it -- which is what orderInterfaceKeys
+// has always cost. The scalar rows still allocate nothing.
+func orderCompositeKeys(keys, vals []reflect.Value) {
+	var c keyCmp
+	orderDeclinableKeys(keys, vals, &c, c.rv)
+}
+
+// orderDeclinableKeys is the shape every key type with a DECLINE takes:
+// sort by cmpKeys, and if the comparator gave up anywhere, throw that
+// order away and sort by the keys' rendered text instead.
+//
+// The fallback's job is DETERMINISM, not parity. A decline means fmt's
+// own answer came from a machine address and changes between runs, so
+// there is nothing left to agree with; what a script still needs is to
+// see the same order twice. The rendered text has that property and is
+// what a struct-keyed map has fallen back to since before keyCmp existed.
+//
+// c is the caller's, not this function's, because the caller built the
+// comparator around it -- the decline flag is the only channel a
+// comparator with sort's signature has to report through.
+//
+// vals, when non-nil, is moved with the keys by both sorts. mapKeysAndVals
+// says which maps have to supply one; every caller that can decline is a
+// key type that may hold a NaN, so in practice it is always supplied by a
+// range and nil only from a test.
+func orderDeclinableKeys(keys, vals []reflect.Value, c *keyCmp, cmpKeys func(a, b reflect.Value) int) {
 	if vals != nil {
-		sort.Sort(&scalarOrder{keys: keys, vals: vals, cmp: cmpKeys})
+		sort.Sort(&pairedOrder{keys: keys, vals: vals, cmp: cmpKeys})
 	} else {
 		slices.SortFunc(keys, cmpKeys)
 	}
 	if !c.declined {
 		return
 	}
+	// THE FALLBACK, built only now: the accepted path pays one wasted
+	// sort and no memory. Bounds are recorded first and the views cut
+	// after, because a view taken while buf is still growing would point
+	// into the array append reallocated away -- the same care sortMapKeys
+	// takes over the same slab.
 	n := len(keys)
 	ord := make([][]byte, n)
 	bounds := make([]int, n+1)
 	var buf []byte
 	for i, k := range keys {
+		// Interface() is legal on a map's own key -- it did not come from
+		// an unexported field, which is the case keyCmp.rv has to avoid.
 		buf = appendValue(buf, k.Interface())
 		bounds[i+1] = len(buf)
 		if i == 0 {
@@ -1503,7 +1642,7 @@ func (s *textOrder) Swap(i, j int) {
 	}
 }
 
-// scalarOrder sorts a map's keys with its VALUES held in step, for the
+// pairedOrder sorts a map's keys with its VALUES held in step, for the
 // maps that had to read both in one pass because their keys cannot look a
 // value up again. See mapKeysAndVals for which those are.
 //
@@ -1514,22 +1653,24 @@ func (s *textOrder) Swap(i, j int) {
 // was not simply replaced by this.
 //
 // cmp is the same comparator the keys-only path uses, taken from
-// scalarKeyCmp or supplied by orderInterfaceKeys, so the two paths cannot
-// drift into two different orders.
+// scalarKeyCmp or built by orderInterfaceKeys or orderCompositeKeys, so
+// the two paths cannot drift into two different orders. It is named for
+// the PAIRING rather than for the scalar keys it started out serving:
+// every declinable key type reaches it too.
 //
 // The receivers are POINTERS so Less and Swap do not copy slice headers
 // on every call of a sort's inner loop.
-type scalarOrder struct {
+type pairedOrder struct {
 	keys []reflect.Value
 	vals []reflect.Value
 	cmp  func(a, b reflect.Value) int
 }
 
-func (s *scalarOrder) Len() int { return len(s.keys) }
+func (s *pairedOrder) Len() int { return len(s.keys) }
 
-func (s *scalarOrder) Less(i, j int) bool { return s.cmp(s.keys[i], s.keys[j]) < 0 }
+func (s *pairedOrder) Less(i, j int) bool { return s.cmp(s.keys[i], s.keys[j]) < 0 }
 
-func (s *scalarOrder) Swap(i, j int) {
+func (s *pairedOrder) Swap(i, j int) {
 	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
 	s.vals[i], s.vals[j] = s.vals[j], s.vals[i]
 }
