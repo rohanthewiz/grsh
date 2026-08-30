@@ -43,3 +43,14 @@ func (u *UnitLog) Submit(src string, sess *runner.Session, outW, errW io.Writer)
 
 // Units returns the units submitted so far, oldest first.
 func (u *UnitLog) Units() []string { return u.h.Units() }
+
+// UserMessage renders an eval error the way loop prints it — the concise
+// one-liner plus, when the interpreter reported a column, the offending
+// source line with a caret under it.
+//
+// It is exported for the same reason Submit is: a host that feeds units
+// programmatically should report a failure in the words the prompt would
+// have used. runner.UserMessage alone is not that — it stops at the text,
+// and the caret block is the half that tells a student WHERE they went
+// wrong, which is most of the value in a tutorial.
+func UserMessage(src string, err error) string { return userMsg(src, err) }

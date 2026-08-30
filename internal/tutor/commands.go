@@ -123,7 +123,7 @@ func (e *engine) cmdSolution(w io.Writer, _ string) {
 	fmt.Fprintf(w, "   %s\n", e.st.dim("run it to move on, or :skip past this step."))
 	// Every hint is now moot; marking them revealed keeps :hint honest
 	// about having nothing further to offer.
-	e.revealed = len(step.Hints)
+	e.revealed, e.answered = len(step.Hints), true
 }
 
 // cmdSkip abandons the current step. The step is not marked passed —
@@ -147,7 +147,7 @@ func (e *engine) cmdBack(w io.Writer, _ string) {
 		return
 	}
 	e.idx--
-	e.attempts, e.revealed, e.posted = 0, 0, false
+	e.attempts, e.revealed, e.posted, e.answered = 0, 0, false, false
 	// Stepping back out of the outro un-finishes the lesson, or Done
 	// would end the session at the next prompt.
 	e.finished = false

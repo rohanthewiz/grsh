@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grsh tour</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header class="bar">
+  <span class="brand">grsh <span class="brand-dim">tour</span></span>
+  <span class="dir" id="dir"></span>
+  <span class="spacer"></span>
+  <button class="ghost" id="stop" title="send SIGINT to the running command">stop</button>
+  <button class="ghost" id="reset" title="throw the playground away and start over">reset</button>
+</header>
+
+<main>
+  <!-- The terminal. Everything the engine and the shell print, in the
+       order they printed it, escape codes and all. -->
+  <section class="term" id="term">
+    <pre id="transcript" aria-live="polite"></pre>
+    <div class="prompt">
+      <span class="marker" id="marker">&#9656;</span>
+      <input id="line" autocomplete="off" autocapitalize="off" spellcheck="false"
+             autofocus aria-label="grsh input">
+    </div>
+    <div class="lane" id="lane"></div>
+  </section>
+
+  <!-- The lesson. Drawn from the View, never scraped from the transcript. -->
+  <aside class="side">
+    <ol class="toc" id="toc"></ol>
+    <div class="step" id="step">
+      <div class="step-head">
+        <span class="step-title" id="stepTitle"></span>
+        <span class="counter" id="counter"></span>
+      </div>
+      <div class="prose" id="prose"></div>
+      <pre class="try" id="try" hidden></pre>
+      <div class="hints" id="hints"></div>
+      <div class="actions">
+        <button id="btnTry" hidden>use it</button>
+        <button id="btnHint">hint</button>
+        <button id="btnSol">answer</button>
+        <button id="btnSkip">skip</button>
+        <button id="btnNext">next chapter</button>
+        <button id="btnKeep" hidden>keep the file</button>
+      </div>
+      <p class="note" id="note"></p>
+    </div>
+  </aside>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -10,9 +10,13 @@ conveniences live (highlighting, ghost text, breadcrumb, hint line), while a
 lesson engine sits around the loop: it prints a lesson panel before the
 prompt, watches what the user evaluates, grades the result, and advances.
 
-The alternative — a web-based tour embedding `grsh.NewSession` behind rweb —
-is deferred to an optional later phase, since the embedding API makes it
-nearly free once the lesson engine exists.
+A web-based tour behind rweb was deferred to an optional later phase on the
+theory that the embedding API would make it nearly free. Phase 5 built it,
+and the theory was half right: the transport was cheap, but the engine had
+to grow a host-facing driver (`tutor.Driver`) and a data view of its state
+(`tutor.View`) first, and it went through `runner.Session` rather than the
+public embedding API — the verifiers grade through read-only surfaces the
+public API does not expose.
 
 Why in-REPL: the product's whole pitch is "interactive work and scripts are
 the same language." Teaching in the real REPL means every convenience (the
@@ -27,12 +31,21 @@ grsh tutor [chapter]                       (cmd/grsh — same dispatch style as 
    ▼
 internal/tutor/
   tutor.go      engine: step state machine, wraps the REPL loop
+  drive.go      Driver: the same engine for a host with no line editor
+  view.go       View: the engine's state as data, for a non-text surface
   lesson.go     Lesson / Step types + loader
   verify.go     verifier implementations (output, status, var, file, classify)
   sandbox.go    playground dir with fixture files; cd in, clean up on exit
   progress.go   resume support
   content/      go:embed'ed lesson files (01-shell.md … 08-scripts.md)
   content_test.go  every step's canned solution must pass its own verifier
+
+internal/tour/   (Phase 5)
+  tour.go       rweb server: routes, visitor sessions, the loopback guard
+  visitor.go    one student: a Driver, a lock, an output stream
+  sink.go       the transcript: io.Writer in, SSE + bounded replay out
+  assets/       index.html / app.css / app.js — the page draws both surfaces
+cmd/grsh-tour/  its own binary, so the shell links no web framework
 ```
 
 Four integration seams, all small:
@@ -271,9 +284,45 @@ progress must never cost a student their lesson.
    `:next`s into a live chapter 2, and `TestTutorResumesEndToEnd` runs
    two processes over one `$HOME` to prove the record survives the
    first. README has the section.
-5. *(Optional, later)* **Web tour** — rweb server + `grsh.NewSession` per
-   visitor with the same lesson files; the embedding API's
-   `Interrupt`/`Kill` and writer-based IO were built for exactly this.
+5. ~~**Web tour**~~ — **done (2026-08-30).** The same eight chapters in a
+   browser, with no second copy of anything: the lesson engine was never
+   really coupled to the REPL, it was coupled to four hooks around an
+   input unit, so a second host only had to call them. `tutor.Driver` is
+   that host-facing driver — it reproduces repl.loop's call sites
+   (notifications, `Done`, `BeforePrompt`, the continuation buffer,
+   `Command` ahead of everything, `repl.UnitLog.Submit`, `AfterEval`)
+   for a host that has no line editor, and `tutor.View` hands out the
+   engine's state as data so a sidebar can render the lesson instead of
+   scraping it back out of the transcript. `internal/tour` is rweb over
+   that: `POST /input` takes a line, an SSE stream carries `out` (the
+   shell's bytes, escape codes intact, rendered to spans in the page)
+   and `state` (the View as JSON). The step panel is routed to
+   io.Discard because the sidebar already says it; the ticks, hints and
+   outro stay inline where they belong.
+   Deviations from the sketch: it is a SEPARATE BINARY (`cmd/grsh-tour`)
+   rather than a `grsh tour` subcommand — reaching rweb from grsh's main
+   would link a web framework into every copy of the shell — and it uses
+   `runner.Session` directly rather than the public `grsh.NewSession`,
+   because the verifiers grade through read-only surfaces
+   (`VarInfo`, `LastStatus`, `Preview`) that the embedding API does not
+   expose. Chapter 2 keeps its lesson: `--explain`'s hint lane has no
+   prompt to live in, so `Driver.Classify` hands the verdict to the page
+   and it appears under the input as you type.
+   The hard constraint is documented rather than papered over: a grsh
+   session's cwd IS the process's cwd, so drivers take turns under one
+   eval gate that re-enters each student's playground. That serves a few
+   tabs on one machine, and one student's `sleep 30` delays another's
+   next command. It binds to loopback and refuses more without
+   `-allow-remote`, since it runs shell commands as the user.
+   Three bugs found by running it that no Go test could have caught
+   alone, all now pinned: rweb labels SSE responses `Content-Encoding:
+   text/plain` (a media type where a content coding belongs), which Go's
+   http client ignores and every browser treats as an undecodable body —
+   headers arrived, events never did; rweb's `Run` installs its own
+   SIGTERM handler and returns, so a second handler in main raced it and
+   lost, leaking a playground per Ctrl+C; and the table of contents
+   ticked off every chapter *before* the current one, congratulating a
+   student who had jumped for work they never did.
 
 ## Risks / open questions
 

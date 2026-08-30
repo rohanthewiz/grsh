@@ -124,6 +124,16 @@ func (d *dbStore) Save(r Record) error {
 
 func (d *dbStore) Close() error { return d.e.Close() }
 
+// OpenStore opens the shared progress database for a host outside this
+// package. It never fails, for the same reason openStore does not: losing
+// progress must never cost anyone their lesson.
+//
+// The database is a single file with a single writer, so a host that holds
+// one open for a long time — a tour server, say — takes resume away from
+// `grsh tutor` for as long as it runs. That is a decision for the host to
+// make deliberately, which is why this is a call and not a default.
+func OpenStore() Store { return openStore(progressPath()) }
+
 // progressPath returns ~/.grsh_tutor.db, matching the ~/.grsh_history and
 // ~/.grsh_units conventions already in the codebase, or "" (no
 // persistence) when the home directory is unknown.

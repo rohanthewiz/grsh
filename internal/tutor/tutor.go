@@ -51,10 +51,19 @@ type engine struct {
 	// that interleaved across two sinks would reorder unpredictably when
 	// one of them is a buffer (as in tests) and the other a terminal.
 	out io.Writer
+	// panels, when non-nil, takes the step panel instead of out. Only the
+	// web host (internal/tour) sets it, to io.Discard: that host renders
+	// the step as HTML beside the transcript from View, so printing the
+	// same prose into the transcript as well would say everything twice.
+	// Everything else the engine prints — ticks, hints, the outro — is a
+	// response to something the student just did and belongs in the
+	// transcript, so only the panel is separable.
+	panels io.Writer
 
 	idx      int  // index of the current step
 	attempts int  // failed attempts at the current step
 	revealed int  // hints already shown for the current step
+	answered bool // has this step's solution been shown, by :sol or by misses?
 	posted   bool // has the current step's panel been printed?
 	skipped  int  // steps left behind with :skip, reported by :progress
 
@@ -127,7 +136,16 @@ func (e *engine) BeforePrompt(io.Writer) {
 		return
 	}
 	e.posted = true
-	e.printPanel(e.out, step)
+	e.printPanel(e.panelSink(), step)
+}
+
+// panelSink is where the step panel goes: the engine's own writer unless a
+// host has claimed the panel for a surface of its own.
+func (e *engine) panelSink() io.Writer {
+	if e.panels != nil {
+		return e.panels
+	}
+	return e.out
 }
 
 // AfterEval grades one completed input unit and advances, or nudges.
@@ -190,7 +208,7 @@ func (e *engine) pass(w io.Writer) {
 // counters are reset in exactly one place, and so is the progress write.
 func (e *engine) advance(w io.Writer) {
 	e.idx++
-	e.attempts, e.revealed, e.posted = 0, 0, false
+	e.attempts, e.revealed, e.posted, e.answered = 0, 0, false, false
 	if e.idx >= len(e.lesson.Steps) {
 		e.finished = true
 		e.printOutro(w)
@@ -235,6 +253,7 @@ func (e *engine) miss(w io.Writer, step *Step) {
 		e.revealed++
 	case step.Solution != "":
 		fmt.Fprintf(w, "   %s %s\n", e.st.label("answer:"), e.st.code(step.Solution))
+		e.answered = true
 	}
 }
 
@@ -387,22 +406,87 @@ func Run(version string, args []string, out, errOut io.Writer) int {
 //     must be reproducible, and someone else's alias for `ls` breaking
 //     step 1 would be a bad first impression of the language.
 func (t *tutor) chapter(idx int, first, resumed bool) (code, next int) {
-	l := t.all[idx]
-
-	// The playground comes first: it chdir's the process, and every
-	// later decision (what `ls` shows, where a `file` verifier looks) is
-	// relative to it.
-	box, err := newSandbox()
+	ch, err := newChapter(t.all, idx, chapterOpts{
+		// The session's two streams stay separate before the tee, so a
+		// student's stderr still goes to stderr — the tutor grades a copy,
+		// it does not reroute the shell.
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+		Chrome: t.out,
+		Color:  t.color,
+		Store:  t.store,
+	})
 	if err != nil {
 		fmt.Fprintf(t.errOut, "grsh tutor: could not build the playground: %v\n", err)
 		return 2, -1
+	}
+	t.printIntro(ch.e, ch.box.dir, first, resumed)
+
+	code = repl.RunOptions(ch.sess, repl.Options{
+		Version:     t.version,
+		NoRC:        true,
+		Quiet:       true,
+		Ephemeral:   true,
+		Interceptor: ch.e,
+	})
+	// Teardown is explicit rather than deferred, so a panic leaves the
+	// playground on disk: the fixtures plus whatever the student's last
+	// command wrote are the whole reproduction for a crash report.
+	ch.box.cleanup()
+	return code, ch.e.jump
+}
+
+// chapterOpts is how a host asks for a chapter. Everything in it is a
+// property of the host's surface — where the shell's output goes, whether
+// escape codes are wanted, whether a terminal is even involved — and
+// nothing in it is a property of the lesson.
+type chapterOpts struct {
+	Stdout, Stderr io.Writer // the session's streams, before the capture tee
+	Chrome         io.Writer // the engine's own output: panels, ticks, hints
+	Panels         io.Writer // panels only, when the host renders them itself
+	Color          bool
+	Width          int  // 0 asks the terminal
+	Embedded       bool // no tty handoff; foreground pipelines get their own pgroup
+	Store          Store
+}
+
+// chapterRun is one assembled chapter: the four objects that are built
+// together, live exactly as long as each other, and are thrown away
+// together when the student moves on.
+type chapterRun struct {
+	box  *sandbox
+	sess *runner.Session
+	cap  *capture
+	e    *engine
+}
+
+// newChapter builds a chapter's playground, session and engine and wires
+// them to each other.
+//
+// Both hosts come through here — the terminal tutor above and the headless
+// Driver in drive.go — so how a chapter is assembled cannot change for one
+// and quietly stay the same for the other. Three choices live in this
+// function rather than in either host:
+//
+//   - The playground comes FIRST, because it chdir's the process and every
+//     later decision (what `ls` shows, where a `file` verifier looks) is
+//     relative to it.
+//   - The session's streams are teed into a capture. The student sees the
+//     output exactly as usual; the engine keeps the copy it grades.
+//   - The student's saved place is restored, hint escalation included.
+func newChapter(all []Lesson, idx int, o chapterOpts) (*chapterRun, error) {
+	l := all[idx]
+	box, err := newSandbox()
+	if err != nil {
+		return nil, err
 	}
 
 	cap := newCapture(64 << 10)
 	opts := runner.Options{
 		ScriptName: "grsh",
-		Stdout:     io.MultiWriter(os.Stdout, cap),
-		Stderr:     io.MultiWriter(os.Stderr, cap),
+		Stdout:     io.MultiWriter(o.Stdout, cap),
+		Stderr:     io.MultiWriter(o.Stderr, cap),
+		Embedded:   o.Embedded,
 	}
 	if l.Explain {
 		// io.Discard, not a real writer: --explain has two halves, a line
@@ -416,30 +500,25 @@ func (t *tutor) chapter(idx int, first, resumed bool) (code, next int) {
 	}
 	sess := runner.NewSession(opts)
 
-	e := newEngine(l, sess, cap, t.out, t.color)
-	e.chapters, e.chIdx, e.dir, e.store = t.all, idx, box.dir, t.store
-
-	rec, found := t.store.Load(l.ID)
-	e.idx = resumeAt(l, rec, found)
-	if e.idx > 0 {
-		// Hint state resumes too: a student who quit stuck on step 4 comes
-		// back to the hint they had already earned, not to silence.
-		e.attempts, e.revealed = rec.Attempts, rec.Revealed
+	e := newEngine(l, sess, cap, o.Chrome, o.Color)
+	e.chapters, e.chIdx, e.dir, e.store = all, idx, box.dir, o.Store
+	e.panels, e.width = o.Panels, o.Width
+	if o.Store == nil {
+		// A host may leave the store out entirely; the engine's own guard
+		// expects a nil interface, not a nil-valued one.
+		e.store = nil
 	}
-	t.printIntro(e, box.dir, first, resumed)
 
-	code = repl.RunOptions(sess, repl.Options{
-		Version:     t.version,
-		NoRC:        true,
-		Quiet:       true,
-		Ephemeral:   true,
-		Interceptor: e,
-	})
-	// Teardown is explicit rather than deferred, so a panic leaves the
-	// playground on disk: the fixtures plus whatever the student's last
-	// command wrote are the whole reproduction for a crash report.
-	box.cleanup()
-	return code, e.jump
+	if o.Store != nil {
+		rec, found := o.Store.Load(l.ID)
+		e.idx = resumeAt(l, rec, found)
+		if e.idx > 0 {
+			// Hint state resumes too: a student who quit stuck on step 4
+			// comes back to the hint they had already earned, not to silence.
+			e.attempts, e.revealed = rec.Attempts, rec.Revealed
+		}
+	}
+	return &chapterRun{box: box, sess: sess, cap: cap, e: e}, nil
 }
 
 // resumeChapter picks the chapter that bare `grsh tutor` opens.

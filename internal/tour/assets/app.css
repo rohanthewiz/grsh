@@ -1,0 +1,233 @@
+/* The tour's two surfaces: a terminal that behaves like one, and a panel
+   that behaves like a page. They are styled to look like different kinds
+   of thing on purpose — the left is where you work, the right is what you
+   are being asked to do, and blurring them would leave a student unsure
+   which half was the shell. */
+
+:root {
+  --bg: #14161a;
+  --bg-side: #1a1d23;
+  --bg-input: #101215;
+  --line: #2a2f38;
+  --fg: #d8dee9;
+  --fg-dim: #7d8698;
+  --accent: #6cb6ff;
+  --ok: #7ec97e;
+  --warn: #e0c060;
+  --code: #67d9d3;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 var(--mono);
+}
+
+/* The two rows are the bar and everything else. Flex rather than a
+   calc() against the bar's height: the bar is sized by its own content,
+   and a subtracted constant is wrong the moment anything in it changes
+   font. min-height:0 is what lets the panes scroll instead of the page. */
+body { display: flex; flex-direction: column; }
+
+/* ── top bar ─────────────────────────────────────────────────────── */
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-side);
+}
+.brand { font-weight: 600; letter-spacing: .02em; }
+.brand-dim { color: var(--fg-dim); font-weight: 400; }
+.dir {
+  color: var(--fg-dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46vw;
+}
+.spacer { flex: 1; }
+
+button {
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  background: #262b34;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .35; cursor: default; }
+button.ghost { background: transparent; }
+
+/* ── layout ──────────────────────────────────────────────────────── */
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 27rem;
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; grid-template-rows: 1fr minmax(0, 45vh); }
+  .side { border-left: none; border-top: 1px solid var(--line); }
+}
+
+/* ── the terminal ────────────────────────────────────────────────── */
+
+.term {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 12px 14px 8px;
+  overflow: hidden;
+}
+
+#transcript {
+  flex: 1;
+  margin: 0;
+  overflow-y: auto;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+}
+
+.prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.prompt:focus-within { border-color: var(--accent); }
+.marker { color: var(--accent); }
+#line {
+  flex: 1;
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 0;
+  outline: none;
+}
+#line:disabled { color: var(--fg-dim); }
+
+/* The classifier lane: the browser's stand-in for the prompt's hint line,
+   shown only in the chapter that teaches classification. */
+.lane {
+  min-height: 1.5em;
+  padding: 2px 4px;
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+.lane .verdict { color: var(--code); }
+
+/* ── the lesson ──────────────────────────────────────────────────── */
+
+.side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg-side);
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+.toc {
+  margin: 0;
+  padding: 10px 0;
+  list-style: none;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+}
+.toc li {
+  display: flex;
+  gap: 8px;
+  padding: 4px 14px;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.toc li:hover { color: var(--fg); background: #21252c; }
+.toc li .n { width: 1.2em; text-align: right; opacity: .7; }
+.toc li.here { color: var(--fg); }
+.toc li.here .n { color: var(--accent); opacity: 1; }
+/* The tick goes after the title, not over the number: a chapter can be
+   both finished and the one you are standing in, and replacing the number
+   would take the "you are here" marker away exactly then. */
+.toc li.done > span:last-child::after { content: " \2713"; color: var(--ok); }
+
+.step { padding: 14px; }
+.step-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.step-title { font-weight: 600; }
+.counter { color: var(--fg-dim); font-size: 12px; margin-left: auto; }
+
+.prose { line-height: 1.6; }
+.prose p { margin: 0 0 .7em; }
+.prose code, .try, .hints code {
+  color: var(--code);
+  font-family: var(--mono);
+}
+.prose strong { color: var(--fg); font-weight: 600; }
+
+.try {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  border-radius: 4px;
+  color: var(--code);
+  white-space: pre-wrap;
+  overflow-x: auto;
+  font: inherit;
+}
+
+.hints { margin-bottom: 12px; }
+.hint {
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border-left: 2px solid var(--warn);
+  background: #1e2027;
+  font-size: 13px;
+}
+.hint.answer { border-left-color: var(--ok); color: var(--code); }
+
+.actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.note {
+  margin: 12px 0 0;
+  color: var(--fg-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ── ANSI ────────────────────────────────────────────────────────── */
+
+.b  { font-weight: 600; }
+.d  { color: var(--fg-dim); }
+.f31 { color: #e88388; }
+.f32 { color: var(--ok); }
+.f33 { color: var(--warn); }
+.f34 { color: var(--accent); }
+.f35 { color: #d3a0e0; }
+.f36 { color: var(--code); }
+.f37 { color: var(--fg); }

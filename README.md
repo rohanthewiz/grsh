@@ -38,7 +38,8 @@ execution. v2 has begun with the interactive REPL.
   Piped stdin runs as a script: `echo 'ls | wc -l' | grsh`.
 - **`grsh tutor`** (new in v2) — an interactive tutorial that runs
   *inside* the real REPL: eight chapters, 47 graded steps, in a
-  throwaway playground. See [below](#learn-it-at-the-prompt-grsh-tutor).
+  throwaway playground. `grsh-tour` serves the same curriculum in a
+  browser. See [below](#learn-it-at-the-prompt-grsh-tutor).
 - **Interactive conveniences** (new) —
   `~/.grshrc` startup file (mix shell and Go; `$GRSH_RC` overrides,
   `-norc` skips); `grsh init` translates your `~/.zshrc` into a
@@ -135,6 +136,33 @@ shadow something you meant to run:
 :keep   :progress   :help   :quit
 ```
 
+### The same tutorial in a browser: `grsh-tour`
+
+```
+go build -o bin/grsh-tour ./cmd/grsh-tour
+./bin/grsh-tour              # http://127.0.0.1:7654, opens a browser
+./bin/grsh-tour -progress    # remember where you got to
+```
+
+The same eight chapters, the same verifiers, the same real shell — with
+the terminal replaced by a page: a transcript on the left, the lesson on
+the right. The commands are real, the playground is a real directory,
+and every tutor command still works by typing it; the sidebar's buttons
+are a convenience for the common ones. Chapter 2's classifier verdict,
+which the terminal shows in the prompt's hint lane, appears under the
+input as you type.
+
+It is a **local tool**. The server runs shell commands as you, so it
+binds to loopback and refuses anything else without `-allow-remote`, and
+that is a reminder rather than a boundary — do not put it on a network.
+Each tab gets its own playground; they take turns to evaluate, because a
+grsh session's working directory is the process's, so this suits a few
+tabs on one machine and nothing larger. Ctrl+C removes the playgrounds.
+
+It is a separate binary on purpose: the tour needs an HTTP server and an
+HTML page, the shell needs neither, and `grsh` stays free of a web
+framework it would never load.
+
 ## How a line is classified
 
 Deterministic rules, in order — see `internal/classify`:
@@ -168,11 +196,16 @@ Run any script with `--explain` to see each line's decision and rule.
 
 ```
 go build -o bin/grsh ./cmd/grsh
+go build -o bin/grsh-tour ./cmd/grsh-tour   # the browser tutorial
 go test ./...
 
 ./bin/grsh script.grsh [args...]
 ./bin/grsh -c "ls | wc -l"
 ```
+
+`go test ./...` caches per package, and the pty and tour tests build or
+serve things the change may be in — use `-count=1` when a change to
+`internal/tutor` or `internal/tour` needs to reach them.
 
 ## Embedding
 
