@@ -18,6 +18,7 @@ import (
 	"github.com/rohanthewiz/grsh/internal/repl"
 	"github.com/rohanthewiz/grsh/internal/runner"
 	"github.com/rohanthewiz/grsh/internal/shellexec"
+	"github.com/rohanthewiz/grsh/internal/tutor"
 	"github.com/rohanthewiz/grsh/internal/zshimport"
 	"github.com/rohanthewiz/logger"
 	"golang.org/x/term"
@@ -34,7 +35,7 @@ func main() {
 		flagNoRC    = flag.Bool("norc", false, "skip ~/.grshrc at interactive startup")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: grsh [flags] script.grsh [args...]\n   or: grsh -c \"commands\"\n   or: grsh                (interactive; reads stdin when piped)\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "usage: grsh [flags] script.grsh [args...]\n   or: grsh -c \"commands\"\n   or: grsh                (interactive; reads stdin when piped)\n   or: grsh tutor [chapter] (interactive tutorial)\n\nFlags:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -49,9 +50,16 @@ func main() {
 		explain = os.Stderr
 	}
 
-	// `grsh init` translates the user's zsh startup files into ~/.grshrc.
-	if flag.NArg() > 0 && flag.Arg(0) == "init" {
-		os.Exit(zshimport.Run(os.Stdout, os.Stderr))
+	// Subcommands are dispatched before any session is built: each one
+	// owns its own session setup (the tutor tees the session's output so
+	// it can grade what a step printed).
+	if flag.NArg() > 0 {
+		switch flag.Arg(0) {
+		case "init": // translate the user's zsh startup files into ~/.grshrc
+			os.Exit(zshimport.Run(os.Stdout, os.Stderr))
+		case "tutor": // interactive, in-REPL tutorial
+			os.Exit(tutor.Run(version, flag.Args()[1:], os.Stdout, os.Stderr))
+		}
 	}
 
 	var err error

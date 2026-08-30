@@ -38,10 +38,17 @@ func (f *fakeReader) SetPrompt(p string) { f.prompts = append(f.prompts, p) }
 
 func run(t *testing.T, steps ...step) (stdout, stderr string, code int, prompts []string) {
 	t.Helper()
+	return runIntercepted(t, nil, steps...)
+}
+
+// runIntercepted is run with a loop Interceptor attached (nil = plain REPL),
+// so the tutor seam is exercised by the same scripted-reader harness.
+func runIntercepted(t *testing.T, ic Interceptor, steps ...step) (stdout, stderr string, code int, prompts []string) {
+	t.Helper()
 	var out, errB bytes.Buffer
 	sess := runner.NewSession(runner.Options{Stdout: &out, Stderr: &errB, ScriptName: "repl"})
 	rd := &fakeReader{steps: steps}
-	code = loop(sess, rd, &out, &errB, openHistory(""))
+	code = loop(sess, rd, &out, &errB, openHistory(""), ic)
 	return out.String(), errB.String(), code, rd.prompts
 }
 
@@ -296,5 +303,134 @@ func TestLoopStatePersistsAcrossInputs(t *testing.T) {
 	}
 	if stdout != "3\n" {
 		t.Errorf("stdout %q, want 3", stdout)
+	}
+}
+
+// stubInterceptor records the loop's hook calls in order so the seam's
+// contract can be asserted: one BeforePrompt per input *unit* (not per
+// continuation line), one AfterEval per evaluated unit, and Done polled
+// before each panel.
+type stubInterceptor struct {
+	calls    []string
+	evals    []string
+	errs     []error
+	stopAt   int // stop the loop once this many AfterEvals have run (0 = never)
+	stopCode int
+	nEvals   int
+}
+
+func (s *stubInterceptor) BeforePrompt(w io.Writer) {
+	s.calls = append(s.calls, "before")
+	io.WriteString(w, "[panel]\n")
+}
+
+func (s *stubInterceptor) AfterEval(src string, err error) {
+	s.calls = append(s.calls, "after")
+	s.evals = append(s.evals, src)
+	s.errs = append(s.errs, err)
+	s.nEvals++
+}
+
+func (s *stubInterceptor) Done() (int, bool) {
+	s.calls = append(s.calls, "done")
+	if s.stopAt > 0 && s.nEvals >= s.stopAt {
+		return s.stopCode, true
+	}
+	return 0, false
+}
+
+// TestInterceptorUnitGranularity: a four-line multi-line block is ONE
+// unit, so the tutor sees one panel and one grade — not four of each.
+func TestInterceptorUnitGranularity(t *testing.T) {
+	ic := &stubInterceptor{}
+	stdout, stderr, code, _ := runIntercepted(t, ic,
+		step{line: "x := 41"},
+		step{line: "if x > 40 {"},
+		step{line: `fmt.Println("big")`},
+		step{line: "}"},
+	)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	// 2 units in, 2 units evaluated.
+	if got := len(ic.evals); got != 2 {
+		t.Fatalf("AfterEval called %d times, want 2: %q", got, ic.evals)
+	}
+	if want := "if x > 40 {\nfmt.Println(\"big\")\n}"; ic.evals[1] != want {
+		t.Errorf("second unit = %q, want %q", ic.evals[1], want)
+	}
+	// The panel must not repeat on continuation lines: two units plus the
+	// final prompt the loop offers before hitting EOF. (The tutor itself
+	// prints a panel once per *step*, so extra BeforePrompts are no-ops
+	// there — what matters is that continuation lines produce none.)
+	if n := strings.Count(stdout, "[panel]"); n != 3 {
+		t.Errorf("panel printed %d times, want 3 (2 units + the final prompt)\n%s", n, stdout)
+	}
+	// Every unit is preceded by Done then BeforePrompt.
+	want := []string{"done", "before", "after", "done", "before", "after", "done", "before"}
+	if strings.Join(ic.calls, ",") != strings.Join(want, ",") {
+		t.Errorf("hook order = %v, want %v", ic.calls, want)
+	}
+}
+
+// TestInterceptorSeesEvalError: a failing unit still reaches AfterEval,
+// carrying the error, so a verifier can grade "this was supposed to fail".
+func TestInterceptorSeesEvalError(t *testing.T) {
+	ic := &stubInterceptor{}
+	_, _, _, _ = runIntercepted(t, ic, step{line: "nope := undefinedThing"})
+	if len(ic.errs) != 1 {
+		t.Fatalf("AfterEval called %d times, want 1", len(ic.errs))
+	}
+	if ic.errs[0] == nil {
+		t.Error("AfterEval got a nil error for a failing unit")
+	}
+}
+
+// TestInterceptorGradesReplCommands: `?name` never reaches Eval, but it
+// is still a completed unit a lesson step can be built on.
+func TestInterceptorGradesReplCommands(t *testing.T) {
+	ic := &stubInterceptor{}
+	_, _, _, _ = runIntercepted(t, ic,
+		step{line: "xs := []string{\"a\"}"},
+		step{line: "?xs"},
+	)
+	if len(ic.evals) != 2 || ic.evals[1] != "?xs" {
+		t.Fatalf("evals = %q, want the ?xs unit graded too", ic.evals)
+	}
+	if ic.errs[1] != nil {
+		t.Errorf("repl command reported error %v, want nil", ic.errs[1])
+	}
+}
+
+// TestInterceptorDoneEndsLoop: Done ends the session with its code even
+// though the scripted reader still has lines queued.
+func TestInterceptorDoneEndsLoop(t *testing.T) {
+	ic := &stubInterceptor{stopAt: 1, stopCode: 7}
+	_, _, code, _ := runIntercepted(t, ic,
+		step{line: "echo one"},
+		step{line: "echo two"},
+	)
+	if code != 7 {
+		t.Fatalf("exit %d, want 7 (Done's code)", code)
+	}
+	if len(ic.evals) != 1 {
+		t.Errorf("evals = %q, want only the first unit", ic.evals)
+	}
+}
+
+// TestInterceptorCtrlCDropsUnit: ^C mid-continuation abandons the unit
+// without a phantom grade, and the next unit gets a fresh panel.
+func TestInterceptorCtrlCDropsUnit(t *testing.T) {
+	ic := &stubInterceptor{}
+	_, _, _, _ = runIntercepted(t, ic,
+		step{line: "if true {"},
+		step{line: "", err: errInterrupt},
+		step{line: "echo after"},
+	)
+	if len(ic.evals) != 1 || ic.evals[0] != "echo after" {
+		t.Fatalf("evals = %q, want only the post-interrupt unit", ic.evals)
+	}
+	if n := strings.Count(strings.Join(ic.calls, ","), "before"); n != 3 {
+		t.Errorf("BeforePrompt fired %d times, want 3 (initial, post-^C, post-eval)", n)
 	}
 }

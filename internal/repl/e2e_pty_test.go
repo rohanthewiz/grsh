@@ -512,3 +512,52 @@ func TestReefExplainHintEndToEnd(t *testing.T) {
 		t.Fatalf("exit: %v", err)
 	}
 }
+
+// TestTutorEndToEnd drives `grsh tutor` through the real binary on a real
+// pty — the Phase-1 proof that the interceptor seam, the output tee, and
+// the verifiers work together at an actual prompt rather than only in
+// unit tests. It walks the demo lesson: a miss (which must NOT advance),
+// then the three correct answers, then the completion banner and a clean
+// exit without the user typing anything to leave.
+func TestTutorEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	p := startShellArgs(t, []string{"tutor"})
+
+	p.waitFor("grsh tutor")           // intro
+	p.waitFor("A three-step tour")    // step 1 panel
+	p.waitFor("Print the word hello") // step 1 task
+	p.waitFor("grsh ")                // the real prompt, not a simulation
+
+	// A wrong answer is graded as a miss and the step must NOT advance:
+	// the shell really ran the command, it just isn't the exercise.
+	p.send("printf 'good%s\\n' bye\r")
+	p.waitFor("goodbye")   // the user's command really ran
+	p.waitFor("not quite") // ...and was graded a miss
+	p.send("echo hello\r") //
+	p.waitFor("nice")      // step 1 passes
+	p.waitFor("Print 42")  // step 2 panel followed immediately
+	p.send("fmt.Println(6*7)\r")
+	p.waitFor("nice")
+	p.waitFor("capture `echo bridge`") // step 3 panel
+
+	// The bridge: $(...) captured into Go, printed through fmt. This is
+	// the step that proves the tee sees output produced by a child
+	// process reached through a Go expression.
+	p.send("fmt.Println($(echo bridge))\r")
+	p.waitFor("nice")
+	p.waitFor("Lesson complete.")
+
+	// The lesson ends the loop itself — no ^D needed.
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("tutor exited with %v, want 0", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tutor did not exit after the lesson completed")
+	}
+}

@@ -46,19 +46,61 @@ func (c chzyerReader) Readline() (string, error) {
 	return line, err
 }
 
+// Interceptor lets a host wrap the input loop without forking it. The
+// loop's continuation/Ctrl-C/EOF logic is subtle and already correct, so
+// the tutorial engine (internal/tutor) rides along on these three hooks
+// instead of reimplementing it:
+//
+//	BeforePrompt  once per *input unit* (not per continuation line) —
+//	              print a lesson panel, reset an output capture buffer.
+//	AfterEval     once per evaluated unit, after the loop has reported
+//	              any error — grade the attempt and advance.
+//	Done          polled at the top of each iteration so the interceptor
+//	              can end the session itself (lesson complete, :quit).
+//
+// A nil Interceptor is the normal REPL: every hook site is guarded.
+type Interceptor interface {
+	BeforePrompt(w io.Writer)
+	AfterEval(src string, err error)
+	Done() (code int, done bool)
+}
+
+// Options tunes an interactive run. The zero value plus a version string
+// is the plain REPL; the tutor sets Interceptor and suppresses the
+// banner and on-disk history so a lesson never pollutes ~/.grsh_units.
+type Options struct {
+	Version     string
+	NoRC        bool
+	Interceptor Interceptor // nil for the normal REPL
+	Quiet       bool        // suppress the startup banner
+	Ephemeral   bool        // keep history in memory only
+}
+
 // Run drives the interactive session and returns the process exit code.
 func Run(sess *runner.Session, version string, noRC bool) int {
+	return RunOptions(sess, Options{Version: version, NoRC: noRC})
+}
+
+// RunOptions is Run with the knobs exposed. Both entry points share one
+// body so the tutor exercises exactly the code path a real user gets.
+func RunOptions(sess *runner.Session, opt Options) int {
 	// Source the startup file first, before job control is enabled — like
 	// bash, ~/.grshrc runs as plain script code. It goes through the same
 	// classifier as everything else, so it can mix shell (aliases,
 	// exports) and Go (helper functions) freely.
-	if !noRC {
+	if !opt.NoRC {
 		if code, exited := loadRC(sess, os.Stderr); exited {
 			return code
 		}
 	}
 
-	hist := openHistory(unitHistoryPath())
+	// An ephemeral store still works in memory (so `session save` remains
+	// available inside a lesson) — it just never touches the real file.
+	histPath := unitHistoryPath()
+	if opt.Ephemeral {
+		histPath = ""
+	}
+	hist := openHistory(histPath)
 	comp := newCompleter(sess.Idents)
 
 	// Editor selection: reeflective is the default; GRSH_EDITOR=legacy
@@ -110,8 +152,10 @@ func Run(sess *runner.Session, version string, noRC bool) int {
 	// SIGTTOU is ignored only around tcsetpgrp (see shellexec.tcSetpgrp).
 	sess.SetInteractive(true)
 
-	fmt.Printf("grsh %s — type exit or Ctrl+D to quit\n", version)
-	return loop(sess, rd, os.Stdout, os.Stderr, hist)
+	if !opt.Quiet {
+		fmt.Printf("grsh %s — type exit or Ctrl+D to quit\n", opt.Version)
+	}
+	return loop(sess, rd, os.Stdout, os.Stderr, hist, opt.Interceptor)
 }
 
 // legacyEditor reports whether the user asked for the chzyer editor.
@@ -123,13 +167,25 @@ func legacyEditor() bool {
 	return false
 }
 
-func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *historyStore) int {
+// loop reads input units and evaluates them. ic may be nil; when set,
+// its hooks fire at the three points documented on Interceptor. The hook
+// sites are deliberately outside the continuation/interrupt branches:
+// a lesson panel belongs to an input *unit*, not to each physical line.
+func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *historyStore, ic Interceptor) int {
 	var buf []string
 	var pend classify.PendingInfo // continuation state for the prompt
 	for {
 		if len(buf) == 0 {
 			for _, note := range sess.Notifications() {
 				fmt.Fprintln(outW, note)
+			}
+			if ic != nil {
+				// Done is polled before the panel so the last step's "✓"
+				// isn't followed by a prompt the user never wanted.
+				if code, done := ic.Done(); done {
+					return code
+				}
+				ic.BeforePrompt(outW)
 			}
 		}
 		rd.SetPrompt(promptFor(sess, len(buf) > 0, pend))
@@ -161,15 +217,27 @@ func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *histo
 			continue
 		}
 		buf, pend = buf[:0], classify.PendingInfo{}
+		// Prompt-only conveniences (`?name`, `session save`) still count as
+		// a completed unit for the interceptor — a lesson step may well be
+		// "now inspect that variable" — they just never reach Eval.
 		if replCommand(src, sess, hist, outW, errW) {
+			if ic != nil {
+				ic.AfterEval(src, nil)
+			}
 			continue
 		}
 		hist.Append(src)
-		if err := sess.Eval(src); err != nil {
+		err = sess.Eval(src)
+		if err != nil {
 			if xe, ok := errors.AsType[shellexec.ExitErr](err); ok {
 				return xe.Code // exit builtin, or errexit tripping (set -e exits the shell)
 			}
 			fmt.Fprintf(errW, "grsh: %s\n", userMsg(src, err))
+		}
+		// Graded after the error is reported, so the tutor's feedback is
+		// the last thing on screen before the next prompt.
+		if ic != nil {
+			ic.AfterEval(src, err)
 		}
 	}
 }
