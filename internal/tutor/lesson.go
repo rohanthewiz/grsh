@@ -19,10 +19,27 @@ type Step struct {
 	Verify   Verifier
 }
 
-// Lesson is one chapter: an ordered list of steps plus its display title.
+// Lesson is one chapter: an ordered list of steps plus its display title
+// and the two chapter-level knobs the engine honours.
 type Lesson struct {
 	ID    string
 	Title string
+
+	// Explain runs this chapter with the classifier's verdict live in the
+	// prompt's hint line — what `grsh --explain` turns on. Chapter 2
+	// grades the classification rules one at a time, and reading the
+	// verdict for the line you are typing is the whole lesson; asking a
+	// student to quit and relaunch with a flag to see it would be
+	// teaching the rule without the evidence.
+	Explain bool
+
+	// Keep names a playground file this chapter has the student create
+	// and which outlives the lesson (the capstone's saved script). The
+	// playground is deleted on exit, so the outro OFFERS the file via
+	// `:keep` rather than writing into the student's home unasked — a
+	// tutorial that leaves files in ~ is a surprise.
+	Keep string
+
 	Steps []Step
 }
 
@@ -101,6 +118,11 @@ func lessonID(name string) string {
 //
 // The block is dedented by its first line's indent, so the lesson file
 // stays readable while the student sees the answer at column zero.
+//
+// Two directives sit at CHAPTER level instead, anywhere in the front
+// matter before the first step — `explain: on` and `keep: report.grsh`
+// (see Lesson). They are the only keys claimed there; everything else in
+// that region stays the editor's commentary.
 func parseLesson(id, src string) (Lesson, error) {
 	l := Lesson{ID: id}
 	lines := strings.Split(src, "\n")
@@ -191,8 +213,12 @@ func parseLesson(id, src string) (Lesson, error) {
 		}
 
 		if cur == nil {
-			// Front matter and any prose between steps is commentary for
-			// whoever edits the file; the engine has no place to show it.
+			// Front matter is commentary for whoever edits the file — the
+			// engine has no place to show it — except for the handful of
+			// recognised chapter directives.
+			if err := chapterDirective(&l, line); err != nil {
+				return l, fmt.Errorf("line %d: %w", n+1, err)
+			}
 			continue
 		}
 		if inProse {
@@ -238,6 +264,40 @@ func parseLesson(id, src string) (Lesson, error) {
 		return l, fmt.Errorf("chapter has no steps")
 	}
 	return l, nil
+}
+
+// chapterDirective reads a `key: value` line from a chapter's front
+// matter — the region between the `# Title` and the first `## step:`.
+//
+// Only the two known keys are claimed, and anything else is left as the
+// commentary that region has always been. That asymmetry with the
+// step-level parser (which rejects an unknown directive) is deliberate:
+// front matter is prose written for the next editor, and a paragraph
+// that happens to contain a colon must not become a parse error that
+// takes the whole curriculum down with it.
+func chapterDirective(l *Lesson, line string) error {
+	key, val, ok := strings.Cut(line, ":")
+	if !ok {
+		return nil
+	}
+	val = strings.TrimSpace(val)
+	switch strings.TrimSpace(key) {
+	case "explain":
+		switch val {
+		case "on":
+			l.Explain = true
+		case "off":
+			l.Explain = false
+		default:
+			return fmt.Errorf("chapter directive `explain:` takes on or off, got %q", val)
+		}
+	case "keep":
+		if val == "" {
+			return fmt.Errorf("chapter directive `keep:` needs a filename")
+		}
+		l.Keep = val
+	}
+	return nil
 }
 
 // trimBlankEdges drops leading and trailing blank prose lines so the

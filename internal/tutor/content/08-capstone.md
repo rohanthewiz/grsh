@@ -7,6 +7,12 @@ without translating anything.
 Build a small report, save the session, and then run the saved script
 back through this very shell.
 
+keep: report.grsh
+
+That directive names the one file worth more than the playground: the
+outro offers it to you with `:keep` rather than writing into your home
+uninvited.
+
 ## step: count-errors
 Start the report. Count the failing requests — capture the matching
 lines and count them in Go this time, so the number is an `int` from

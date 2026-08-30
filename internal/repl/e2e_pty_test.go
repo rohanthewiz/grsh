@@ -563,9 +563,32 @@ func TestTutorEndToEnd(t *testing.T) {
 	p.send("awk '{print $1}' access.log | head -1\r")
 	p.waitFor("10.0.0.1")
 	p.waitFor("nice")
-	p.waitFor("Lesson complete.")
 
-	// The lesson ends the loop itself — no ^D needed.
+	// A finished chapter does NOT end the session while there is a next
+	// one: the outro names an action, so the prompt stays open to take it.
+	p.waitFor("Chapter 1 of 8 complete.")
+	p.waitFor("2. Two languages, one prompt")
+
+	// :next is the Phase-4 seam — a chapter switch is a teardown and a
+	// rebuild (new playground, new session, new editor), and only a real
+	// pty can prove the second chapter is as live as the first.
+	p.send(":next\r")
+	p.waitFor("Fresh playground:")
+	p.waitFor("Two languages, one prompt") // chapter 2's own panel rule
+	p.waitFor("Rule 9")
+
+	// The rebuilt session really works, and it was built the way chapter
+	// 2 asked: `explain: on` in its front matter means the hint lane
+	// names the verdict and the rule for the line being typed, BEFORE
+	// Enter — which is the chapter's whole lesson, since it grades the
+	// classification rules one at a time.
+	p.send("wc -l access.log")
+	p.waitFor("shell · rule=default")
+	p.send("\r")
+	p.waitFor("120")
+	p.waitFor("nice")
+
+	p.send(":quit\r")
 	done := make(chan error, 1)
 	go func() { done <- p.cmd.Wait() }()
 	select {
@@ -574,8 +597,43 @@ func TestTutorEndToEnd(t *testing.T) {
 			t.Fatalf("tutor exited with %v, want 0", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("tutor did not exit after the lesson completed")
+		t.Fatal("tutor did not exit after :quit")
 	}
+}
+
+// TestTutorResumesEndToEnd is the Phase-4 resume path, and it needs two
+// processes to mean anything: the record is written by one `grsh tutor`
+// and read by the next, through ~/.grsh_tutor.db in a shared $HOME.
+//
+// $HOME is overridden rather than the harness's own temp home reused,
+// because each shell gets a fresh one — which is exactly the isolation
+// that makes every other pty test independent, and exactly what a resume
+// test must undo. Cmd.Env keeps the LAST value of a repeated key, so the
+// override lands.
+func TestTutorResumesEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	home := t.TempDir()
+
+	first := startShellArgs(t, []string{"tutor"}, "HOME="+home)
+	first.waitFor("Start by looking around")
+	first.send("ls\r")
+	first.waitFor("nice")
+	first.waitFor("Count them") // step 2's panel: this is the saved place
+	first.send(":quit\r")
+	first.waitFor("your place is saved")
+	if _, err := first.cmd.Process.Wait(); err != nil {
+		t.Fatalf("first tutor: %v", err)
+	}
+
+	// A bare `grsh tutor` carries on rather than starting over: same
+	// chapter, and the step the student had reached.
+	second := startShellArgs(t, []string{"tutor"}, "HOME="+home)
+	second.waitFor("Resuming at chapter 1 (It's just a shell), step 2")
+	second.waitFor("Count them")
+	second.send(":quit\r")
+	second.waitFor("your place is saved")
 }
 
 // TestTutorMetaCommandsEndToEnd is the Phase-2 counterpart: it proves the

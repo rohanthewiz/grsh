@@ -235,8 +235,42 @@ progress must never cost a student their lesson.
    rather than writing into the student's home — a tutorial leaving files
    in `~` is a surprise, and sourcing proves the round trip in the same
    session that made it.
-4. **Polish** — resume UX, completion banner, README section, e2e/golden
-   tests.
+4. ~~**Polish**~~ — **done (2026-08-30).** The engine stopped being a
+   one-chapter program. `tutor.Run` is now a chapter LOOP: each chapter
+   gets a fresh sandbox, a fresh `runner.Session` and a fresh engine, and
+   a chapter change is a teardown and a rebuild rather than a lesson
+   swapped under a live session (which would leave a student in chapter 5
+   holding chapter 2's variables, files and cwd). That one restructure
+   closed four Phase-3 open items at once: `:next` and `:menu N` jump for
+   real (the engine records the target in `jump` and ends the loop
+   through `Done`); chapter 2 runs itself with `Explain: io.Discard`, so
+   the classification rules fire in the prompt's hint lane as the student
+   types — the writer is discarded because only that half of `--explain`
+   belongs in a lesson; and a finished chapter no longer ends the
+   session while it still has something to offer. `Done` now says so
+   directly: quit or jump end it, and a finished chapter ends it only
+   when there is no next chapter AND no keepsake file pending — an outro
+   that offers an action must leave the prompt alive to take it.
+   Resume grew from a step to a chapter: bare `grsh tutor` calls
+   `resumeChapter`, which scans the records backwards and picks the
+   FURTHEST chapter touched (a student who ran `grsh tutor 6` wants
+   chapter 6 back, not chapter 1 because they skipped the basics),
+   carrying on to the next chapter when the furthest one is finished and
+   starting over only after the last. The lesson format grew two
+   chapter-level directives in the front matter — `explain: on` and
+   `keep: report.grsh` — claimed by key so the rest of that region stays
+   the editor's commentary. `:keep` closes Phase 3's last open item: the
+   capstone's script is OFFERED at the outro and copied out on request
+   (home by default, `~` expanded, a directory argument taking the
+   file's name, never overwriting), instead of the plan's original
+   silent write into `~`. Tests: `testdata/chapter01.golden` is the
+   golden transcript (intro, panels, a miss, the earned hint, the ticks,
+   the outro; `-update` regenerates), `chapters_test.go` covers
+   navigation, the resume policy and `:keep`, and two pty runs prove the
+   seam end to end — `TestTutorEndToEnd` now finishes chapter 1 and
+   `:next`s into a live chapter 2, and `TestTutorResumesEndToEnd` runs
+   two processes over one `$HOME` to prove the record survives the
+   first. README has the section.
 5. *(Optional, later)* **Web tour** — rweb server + `grsh.NewSession` per
    visitor with the same lesson files; the embedding API's
    `Interrupt`/`Kill` and writer-based IO were built for exactly this.

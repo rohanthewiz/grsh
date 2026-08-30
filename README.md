@@ -36,6 +36,9 @@ execution. v2 has begun with the interactive REPL.
   (PATH commands, shell builtins, your identifiers, `pkg.Member`
   registry symbols, file paths), cwd-and-status prompt.
   Piped stdin runs as a script: `echo 'ls | wc -l' | grsh`.
+- **`grsh tutor`** (new in v2) — an interactive tutorial that runs
+  *inside* the real REPL: eight chapters, 47 graded steps, in a
+  throwaway playground. See [below](#learn-it-at-the-prompt-grsh-tutor).
 - **Interactive conveniences** (new) —
   `~/.grshrc` startup file (mix shell and Go; `$GRSH_RC` overrides,
   `-norc` skips); `grsh init` translates your `~/.zshrc` into a
@@ -94,6 +97,43 @@ the transformed program back to your source).
 **Full language reference: [docs/LANGUAGE.md](docs/LANGUAGE.md)** —
 classification rules, shell features, the Go subset, bridge semantics,
 builtins, and every deliberate difference from bash.
+
+## Learn it at the prompt: `grsh tutor`
+
+```
+grsh tutor        # start, or pick up where you left off
+grsh tutor 4      # jump straight to a chapter
+```
+
+A tutorial that runs **inside the real REPL** rather than simulating
+one. You type at an actual grsh prompt with every convenience live —
+highlighting, ghost text, the breadcrumb, `?name` — while a lesson
+engine prints a panel above the prompt, watches what you run, and grades
+it. Grading looks at what a step is actually about: a live variable's
+type and value, a file on disk, the exit status, or how the line was
+*classified* — not just what it printed.
+
+1. It's just a shell — 2. Two languages, one prompt — 3. Go at the
+prompt — 4. The bridge — 5. Helpers and the registry — 6. Where bash
+habits break — 7. Jobs — 8. Capstone: session to script
+
+Each chapter runs in a throwaway playground seeded with fixtures (a
+120-line `access.log`, three `.go` files, a directory with a space in
+its name), deleted when you leave — experiment freely. Chapter 2 turns
+`--explain` on for itself, so you watch each classification rule fire as
+you type. The capstone builds a report, saves the session as a runnable
+script with `session save`, and sources it back; `:keep` copies that
+script out before the playground goes.
+
+Your place is saved per chapter (`~/.grsh_tutor.db`), so bare
+`grsh tutor` carries on where you stopped. Tutor commands take a colon
+prefix — nothing in shell or Go starts with one, so they can never
+shadow something you meant to run:
+
+```
+:hint   :sol   :skip   :back   :next   :menu (`:menu 4` jumps)
+:keep   :progress   :help   :quit
+```
 
 ## How a line is classified
 

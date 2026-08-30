@@ -5,8 +5,12 @@ order — no mode switch, no subshell, no different language for scripts.
 This chapter grades your grasp of those rules directly: the tutor asks
 the classifier the same question the prompt just asked.
 
-Run `grsh --explain` outside the tutor to see the verdict for every line
-as you type it.
+explain: on
+
+That last line is a chapter directive, not prose: this chapter runs with
+`--explain` on, so the hint line under the prompt names the verdict and
+the rule for whatever you are typing, before you press Enter. Reading
+the rule fire is the lesson; grading it afterwards only confirms it.
 
 ## step: shell-default
 Rule 9 is the default: anything that isn't recognisably Go is a

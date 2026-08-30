@@ -1,0 +1,85 @@
+
+grsh tutor · 0.0.0-test
+You are at a real grsh prompt. Answer each step by running it.
+Playground: /tmp/grsh-tutor-PLAYGROUND (deleted on exit — experiment freely)
+Type :help for tutor commands; Ctrl+D or :quit leaves at any time.
+
+── It's just a shell ─────────────────────────────────── 1/6 ──
+
+  Welcome. You are at a real grsh prompt, in a throwaway playground
+  seeded with files to practise on.
+
+  Start by looking around.
+
+  try: ls
+
+grsh> pwd
+
+·  not quite — try again.
+grsh> pwd
+
+·  not quite — try again.
+   hint: `ls` — the same one you already use.
+grsh> ls
+
+✓  nice — that's it.
+
+── It's just a shell ─────────────────────────────────── 2/6 ──
+
+  `access.log` is a web server log. Some of its requests failed with a
+  500.
+
+  Count them.
+
+grsh> grep -c 500 access.log
+
+✓  nice — that's it.
+
+── It's just a shell ─────────────────────────────────── 3/6 ──
+
+  Pipes work exactly as they do in bash.
+
+  There are some Go files here. Count them with a pipe — list them,
+  and let another command do the counting.
+
+grsh> ls *.go | wc -l
+
+✓  nice — that's it.
+
+── It's just a shell ─────────────────────────────────── 4/6 ──
+
+  Redirection too.
+
+  Save just the failing requests into a file called `errs.txt`.
+
+grsh> grep 500 access.log > errs.txt
+
+✓  nice — that's it.
+
+── It's just a shell ─────────────────────────────────── 5/6 ──
+
+  `&&` and `||` short-circuit the way you expect.
+
+  Print `found` — but only if `access.log` really exists.
+
+grsh> test -f access.log && echo found
+
+✓  nice — that's it.
+
+── It's just a shell ─────────────────────────────────── 6/6 ──
+
+  Single quotes are still literal — nothing inside them is expanded, by
+  anything. That means the awk and sed one-liners you have memorised
+  paste in and work.
+
+  Print the client address from the log's first line.
+
+grsh> awk '{print $1}' access.log | head -1
+
+✓  nice — that's it.
+
+★ Chapter 1 of 8 complete.
+  next — 2. Two languages, one prompt
+  `:next` starts it in a fresh playground.
+  Ctrl+D stops here; your place is saved.
+

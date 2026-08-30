@@ -14,7 +14,8 @@ import (
 // statement starts with one.
 func TestColonIsACompleteUnit(t *testing.T) {
 	sess, _ := liveSession(t)
-	for _, src := range []string{":hint", ":sol", ":skip", ":back", ":menu", ":progress", ":help", ":quit"} {
+	for _, src := range []string{":hint", ":sol", ":skip", ":back", ":next", ":menu", ":menu 4",
+		":keep", ":keep ~/report.grsh", ":progress", ":help", ":quit"} {
 		if sess.Pending(src).NeedsMore {
 			t.Errorf("%q asks for a continuation; the tutor would hang at a `...` prompt", src)
 		}
@@ -179,7 +180,7 @@ func TestMenuAndProgressAndHelp(t *testing.T) {
 
 	e.Command(":menu")
 	menu := out.String()
-	if !strings.Contains(menu, "Second chapter") || !strings.Contains(menu, "grsh tutor N") {
+	if !strings.Contains(menu, "Second chapter") || !strings.Contains(menu, ":menu N") {
 		t.Errorf(":menu = %q", menu)
 	}
 

@@ -51,6 +51,34 @@ solution:
   }
 ```
 
+## Chapter directives
+
+Two directives live in the front matter — anywhere between the `# Title`
+and the first step — and configure the chapter rather than a step:
+
+| directive | effect |
+|---|---|
+| `explain: on` | run the chapter with `--explain`'s live verdict in the prompt's hint line |
+| `keep: report.grsh` | name a playground file the outro offers to save with `:keep` |
+
+They are the *only* keys claimed in that region; every other line there
+stays the editor's commentary, so a paragraph containing a colon is not
+a parse error. A known key with an unusable value (`explain: yes`) *is*
+one — silently ignoring it would leave you wondering why the hint lane
+stayed quiet.
+
+`explain: on` is chapter 2's, and it is the difference between telling a
+student the classifier decided something and letting them watch the rule
+fire as they type. It costs a session rebuilt with `Explain: io.Discard`
+— the writer is discarded because only the hint-lane half of `--explain`
+belongs in a lesson, not a classification dump over every panel.
+
+`keep:` exists because the playground is deleted on exit. The capstone
+has the student save their session as `report.grsh`, which is worth more
+than the directory it sits in; the outro offers it, and `:keep` (or
+`:keep ~/somewhere.grsh`) copies it out. The tutor never writes into a
+home directory unasked.
+
 ## Verifier kinds
 
 | kind | argument | grades |
