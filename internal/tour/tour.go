@@ -181,21 +181,15 @@ func (s *Server) events(ctx rweb.Context) error {
 	if err != nil {
 		return ctx.SetStatus(404).WriteString("no session — reload the page")
 	}
-	if err := ctx.SetSSE(v.sink.attach(), "out"); err != nil {
-		return err
-	}
-	// rweb's SSE headers include `Content-Encoding: text/plain`, which is a
-	// media type where a content CODING belongs. Browsers and curl treat an
-	// unrecognised coding as a body they cannot decode and drop the stream —
-	// headers arrive, events never do. Go's http client ignores the header
-	// (it only ever auto-decodes gzip), which is why this is invisible to a
-	// test written in Go and obvious the moment a browser opens the page.
-	//
-	// `identity` is the valid spelling of what rweb meant: no coding
-	// applied. Overriding is safe if this is ever fixed upstream, since
-	// SetHeader replaces a key it already has.
-	ctx.Response().SetHeader("Content-Encoding", "identity")
-	return nil
+	// SetSSE writes the whole header set the stream needs. It notably does
+	// not write a Content-Encoding, which is the correct behaviour and worth
+	// knowing: rweb <= v0.1.26 sent `Content-Encoding: text/plain` — a media
+	// type where a content CODING belongs — and browsers and curl drop a body
+	// whose coding they cannot decode, so headers arrived and events never
+	// did. We carried an `identity` override here until rweb v0.1.28 removed
+	// the header upstream. TestTourSendsADecodableStream still guards it,
+	// since a dependency could reintroduce it and no Go client would notice.
+	return ctx.SetSSE(v.sink.attach(), "out")
 }
 
 // state is the sidebar's initial draw, and its recovery path if the page

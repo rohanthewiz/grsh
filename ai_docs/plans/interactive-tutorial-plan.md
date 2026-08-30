@@ -315,10 +315,12 @@ progress must never cost a student their lesson.
    next command. It binds to loopback and refuses more without
    `-allow-remote`, since it runs shell commands as the user.
    Three bugs found by running it that no Go test could have caught
-   alone, all now pinned: rweb labels SSE responses `Content-Encoding:
+   alone, all now pinned: rweb labelled SSE responses `Content-Encoding:
    text/plain` (a media type where a content coding belongs), which Go's
    http client ignores and every browser treats as an undecodable body —
-   headers arrived, events never did; rweb's `Run` installs its own
+   headers arrived, events never did (fixed upstream in rweb v0.1.28,
+   which sends no such header; the tour's local override is gone and only
+   the assertion remains); rweb's `Run` installs its own
    SIGTERM handler and returns, so a second handler in main raced it and
    lost, leaking a playground per Ctrl+C; and the table of contents
    ticked off every chapter *before* the current one, congratulating a

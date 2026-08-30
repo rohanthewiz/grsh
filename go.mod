@@ -7,7 +7,7 @@ require (
 	github.com/reeflective/readline v1.3.0
 	github.com/rohanthewiz/bytdb v0.11.0
 	github.com/rohanthewiz/logger v1.3.0
-	github.com/rohanthewiz/rweb v0.1.26
+	github.com/rohanthewiz/rweb v0.1.28
 	github.com/rohanthewiz/serr v1.4.0
 	golang.org/x/sys v0.46.0
 	golang.org/x/term v0.44.0

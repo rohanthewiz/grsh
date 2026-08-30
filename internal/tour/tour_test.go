@@ -191,13 +191,18 @@ func TestTourStreamsOutput(t *testing.T) {
 // TestTourSendsADecodableStream guards a header, not a behaviour, and that
 // is the point.
 //
-// rweb labels its SSE responses `Content-Encoding: text/plain` — a media
-// type where a content coding belongs. Go's http client ignores the header
-// (it only ever auto-decodes gzip), so every test here passed while the
-// page in an actual browser showed a connected stream that never delivered
-// a byte: Chrome and curl both treat an unrecognised coding as a body they
-// cannot decode. Nothing about the events themselves can catch this from
-// Go, so the header is asserted directly.
+// rweb <= v0.1.26 labelled its SSE responses `Content-Encoding: text/plain`
+// — a media type where a content coding belongs. Go's http client ignores
+// the header (it only ever auto-decodes gzip), so every test here passed
+// while the page in an actual browser showed a connected stream that never
+// delivered a byte: Chrome and curl both treat an unrecognised coding as a
+// body they cannot decode. Nothing about the events themselves can catch
+// this from Go, so the header is asserted directly.
+//
+// v0.1.28 drops the header, which is what "no coding applied" is actually
+// spelled as, and the tour's `identity` override went with it. The
+// assertion stays: a dependency bump is exactly how this comes back, and
+// nothing else here would notice.
 func TestTourSendsADecodableStream(t *testing.T) {
 	_, c, base := newTestServer(t)
 	get(t, c, base+"/")
@@ -207,9 +212,9 @@ func TestTourSendsADecodableStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	if got := res.Header.Get("Content-Encoding"); got != "identity" {
-		t.Errorf("Content-Encoding = %q; anything a browser does not recognise "+
-			"as a content coding makes it discard the whole stream", got)
+	if got := res.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want none; anything a browser does not "+
+			"recognise as a content coding makes it discard the whole stream", got)
 	}
 	if got := res.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
 		t.Errorf("Content-Type = %q, want text/event-stream", got)
