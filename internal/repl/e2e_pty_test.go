@@ -561,3 +561,49 @@ func TestTutorEndToEnd(t *testing.T) {
 		t.Fatal("tutor did not exit after the lesson completed")
 	}
 }
+
+// TestTutorMetaCommandsEndToEnd is the Phase-2 counterpart: it proves the
+// Command hook, the sandbox, and :quit work through the real binary on a
+// real pty — the three things a unit test can only approximate, since
+// each depends on the loop, the process cwd, or the exit path.
+func TestTutorMetaCommandsEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary and drives a pty")
+	}
+	p := startShellArgs(t, []string{"tutor"})
+
+	p.waitFor("Playground:")       // the intro names the throwaway dir
+	p.waitFor("A three-step tour") // step 1 panel
+	p.waitFor("grsh ")
+
+	// The prompt really is inside the playground: `ls *.go` finds the
+	// fixtures, which is what makes "count the Go files" a gradable step
+	// rather than a lottery in the user's home directory.
+	p.send("ls *.go\r")
+	p.waitFor("util.go")
+
+	// A colon line is claimed by the tutor: it never reaches the shell,
+	// so there is no "command not found" and no status change.
+	p.send(":hint\r")
+	p.waitFor("hint:")
+
+	p.send(":skip\r")
+	p.waitFor("skipped")
+	p.waitFor("Print 42") // step 2's panel follows immediately
+
+	p.send(":quit\r")
+	p.waitFor("your place is saved")
+
+	// :quit ends the loop itself, at exit code 0 — leaving a tutorial is
+	// a choice, not a failure.
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("tutor exited with %v, want 0", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tutor did not exit after :quit")
+	}
+}

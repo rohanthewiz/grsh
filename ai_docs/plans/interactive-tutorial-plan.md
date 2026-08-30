@@ -147,13 +147,17 @@ that's the capstone.
 ## Progress & resume
 
 Persist chapter/step + per-step attempt counts so `grsh tutor` resumes where
-you left off and `grsh tutor 4` jumps to a chapter. Default per standing
-preference is `bytdb`; caveat to decide consciously: it adds a dependency to
-a binary that currently has six, for what is one tiny record. A plain JSON
-file at `~/.grsh_tutor.json` (matching the `~/.grsh_history` /
-`~/.grsh_units` conventions already in the codebase) may fit grsh's texture
-better. The plan works either way — `progress.go` isolates the choice behind
-an interface.
+you left off and `grsh tutor 4` jumps to a chapter.
+
+**Decided (Phase 2): `bytdb`**, at `~/.grsh_tutor.db`, per the standing
+preference. It costs three module lines (bytdb, btypedb, tidwall/btype) for
+one row, and the alternative — a plain JSON file matching the
+`~/.grsh_history` / `~/.grsh_units` conventions — remains a one-file swap
+because `progress.go` keeps the choice behind a `Store` interface. The
+engine API (`Open`/`CreateTable`/`Insert`/`Update`/`Get`) is used rather
+than the SQL front door: one row with a known primary key buys nothing from
+a parser and planner. Every failure path degrades to a `nopStore` — losing
+progress must never cost a student their lesson.
 
 ## Testing
 
@@ -181,9 +185,29 @@ an interface.
    `runner.Options` already exposed Stdout/Stderr, so no runner change was
    needed; the tutor session runs with `NoRC` and in-memory history so a
    user's `~/.grshrc` can't break a lesson.
-2. **Verifier suite + sandbox + meta-commands** — remaining verifiers,
-   fixtures, `:hint/:sol/:skip/:menu`, progress persistence, content
-   self-check test.
+2. ~~**Verifier suite + sandbox + meta-commands**~~ — **done
+   (2026-08-30).** All eight verifier kinds behind the table
+   (`output-exact`, `status`, `var`, `file`, `classified-as`,
+   `used-construct` joined the two Phase-1 kinds), plus an `All`
+   conjunction so a step can demand the mechanism AND the result — the
+   demo's bridge step now uses it, closing Phase 1's open item. The
+   `var` kind grades through a new read-only `Session.VarInfo` /
+   `Interp.InspectParts` (type and value as separate raw strings) rather
+   than parsing `?name`'s rendered line, so lesson regexps never depend
+   on the inspector's cosmetics. `sandbox.go` builds a deterministic
+   playground (`$TMPDIR/grsh-tutor-*`: a 120-line `access.log` with 17
+   500s, three `.go` files, `data.json`, a `notes/` subtree) and chdir's
+   the process into it; teardown is explicit, not deferred, so a panic
+   leaves it for debugging. Meta-commands (`:hint :sol :skip :back
+   :menu :progress :help :quit`) ride a fourth interceptor hook,
+   `Command(src) bool`, placed ahead of `replCommand`, `Eval` AND
+   `hist.Append` — a `:hint` must never land in the unit history the
+   capstone turns into a script. Progress persists to `~/.grsh_tutor.db`
+   via bytdb's engine API (decision below resolved in favor of the
+   standing preference), keyed by lesson and storing a step *ID* so
+   editing content can't teleport a returning student. Notes for Phase
+   3: `Attempt` now carries `Dir` (the sandbox root, for `file`); the
+   content self-check runs each solution in its own fresh playground.
 3. **Content** — the 8 chapters, iterating with the self-check test; ANSI
    panel styling consistent with the existing prompt colors, `NO_COLOR`
    respected.
@@ -195,14 +219,14 @@ an interface.
 
 ## Risks / open questions
 
-- **Loop refactor**: the interceptor must not disturb continuation
-  (`Pending`) or Ctrl+C semantics — Phase 1's demo lesson plus the existing
-  repl tests guard this.
+- ~~**Loop refactor**~~: settled. The interceptor does not disturb
+  continuation (`Pending`) or Ctrl+C semantics; the repl seam tests plus two
+  pty end-to-end runs (`TestTutorEndToEnd`, `TestTutorMetaCommandsEndToEnd`)
+  guard it.
 - **Output-based grading brittleness**: environment leaks into output (`ls`
   ordering, locale). Mitigation: fixtures + regexp verifiers + prefer
   `var`/`file`/`status` checks where possible.
-- **`runner.Options` writers**: if the internal runner doesn't yet expose
-  Stdout/Stderr the way root `grsh.Options` does, that's a small Phase-1
-  addition.
+- ~~**`runner.Options` writers**~~: it already exposed them; the tee was
+  pure addition.
 - **Jobs chapter timing**: background-job steps need generous, non-flaky
   waits; keep them demo-flavored.

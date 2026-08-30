@@ -317,11 +317,24 @@ type stubInterceptor struct {
 	stopAt   int // stop the loop once this many AfterEvals have run (0 = never)
 	stopCode int
 	nEvals   int
+	cmds     []string // units the stub claimed via Command
 }
 
 func (s *stubInterceptor) BeforePrompt(w io.Writer) {
 	s.calls = append(s.calls, "before")
 	io.WriteString(w, "[panel]\n")
+}
+
+// Command stands in for the tutor's colon meta-commands: it swallows
+// any unit starting with ":" so the test can assert such a unit never
+// reaches the classifier, Eval, or unit history.
+func (s *stubInterceptor) Command(src string) bool {
+	if !strings.HasPrefix(strings.TrimSpace(src), ":") {
+		return false
+	}
+	s.calls = append(s.calls, "command")
+	s.cmds = append(s.cmds, src)
+	return true
 }
 
 func (s *stubInterceptor) AfterEval(src string, err error) {
@@ -432,5 +445,40 @@ func TestInterceptorCtrlCDropsUnit(t *testing.T) {
 	}
 	if n := strings.Count(strings.Join(ic.calls, ","), "before"); n != 3 {
 		t.Errorf("BeforePrompt fired %d times, want 3 (initial, post-^C, post-eval)", n)
+	}
+}
+
+// TestInterceptorCommandClaimsUnit: a unit the interceptor claims never
+// reaches Eval, never reaches AfterEval, and — the part that matters for
+// the capstone chapter — never lands in unit history, which `session
+// save` turns into a runnable script.
+func TestInterceptorCommandClaimsUnit(t *testing.T) {
+	var out, errB bytes.Buffer
+	sess := runner.NewSession(runner.Options{Stdout: &out, Stderr: &errB, ScriptName: "repl"})
+	hist := openHistory("")
+	ic := &stubInterceptor{}
+	rd := &fakeReader{steps: []step{
+		{line: "echo one"},
+		{line: ":hint"},
+		{line: "echo two"},
+	}}
+	loop(sess, rd, &out, &errB, hist, ic)
+
+	if len(ic.cmds) != 1 || ic.cmds[0] != ":hint" {
+		t.Fatalf("Command claimed %q, want [\":hint\"]", ic.cmds)
+	}
+	if len(ic.evals) != 2 || ic.evals[0] != "echo one" || ic.evals[1] != "echo two" {
+		t.Errorf("evals = %q, want the two shell units only", ic.evals)
+	}
+	// A claimed unit is not shell, so it must not have run: `:hint` as a
+	// command would print nothing but would set a status and pollute the
+	// transcript the student is about to save.
+	if strings.Contains(out.String(), "hint") {
+		t.Errorf("claimed unit reached the shell; stdout = %q", out.String())
+	}
+	for _, u := range hist.SessionUnits() {
+		if strings.TrimSpace(u) == ":hint" {
+			t.Errorf("meta-command entered unit history: %q", hist.SessionUnits())
+		}
 	}
 }

@@ -66,19 +66,56 @@ func TestContentSolutionsPass(t *testing.T) {
 				if st.Solution == "" {
 					t.Fatal("step has no solution to check")
 				}
+				// Each step gets its own playground, so a solution that
+				// writes a file is graded against fixtures in the state the
+				// student would meet them — and cannot leak into the next
+				// step's check. (Steps whose solutions must compose are a
+				// content-design question, not something to paper over by
+				// sharing a directory here.)
+				box, err := newSandbox()
+				if err != nil {
+					t.Fatalf("playground: %v", err)
+				}
+				defer box.cleanup()
+
 				cap := newCapture(64 << 10)
 				sess := runner.NewSession(runner.Options{
 					ScriptName: "tutor-check",
 					Stdout:     cap,
 					Stderr:     cap,
 				})
-				err := sess.Eval(st.Solution)
-				a := Attempt{Input: st.Solution, Output: cap.String(), Err: err, Sess: sess}
+				evalErr := sess.Eval(st.Solution)
+				a := Attempt{Input: st.Solution, Output: cap.String(), Err: evalErr, Sess: sess, Dir: box.dir}
 				if !st.Verify.Verify(a) {
 					t.Errorf("solution %q failed its own verifier (%s)\noutput: %q\nerr: %v",
-						st.Solution, st.Verify.Spec(), cap.String(), err)
+						st.Solution, st.Verify.Spec(), cap.String(), evalErr)
 				}
 			})
+		}
+	}
+}
+
+// TestContentStepsAreWellFormed guards the invariants the engine assumes
+// but cannot enforce: every step needs a stable, unique ID (progress
+// records name steps by ID, so a duplicate would resume the wrong one)
+// and a verifier (a nil one would panic mid-lesson).
+func TestContentStepsAreWellFormed(t *testing.T) {
+	for _, l := range lessons() {
+		seen := map[string]bool{}
+		for _, st := range l.Steps {
+			switch {
+			case st.ID == "":
+				t.Errorf("%s: a step has no ID", l.ID)
+			case seen[st.ID]:
+				t.Errorf("%s: duplicate step ID %q — progress would resume the wrong step", l.ID, st.ID)
+			}
+			seen[st.ID] = true
+			if st.Verify == nil {
+				t.Errorf("%s/%s: no verifier", l.ID, st.ID)
+			}
+			if len(st.Prose) == 0 {
+				t.Errorf("%s/%s: no prose — the panel would be blank", l.ID, st.ID)
+			}
 		}
 	}
 }

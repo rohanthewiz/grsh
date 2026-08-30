@@ -416,3 +416,73 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// ---- InspectParts: the same data, without the presentation ----
+//
+// The tutor's `var` verifier grades type and value independently, so it
+// reads these rather than parsing Inspect's rendered line. The two must
+// stay genuinely separate: sharing the string would make a lesson's
+// regexp depend on the inspector's quoting, its "(len N)", and its
+// 60-rune elision.
+
+func TestInspectPartsSplitsTypeAndValue(t *testing.T) {
+	tests := []struct {
+		name, src, binding, typ, val string
+	}{
+		{"int", `n := 42`, "n", "int", "42"},
+		{"float", `f := 1.5`, "f", "float64", "1.5"},
+		{"bool", `b := true`, "b", "bool", "true"},
+		// A string's value is its RAW contents: no quotes, no length
+		// prefix. A lesson writes value=^ada$, not value=^"ada"$.
+		{"string", `s := "ada"`, "s", "string", "ada"},
+		{"empty string", `s := ""`, "s", "string", ""},
+		// A nil binding has no type to report, matching Inspect's own
+		// special case for it.
+		{"nil", `z := nil`, "z", "", "nil"},
+		{"slice", `xs := []string{"a", "b"}`, "xs", "[]string", "[a b]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in, out, err := evalKeep(t, tc.src, nil)
+			if err != nil {
+				t.Fatalf("run: %v\noutput:\n%s", err, out)
+			}
+			typ, val, ok := in.InspectParts(tc.binding)
+			if !ok {
+				t.Fatalf("InspectParts(%q) reported no such binding", tc.binding)
+			}
+			if typ != tc.typ || val != tc.val {
+				t.Errorf("got type %q value %q, want type %q value %q", typ, val, tc.typ, tc.val)
+			}
+		})
+	}
+}
+
+func TestInspectPartsUnknownName(t *testing.T) {
+	in, _, err := evalKeep(t, `n := 1`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := in.InspectParts("nope"); ok {
+		t.Error("InspectParts reported a binding that does not exist")
+	}
+}
+
+// TestInspectPartsIsUntruncated is the whole reason this accessor exists
+// rather than the verifier scraping Inspect: the human-facing renderer
+// elides past inspectMaxWidth, and a grader that matched the elided
+// string would pass any answer whose first 60 runes were right.
+func TestInspectPartsIsUntruncated(t *testing.T) {
+	long := strings.Repeat("x", inspectMaxWidth*2) + "END"
+	in, _, err := evalKeep(t, `s := "`+long+`"`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, val, ok := in.InspectParts("s")
+	if !ok {
+		t.Fatal("no binding")
+	}
+	if val != long {
+		t.Errorf("value was transformed: got %d runes ending %q, want the raw %d", len(val), val[max(0, len(val)-8):], len(long))
+	}
+}

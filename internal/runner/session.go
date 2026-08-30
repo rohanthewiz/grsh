@@ -163,6 +163,12 @@ func (s *Session) Alias(name string) (string, bool) {
 // REPL's `?name` command).
 func (s *Session) Inspect(name string) (string, bool) { return s.in.Inspect(name) }
 
+// VarInfo is Inspect's data half — a top-level variable's displayed type
+// and its value as separate, unformatted strings. The tutor's `var`
+// verifier grades against these rather than against Inspect's rendered
+// line, so lesson content never depends on the inspector's cosmetics.
+func (s *Session) VarInfo(name string) (typ, val string, ok bool) { return s.in.InspectParts(name) }
+
 // JobCount reports how many background jobs are still live (running or
 // stopped) — a prompt segment.
 func (s *Session) JobCount() int {

@@ -74,10 +74,11 @@ func demoLesson() Lesson {
 				Try:      `fmt.Println($(echo bridge))`,
 				Hints:    []string{"`$(...)` is an expression here, not a string splice.", "Try `fmt.Println($(echo bridge))`."},
 				Solution: `fmt.Println($(echo bridge))`,
-				// The used-construct check that would force `$(` lands with
-				// the rest of the verifier suite in Phase 2; for the demo,
-				// matching the output is enough to prove the tee works.
-				Verify: MustVerifier("output-regexp (?m)^bridge$"),
+				// Two clauses, conjoined: the mechanism AND the result.
+				// Grading the output alone would tick over for a student who
+				// typed `echo bridge`, which is the one thing this step is
+				// not about.
+				Verify: MustAll(`used-construct \$\(`, "output-regexp (?m)^bridge$"),
 			},
 		},
 	}

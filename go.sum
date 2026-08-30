@@ -16,6 +16,10 @@ github.com/reeflective/readline v1.3.0 h1:uh9c2SEmyoy7A/auequfXZjvK0NP5HVEAJFcL9
 github.com/reeflective/readline v1.3.0/go.mod h1:bOpqx2/VqGlIoobyWR1Vgt/p5FiMfIHj4OicPuw6RfU=
 github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
 github.com/rivo/uniseg v0.4.7/go.mod h1:FN3SvrM+Zdj16jyLfmOkMNblXMcoc8DfTHruCPUcx88=
+github.com/rohanthewiz/btypedb v0.7.0 h1:i8zu+Rc5YIkocbVuNk1jlnb94g9RTtJQGAGm9xob+QI=
+github.com/rohanthewiz/btypedb v0.7.0/go.mod h1:K+7M8clbmaVh33X9QYm1sA5A7DWDKOE1+O9WFQflMI0=
+github.com/rohanthewiz/bytdb v0.11.0 h1:s7SyK5clCv7DKkNOkIzmBQ0iPDXCEXnamhP1g/O+XBA=
+github.com/rohanthewiz/bytdb v0.11.0/go.mod h1:HKuQb7ptS/dPzagWWttvfy1qkQulke/p8JUHZeDOvO4=
 github.com/rohanthewiz/logger v1.3.0 h1:cJoocqUvv5wsHcjlW7wupMTruyBCUHuu8J380u5fyFs=
 github.com/rohanthewiz/logger v1.3.0/go.mod h1:aPgQ2SY+8fjgyUVcHpWBT9gGHaqKU4cfWjJ7Gkt+Eb0=
 github.com/rohanthewiz/serr v1.4.0 h1:twQnnRRB3+orPJBrdVBaxaYScNE+Dk9MxSLtEabvoGA=
@@ -24,6 +28,8 @@ github.com/sirupsen/logrus v1.9.4 h1:TsZE7l11zFCLZnZ+teH4Umoq5BhEIfIzfRDZ1Uzql2w
 github.com/sirupsen/logrus v1.9.4/go.mod h1:ftWc9WdOfJ0a92nsE2jF5u5ZwH8Bv2zdeOC42RjbV2g=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+github.com/tidwall/btype v0.3.0 h1:VU0/oeVecbqY+2OpyzN0wPQU9CBvCnmOv3w5A+pn42A=
+github.com/tidwall/btype v0.3.0/go.mod h1:IRq7GmniRp9OhEKPIalEyUe/3x9oR8AuuKrdv0ANFbc=
 golang.org/x/sys v0.0.0-20220310020820-b874c991c1a5/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
 golang.org/x/sys v0.46.0 h1:noSf2Fq6F8DBgS+LysIkx7rIExoNHJsxOAtPp4rthXw=
 golang.org/x/sys v0.46.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=

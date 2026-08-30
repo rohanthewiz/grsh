@@ -48,11 +48,14 @@ func (c chzyerReader) Readline() (string, error) {
 
 // Interceptor lets a host wrap the input loop without forking it. The
 // loop's continuation/Ctrl-C/EOF logic is subtle and already correct, so
-// the tutorial engine (internal/tutor) rides along on these three hooks
+// the tutorial engine (internal/tutor) rides along on these four hooks
 // instead of reimplementing it:
 //
 //	BeforePrompt  once per *input unit* (not per continuation line) —
 //	              print a lesson panel, reset an output capture buffer.
+//	Command       first refusal on a completed unit, before the
+//	              classifier, history, or Eval ever see it — the
+//	              tutor's `:hint` / `:skip` / `:quit` meta-commands.
 //	AfterEval     once per evaluated unit, after the loop has reported
 //	              any error — grade the attempt and advance.
 //	Done          polled at the top of each iteration so the interceptor
@@ -61,6 +64,7 @@ func (c chzyerReader) Readline() (string, error) {
 // A nil Interceptor is the normal REPL: every hook site is guarded.
 type Interceptor interface {
 	BeforePrompt(w io.Writer)
+	Command(src string) bool
 	AfterEval(src string, err error)
 	Done() (code int, done bool)
 }
@@ -168,7 +172,7 @@ func legacyEditor() bool {
 }
 
 // loop reads input units and evaluates them. ic may be nil; when set,
-// its hooks fire at the three points documented on Interceptor. The hook
+// its hooks fire at the four points documented on Interceptor. The hook
 // sites are deliberately outside the continuation/interrupt branches:
 // a lesson panel belongs to an input *unit*, not to each physical line.
 func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *historyStore, ic Interceptor) int {
@@ -217,6 +221,14 @@ func loop(sess *runner.Session, rd lineReader, outW, errW io.Writer, hist *histo
 			continue
 		}
 		buf, pend = buf[:0], classify.PendingInfo{}
+		// The interceptor gets first refusal on a completed unit. This sits
+		// ahead of replCommand, Eval, AND hist.Append on purpose: a tutor
+		// meta-command is neither shell nor Go, and it must not land in unit
+		// history — the capstone chapter turns that history into a script,
+		// and `:hint` is not a line anyone wants replayed.
+		if ic != nil && ic.Command(src) {
+			continue
+		}
 		// Prompt-only conveniences (`?name`, `session save`) still count as
 		// a completed unit for the interceptor — a lesson step may well be
 		// "now inspect that variable" — they just never reach Eval.

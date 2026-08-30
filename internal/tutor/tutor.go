@@ -49,9 +49,19 @@ type engine struct {
 	attempts int  // failed attempts at the current step
 	revealed int  // hints already shown for the current step
 	posted   bool // has the current step's panel been printed?
+	skipped  int  // steps left behind with :skip, reported by :progress
 
 	finished bool // every step passed; Done ends the loop
+	quit     bool // :quit — Done ends the loop early, at the same code
 	st       style
+
+	// Phase-2 wiring, set by Run after construction so the engine's
+	// constructor stays the small thing the unit tests build. Each is
+	// optional: a nil store or an empty dir degrades a feature, never
+	// the lesson.
+	chapters []Lesson // for :menu
+	dir      string   // sandbox root, handed to `file` verifiers
+	store    Store    // progress persistence; nil in tests
 }
 
 func newEngine(l Lesson, sess *runner.Session, cap *capture, out io.Writer, color bool) *engine {
@@ -89,9 +99,10 @@ func (e *engine) AfterEval(src string, err error) {
 	if step == nil {
 		return
 	}
-	a := Attempt{Input: src, Output: e.cap.String(), Err: err, Sess: e.sess}
+	a := Attempt{Input: src, Output: e.cap.String(), Err: err, Sess: e.sess, Dir: e.dir}
 	if !step.Verify.Verify(a) {
 		e.miss(e.out, step)
+		e.save()
 		return
 	}
 	e.pass(e.out)
@@ -100,21 +111,58 @@ func (e *engine) AfterEval(src string, err error) {
 // Done reports lesson completion. The loop polls it before each prompt,
 // so the closing banner is the last thing on screen.
 func (e *engine) Done() (int, bool) {
-	if !e.finished {
+	if !e.finished && !e.quit {
 		return 0, false
 	}
+	// Exit code 0 either way. A finished lesson is obviously a success,
+	// and so is a deliberate :quit — walking out of a tutorial is a
+	// choice, not a failure, and a nonzero code would break the entirely
+	// reasonable `grsh tutor && next-thing` while teaching nobody
+	// anything. The signature keeps the code in case a future mode (a
+	// graded exam, say) has an actual verdict to report.
 	return 0, true
 }
 
-// pass advances to the next step, resetting the per-step counters.
+// pass ticks the step over and moves on.
 func (e *engine) pass(w io.Writer) {
 	fmt.Fprintf(w, "\n%s  %s\n", e.st.ok("✓"), e.st.dim("nice — that's it."))
+	e.advance(w)
+}
+
+// advance is the only place the lesson's position moves — a pass, a
+// :skip, or falling off the end. Keeping it single means the per-step
+// counters are reset in exactly one place, and so is the progress write.
+func (e *engine) advance(w io.Writer) {
 	e.idx++
 	e.attempts, e.revealed, e.posted = 0, 0, false
 	if e.idx >= len(e.lesson.Steps) {
 		e.finished = true
 		e.printOutro(w)
 	}
+	e.save()
+}
+
+// save records the student's place. Failures are swallowed on purpose:
+// progress is a convenience, and a full disk or a second tutor holding
+// the database must not interrupt a lesson to say so.
+func (e *engine) save() {
+	if e.store == nil {
+		return
+	}
+	// A finished lesson saves an empty step, which resumeAt reads as
+	// "start over" — running `grsh tutor` again after the outro should
+	// begin the chapter, not drop the student straight back into the
+	// completion banner.
+	step := ""
+	if cur := e.current(); cur != nil {
+		step = cur.ID
+	}
+	_ = e.store.Save(Record{
+		Lesson:   e.lesson.ID,
+		Step:     step,
+		Attempts: e.attempts,
+		Revealed: e.revealed,
+	})
 }
 
 // miss records a failed attempt and escalates: a bare nudge first, then
@@ -191,6 +239,15 @@ func Run(version string, args []string, out, errOut io.Writer) int {
 		return 2
 	}
 
+	// The playground comes first: it chdir's the process, and every
+	// later decision (what `ls` shows, where a `file` verifier looks) is
+	// relative to it.
+	box, err := newSandbox()
+	if err != nil {
+		fmt.Fprintf(errOut, "grsh tutor: could not build the playground: %v\n", err)
+		return 2
+	}
+
 	cap := newCapture(64 << 10)
 	sess := runner.NewSession(runner.Options{
 		ScriptName: "grsh",
@@ -198,16 +255,52 @@ func Run(version string, args []string, out, errOut io.Writer) int {
 		Stderr:     io.MultiWriter(os.Stderr, cap),
 	})
 
+	store := openStore(progressPath())
 	e := newEngine(all[idx], sess, cap, out, colorEnabled())
-	printIntro(out, e.st, version)
+	e.chapters, e.dir, e.store = all, box.dir, store
 
-	return repl.RunOptions(sess, repl.Options{
+	rec, found := store.Load(e.lesson.ID)
+	e.idx = resumeAt(e.lesson, rec, found)
+	if e.idx > 0 {
+		// Hint state resumes too: a student who quit stuck on step 4 comes
+		// back to the hint they had already earned, not to silence.
+		e.attempts, e.revealed = rec.Attempts, rec.Revealed
+	}
+	printIntro(out, e.st, version, box.dir, e.idx)
+
+	code := repl.RunOptions(sess, repl.Options{
 		Version:     version,
 		NoRC:        true,
 		Quiet:       true,
 		Ephemeral:   true,
 		Interceptor: e,
 	})
+	// Teardown is explicit rather than deferred, so a panic leaves the
+	// playground on disk: the fixtures plus whatever the student's last
+	// command wrote are the whole reproduction for a crash report.
+	store.Close()
+	box.cleanup()
+	return code
+}
+
+// resumeAt maps a saved record onto a step index in the lesson as it
+// exists NOW.
+//
+// The record stores a step *ID*, not an index, precisely so that editing
+// the curriculum cannot teleport a returning student into the middle of a
+// step they have never seen. An ID that no longer exists — a renamed or
+// deleted step — and an empty ID — the lesson was finished — both mean
+// the same safe thing: start at the top.
+func resumeAt(l Lesson, r Record, found bool) int {
+	if !found || r.Step == "" {
+		return 0
+	}
+	for i, st := range l.Steps {
+		if st.ID == r.Step {
+			return i
+		}
+	}
+	return 0
 }
 
 // chapterIndex resolves the optional chapter argument (1-based, as the
@@ -226,10 +319,16 @@ func chapterIndex(args []string, n int) (int, error) {
 	return ch - 1, nil
 }
 
-func printIntro(w io.Writer, st style, version string) {
+// printIntro sets the scene: a real prompt, a real (throwaway) directory,
+// and the one meta-command a student needs to find all the others.
+func printIntro(w io.Writer, st style, version, dir string, resumeIdx int) {
 	fmt.Fprintf(w, "\n%s %s\n", st.bold("grsh tutor"), st.dim("· "+version))
 	fmt.Fprintf(w, "%s\n", st.dim("You are at a real grsh prompt. Answer each step by running it."))
-	fmt.Fprintf(w, "%s\n", st.dim("Ctrl+D leaves the tutor at any time."))
+	fmt.Fprintf(w, "%s\n", st.dim("Playground: "+dir+" (deleted on exit — experiment freely)"))
+	fmt.Fprintf(w, "%s\n", st.dim("Type :help for tutor commands; Ctrl+D or :quit leaves at any time."))
+	if resumeIdx > 0 {
+		fmt.Fprintf(w, "%s\n", st.dim(fmt.Sprintf("Resuming at step %d.", resumeIdx+1)))
+	}
 }
 
 // termWidth is the panel rule width, clamped so the lesson reads the same

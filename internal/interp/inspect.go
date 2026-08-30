@@ -41,6 +41,39 @@ func (in *Interp) Inspect(name string) (string, bool) {
 	return inspectValue(name, v), true
 }
 
+// InspectParts is Inspect's data half: a variable's displayed type and
+// its value as two plain strings, with none of the "name: " framing,
+// quoting, or width capping the human-facing rendering applies.
+//
+// It exists for the tutor's `var` verifier, which grades a step like
+// "bind n to 42" by matching type and value independently. Sharing
+// Inspect's *string* would have made a lesson's regexp depend on the
+// inspector's cosmetics — the quotes around a string, the "(len 3)", the
+// 60-rune elision — so a formatting change would silently break content.
+// The two callers want genuinely different things: one is a variable
+// view for a human, this one is data for a predicate.
+//
+// The renderings, in order of the switch below:
+//
+//	nil     type "",  value "nil"   (a nil binding has no type to report)
+//	string  type "string", value the RAW contents — a lesson writes
+//	        `value=^hello$`, not `value=^"hello"$`
+//	other   displayType(v) and fmt.Sprint(v), uncapped: a verifier that
+//	        matched only the first 60 runes would pass a wrong answer.
+func (in *Interp) InspectParts(name string) (typ, val string, ok bool) {
+	v, ok := in.globals.Get(name)
+	if !ok {
+		return "", "", false
+	}
+	switch t := v.(type) {
+	case nil:
+		return "", "nil", true
+	case string:
+		return "string", t, true
+	}
+	return displayType(v), fmt.Sprint(v), true
+}
+
 func inspectValue(name string, v Value) string {
 	switch t := v.(type) {
 	case nil:
