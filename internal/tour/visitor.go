@@ -4,15 +4,19 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"sync"
 	"time"
 
 	"github.com/rohanthewiz/grsh/internal/tutor"
 )
 
-// visitor is one student: a driver, the output stream feeding their page,
-// and the lock that makes an HTTP server's goroutines look to the driver
+// transcriptWidth pins the engine's panel rule. There is no terminal to
+// ask, 76 is the engine's own upper bound, and the page's transcript is
+// sized to hold it without wrapping.
+const transcriptWidth = 76
+
+// visitor is one student: an engine, the output stream feeding their page,
+// and the lock that makes an HTTP server's goroutines look to the engine
 // like the single caller it expects.
 //
 // The page's step panel is routed to io.Discard rather than into the
@@ -23,75 +27,78 @@ type visitor struct {
 	id   string
 	sink *sink
 
-	// mu serializes everything that touches the driver. Interrupt is the
+	// inProcess runs this student's driver here rather than in a worker of
+	// their own. Off by default; see Options.InProcess.
+	inProcess bool
+
+	// mu serializes everything that touches the engine. Interrupt is the
 	// documented exception and takes nothing — a stop button that queues
 	// behind the command it is stopping is not a stop button.
-	mu sync.Mutex
-	d  *tutor.Driver
-	// dMu guards the d POINTER, and nothing the pointer leads to. It
+	mu  sync.Mutex
+	eng engine
+	// engMu guards the eng FIELD, and nothing the field leads to. It
 	// exists because interrupt deliberately does not take mu: a restart
-	// swaps the driver while mu is held, and the signal path reads the
+	// swaps the engine while mu is held, and the signal path reads the
 	// field with mu belonging to someone else. Held for a load and a
 	// store, never across a call.
-	dMu sync.Mutex
+	engMu sync.Mutex
 
 	seenMu sync.Mutex
 	seen   time.Time
 }
 
 // newVisitor mints a session and opens the student's first chapter, which
-// creates their playground on disk.
-func newVisitor(store tutor.Store) (*visitor, error) {
-	v := &visitor{id: newID(), sink: newSink(transcriptLimit), seen: time.Now()}
+// creates their playground on disk — in a worker process of the student's
+// own unless the server was told to stay in-process.
+func newVisitor(store tutor.Store, inProcess bool) (*visitor, error) {
+	v := &visitor{id: newID(), sink: newSink(transcriptLimit), seen: time.Now(), inProcess: inProcess}
 	if err := v.start(store); err != nil {
 		return nil, err
 	}
 	return v, nil
 }
 
-// start builds the driver. Split out from newVisitor so restart can reuse
+// start builds the engine. Split out from newVisitor so restart can reuse
 // it without minting a new id — a reset should keep the browser's cookie
 // working, since the page it came from is still open.
+//
+// The greeting goes in first, and it goes in HERE rather than in the
+// engine: it must land above the chapter banner, and with a worker that
+// banner arrives asynchronously from another process the moment it starts.
 func (v *visitor) start(store tutor.Store) error {
 	v.greet()
-	d, err := tutor.NewDriver(v.sink, tutor.ResumeChapter(store), tutor.DriverOptions{
-		// Colour on: the transcript is a terminal surface, and the page
-		// renders the escape codes as spans. The engine's palette is part
-		// of how a lesson reads.
-		Color: true,
-		// A fixed width, because there is no terminal to ask. 76 is the
-		// engine's own upper bound, and the page's transcript is sized to
-		// hold it without wrapping.
-		Width:  76,
-		Panels: io.Discard,
-		Store:  store,
-		// No controlling terminal here, so foreground pipelines need their
-		// own process group for Interrupt to have anything to signal.
-		Embedded: true,
-	})
+	var (
+		eng engine
+		err error
+	)
+	if v.inProcess {
+		eng, err = newLocalEngine(v.sink, store)
+	} else {
+		eng, err = newRemoteEngine(v.sink, store)
+	}
 	if err != nil {
 		return err
 	}
-	v.dMu.Lock()
-	v.d = d
-	v.dMu.Unlock()
+	v.engMu.Lock()
+	v.eng = eng
+	v.engMu.Unlock()
 	return nil
 }
 
-// driver reads the current driver without waiting for whatever is running
+// engine reads the current engine without waiting for whatever is running
 // on it. Only the signal path needs this; every other caller already holds
 // mu, which excludes the one writer.
-func (v *visitor) driver() *tutor.Driver {
-	v.dMu.Lock()
-	defer v.dMu.Unlock()
-	return v.d
+func (v *visitor) engine() engine {
+	v.engMu.Lock()
+	defer v.engMu.Unlock()
+	return v.eng
 }
 
 // interrupt is SIGINT to the student's foreground pipeline: the stop
 // button, and Ctrl+C in the page's input.
 func (v *visitor) interrupt() bool {
-	d := v.driver()
-	return d != nil && d.Interrupt()
+	e := v.engine()
+	return e != nil && e.Interrupt()
 }
 
 // kill is the escalation, for a pipeline that ignored SIGINT — a second
@@ -100,8 +107,8 @@ func (v *visitor) interrupt() bool {
 // automatically, because SIGKILL leaves no chance to clean up and the
 // student is better placed than a timer to decide they have waited enough.
 func (v *visitor) kill() bool {
-	d := v.driver()
-	return d != nil && d.Kill()
+	e := v.engine()
+	return e != nil && e.Kill()
 }
 
 // submit feeds physical lines and returns the resulting View. The lines go
@@ -110,16 +117,21 @@ func (v *visitor) kill() bool {
 func (v *visitor) submit(lines []string) tutor.View {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	for _, line := range lines {
-		v.d.Submit(line)
-	}
-	return v.d.View()
+	return v.eng.Submit(lines)
 }
 
 func (v *visitor) view() tutor.View {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return v.d.View()
+	return v.eng.View()
+}
+
+// dir is the student's playground on disk. Only the reaper's test and the
+// server's own bookkeeping need it; the page reads it out of the View.
+func (v *visitor) dir() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.eng.Dir()
 }
 
 // classify reads the classifier's verdict for a half-typed line. It shares
@@ -128,26 +140,51 @@ func (v *visitor) view() tutor.View {
 func (v *visitor) classify(src string) string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return v.d.Classify(src)
+	return v.eng.Classify(src)
 }
 
-// restart throws the driver away and starts over on a clean playground.
+// restart throws the engine away and starts over on a clean playground.
+//
+// The teardown happens outside mu for the same reason close's does, and
+// then mu is taken to swap the engine in — which excludes a concurrent
+// submit from reading a field that is halfway through being replaced.
 func (v *visitor) restart(store tutor.Store) error {
+	v.stop()
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.d.Close()
 	v.sink.clear()
 	return v.start(store)
 }
 
-// close removes the playground and detaches the browser. Taking the lock
-// means an in-flight command finishes first: killing a session mid-Eval
-// would leave the child process orphaned and the playground busy.
+// close removes the playground and detaches the browser.
 func (v *visitor) close() {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.d.Close()
+	v.stop()
 	v.sink.close()
+}
+
+// stop ends this student's session without waiting for their lock.
+//
+// mu is held for the whole of a running command, so a teardown that took
+// it would wait for whatever the student happened to have typed — five
+// minutes of `sleep 300` on every Ctrl+C, on every reaper pass, and on
+// Reset. Neither of the calls here queues behind that lock: Kill is the
+// signal path, which exists precisely to be heard while a command is
+// running, and engine.Close is required to be safe from any goroutine.
+//
+// The Kill comes first anyway. It is the polite version — the worker
+// gets to remove its own playground and exit — where Close's fallback is
+// to kill the process and clean up after it.
+//
+// A Submit still in flight returns a View of a session that has just
+// ended underneath it. Nobody is left to read it: a reset replaces the
+// page's state a moment later, and a shutdown has no page to tell.
+func (v *visitor) stop() {
+	e := v.engine()
+	if e == nil {
+		return
+	}
+	e.Kill()
+	e.Close()
 }
 
 // greet is the transcript's first paragraph, written before the driver so

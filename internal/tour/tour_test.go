@@ -22,8 +22,20 @@ import (
 // returns a client that carries the session cookie the way a browser does.
 func newTestServer(t *testing.T) (*Server, *http.Client, string) {
 	t.Helper()
+	return newTestServerWith(t, Options{})
+}
+
+// newTestServerWith is newTestServer with the caller's options, minus the
+// three it always owns: the address, the readiness signal and an idle
+// timeout long enough that the reaper never fires mid-test.
+func newTestServerWith(t *testing.T, o Options) (*Server, *http.Client, string) {
+	t.Helper()
 	ready := make(chan struct{}, 1)
-	s, err := New(Options{Addr: "127.0.0.1:0", Ready: ready, IdleTimeout: time.Hour})
+	o.Addr, o.Ready = "127.0.0.1:0", ready
+	if o.IdleTimeout == 0 {
+		o.IdleTimeout = time.Hour
+	}
+	s, err := New(o)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -304,11 +316,11 @@ func TestVisitorsAreReclaimed(t *testing.T) {
 	<-ready
 	defer s.Close()
 
-	v, err := newVisitor(nil)
+	v, err := newVisitor(nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := v.d.Dir()
+	dir := v.dir()
 	s.mu.Lock()
 	s.visitors[v.id] = v
 	s.mu.Unlock()

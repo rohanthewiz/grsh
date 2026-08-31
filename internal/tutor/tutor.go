@@ -32,6 +32,7 @@ import (
 
 	"github.com/rohanthewiz/grsh/internal/repl"
 	"github.com/rohanthewiz/grsh/internal/runner"
+	"github.com/rohanthewiz/grsh/internal/shellexec"
 	"golang.org/x/term"
 )
 
@@ -487,6 +488,19 @@ func newChapter(all []Lesson, idx int, o chapterOpts) (*chapterRun, error) {
 		Stdout:     io.MultiWriter(o.Stdout, cap),
 		Stderr:     io.MultiWriter(o.Stderr, cap),
 		Embedded:   o.Embedded,
+	}
+	if o.Embedded {
+		// Embedded children must never read the host's stdin — the same
+		// rule the public embedding API states in session.go, and the
+		// tutor's own chapters were the one place that had not adopted it.
+		//
+		// Left to itself, runner.NewSession hands children os.Stdin. In
+		// the web tour that means a student typing a bare `cat` in a
+		// browser reads the keyboard of whoever started the server, and in
+		// a worker process (see internal/tour) it means reading the wire
+		// this program is being driven over. EOF is the only honest answer
+		// for a session whose student is not at this terminal.
+		opts.Stdin = shellexec.EOFStdin
 	}
 	if l.Explain {
 		// io.Discard, not a real writer: --explain has two halves, a line

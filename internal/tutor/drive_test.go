@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // newTestDriver starts a driver on a chapter with colour off and a fixed
@@ -351,5 +352,50 @@ func TestDriverQuits(t *testing.T) {
 	d.Submit(":quit")
 	if v := d.View(); !v.Ended || v.Code != 0 {
 		t.Errorf(":quit gave ended=%v code=%d", v.Ended, v.Code)
+	}
+}
+
+// TestEmbeddedChaptersDoNotReadTheHostsStdin.
+//
+// A session built by newChapter used to leave runner.Options.Stdin unset,
+// which hands every child process os.Stdin. In the terminal tutor that is
+// harmless — os.Stdin is the student's own keyboard. In a host it is a
+// bug with two faces: in the web tour a student typing a bare `cat` in a
+// browser reads the keyboard of whoever started the server, and in a
+// worker process (internal/tour) the same `cat` reads the wire that
+// process is being driven over.
+//
+// The public embedding API in session.go already stated the rule —
+// "embedded children must never read the host's stdin" — and the tutor's
+// own chapters were the one place that had not adopted it.
+//
+// The test replaces os.Stdin with a pipe nobody ever writes to, so a
+// `cat` that reaches it blocks forever. That is what makes this bite:
+// under `go test` os.Stdin is already /dev/null, and a chapter reading it
+// would look perfectly well behaved.
+func TestEmbeddedChaptersDoNotReadTheHostsStdin(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { w.Close(); r.Close() }()
+
+	prev := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = prev })
+
+	d, buf := newTestDriver(t, 0)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.Submit("cat")
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		// Fatal rather than Error: the goroutine is wedged holding the
+		// eval gate, and every later test in this package would block on
+		// it and report a timeout instead of this sentence.
+		t.Fatalf("`cat` read the host's stdin and never returned; transcript so far:\n%s", buf.String())
 	}
 }

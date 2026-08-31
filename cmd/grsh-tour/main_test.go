@@ -76,8 +76,9 @@ func noBrowser(t *testing.T) { t.Cleanup(swap(t, &launch, func(string) {})) }
 // code rather than after falling off the end of a function.
 func TestRunClosesPlaygroundsWhenTheServerStops(t *testing.T) {
 	noBrowser(t)
-	var dir string
-	code, stdout, stderr := runTour(t, []string{"-addr", "127.0.0.1:0", "-open=false"}, func(base string) {
+	var dir, base string
+	code, stdout, stderr := runTour(t, []string{"-addr", "127.0.0.1:0", "-open=false"}, func(u string) {
+		base = u
 		dir = visitAndReportPlayground(t, base)
 		if _, err := os.Stat(dir); err != nil {
 			t.Errorf("playground %s missing while the tour is running: %v", dir, err)
@@ -93,7 +94,7 @@ func TestRunClosesPlaygroundsWhenTheServerStops(t *testing.T) {
 	if _, err := os.Stat(dir); err == nil {
 		t.Errorf("playground %s outlived the process", dir)
 	}
-	if !strings.Contains(stdout, "http://127.0.0.1:0") {
+	if !strings.Contains(stdout, base) {
 		t.Errorf("the address was not printed for the user:\n%s", stdout)
 	}
 	if !strings.Contains(stderr, "closing playgrounds") {
@@ -198,11 +199,15 @@ func TestRunOpensTheBrowserOnce(t *testing.T) {
 	var opened []string
 	defer swap(t, &launch, func(u string) { opened = append(opened, u) })()
 
-	if _, _, _ = runTour(t, []string{"-addr", "127.0.0.1:0"}, nil); len(opened) != 1 {
+	var base string
+	_, _, _ = runTour(t, []string{"-addr", "127.0.0.1:0"}, func(u string) { base = u })
+	if len(opened) != 1 {
 		t.Fatalf("the default opened %d browser windows, want 1", len(opened))
 	}
-	if opened[0] != "http://127.0.0.1:0" {
-		t.Errorf("browser sent to %q, not the address the tour printed", opened[0])
+	// The listening address, not the requested one. A browser sent to
+	// port 0 lands nowhere.
+	if opened[0] != base {
+		t.Errorf("browser sent to %q, want %q", opened[0], base)
 	}
 
 	opened = nil
@@ -262,6 +267,78 @@ func TestRunStoreLifecycle(t *testing.T) {
 	}
 	if !st.closed() {
 		t.Error("a refused address left the progress database open")
+	}
+}
+
+// TestRunPrintsThePortTheKernelPicked: `-addr host:0` means "any free
+// port", and the port is not decided until the listener binds. Printing
+// *addr — which is what run used to do, before it served — handed the
+// user "http://127.0.0.1:0" and the real port went nowhere.
+//
+// This also pins the ordering that makes the fix possible: the URL is
+// printed after rweb signals readiness, and run does not return until
+// that has happened.
+func TestRunPrintsThePortTheKernelPicked(t *testing.T) {
+	noBrowser(t)
+	var base string
+	_, stdout, _ := runTour(t, []string{"-addr", "127.0.0.1:0", "-open=false"}, func(u string) { base = u })
+
+	if base == "" || strings.HasSuffix(base, ":0") {
+		t.Fatalf("the listener never took a real port (%q) — the test proved nothing", base)
+	}
+	if !strings.Contains(stdout, base) {
+		t.Errorf("stdout does not name the listening address %s:\n%s", base, stdout)
+	}
+	if strings.Contains(stdout, "http://127.0.0.1:0") {
+		t.Errorf("the requested port 0 was printed as if it were a place:\n%s", stdout)
+	}
+}
+
+// TestRunSaysNothingWhenTheListenerNeverStarts: the announcement is now
+// on its own goroutine waiting for readiness, and a server that never
+// becomes ready must not leave it hanging or print a URL that never
+// worked. run has to join it either way.
+func TestRunSaysNothingWhenTheListenerNeverStarts(t *testing.T) {
+	noBrowser(t)
+	defer swap(t, &serve, func(s *tour.Server, ready <-chan struct{}) error {
+		return errors.New("address already in use")
+	})()
+
+	var out, errOut bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"-addr", "127.0.0.1:0", "-open=false"}, &out, &errOut) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run never returned — the announcement goroutine was not joined")
+	}
+	if strings.Contains(out.String(), "http://") {
+		t.Errorf("a URL was printed for a server that never listened:\n%s", out.String())
+	}
+}
+
+// TestDisplayURL covers the shapes of -addr separately from the server,
+// because binding each of them in a test would mean binding a real port
+// on every interface of the machine running it.
+func TestDisplayURL(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		requested string
+		port      string // what the listener took
+		want      string
+	}{
+		{"the usual case, unchanged", "127.0.0.1:7654", "7654", "http://127.0.0.1:7654"},
+		{"port 0 takes the real port", "127.0.0.1:0", "51234", "http://127.0.0.1:51234"},
+		{"a wildcard host is a place you can go", ":7654", "7654", "http://127.0.0.1:7654"},
+		{"an IPv6 literal keeps its brackets", "[::1]:0", "51234", "http://[::1]:51234"},
+		{"no port from the listener falls back", "127.0.0.1:7654", "", "http://127.0.0.1:7654"},
+		{"not a host:port at all", "localhost:", "", "http://localhost:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := displayURL(tc.requested, tc.port); got != tc.want {
+				t.Errorf("displayURL(%q, %q) = %q, want %q", tc.requested, tc.port, got, tc.want)
+			}
+		})
 	}
 }
 

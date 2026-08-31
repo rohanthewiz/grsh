@@ -13,6 +13,12 @@
 //
 // The server runs shell commands as the user who started it. It binds to
 // loopback and refuses anything else unless told twice; see -allow-remote.
+//
+// Each browser tab gets a worker process of its own, which is this same
+// binary re-executed — a shell's working directory and environment are
+// the process's, so sharing one would mean students taking turns. That is
+// why run() answers tour.IsWorker before it does anything else, and why
+// -in-process exists to go back to one process for anyone who wants it.
 package main
 
 import (
@@ -20,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -58,10 +65,22 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 // run is main with its edges injected. It returns the process's exit code
 // rather than calling os.Exit, so that the teardown below always happens.
 func run(args []string, stdout, stderr io.Writer) int {
+	// A worker is this same binary, started again with the environment
+	// variable set, to be one visitor's shell (see internal/tour/worker.go
+	// for why a visitor gets a process of their own). It must be answered
+	// before anything else: a worker has no flags, no listener and no
+	// business printing a banner, and its whole conversation happens on
+	// three inherited descriptors.
+	if tour.IsWorker() {
+		return tour.RunWorkerProcess()
+	}
+
 	fs := flag.NewFlagSet("grsh-tour", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		addr        = fs.String("addr", "127.0.0.1:7654", "listen address")
+		addr      = fs.String("addr", "127.0.0.1:7654", "listen address")
+		inProcess = fs.Bool("in-process", false,
+			"run every visitor in this process — no worker per tab, and one slow command stops everyone")
 		allowRemote = fs.Bool("allow-remote", false,
 			"permit a non-loopback bind — the tour runs shell commands as you, so mean it")
 		openBrowser = fs.Bool("open", true, "open a browser when the server starts")
@@ -83,16 +102,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 	}
 
-	// Ready is threaded through even in production, where nothing reads
-	// it: a listener on port 0 is not knowable until it exists, and the
-	// alternative for the test that needs the port is polling, which is a
-	// race dressed up as a retry.
+	// ready is rweb's signal that the listener exists. It is not a
+	// convenience for tests: the address we print is not knowable until
+	// the listener has bound, because -addr host:0 asks the kernel to
+	// choose the port. The alternative is polling, which is a race
+	// dressed up as a retry.
+	//
+	// rweb SENDS one value here (non-blocking) rather than closing, so
+	// exactly one receiver may read it. Both the announcement below and
+	// the serve hook need to know, so this channel has a single reader
+	// and `started`, which that reader closes, is what everything else
+	// waits on.
 	ready := make(chan struct{}, 1)
 	opts := tour.Options{
 		Addr:        *addr,
 		AllowRemote: *allowRemote,
 		IdleTimeout: *idle,
 		Verbose:     *verbose,
+		InProcess:   *inProcess,
 		Ready:       ready,
 	}
 	var store tutor.Store
@@ -112,12 +139,38 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	url := "http://" + *addr
-	fmt.Fprintf(stdout, "grsh tour · %s\n%s\n", version, url)
-	fmt.Fprintln(stdout, "Each browser tab gets its own playground. Ctrl+C ends the tour and removes them.")
-	if *openBrowser {
-		launch(url)
-	}
+	// The announcement waits for the listener, for two reasons that used
+	// to be two bugs: with -addr host:0 the port in *addr is 0 and the
+	// one the kernel picked never reached the user, and the browser was
+	// launched at an address that might not yet accept connections.
+	//
+	// It has to happen on another goroutine because serve blocks until a
+	// signal arrives, and run joins it below so that nothing prints after
+	// the shutdown notice — and so that a test reading stdout is reading
+	// a finished buffer rather than one still being written.
+	var (
+		started   = make(chan struct{}) // closed once the listener is up
+		stopped   = make(chan struct{}) // closed once serve has returned
+		announced = make(chan struct{}) // closed once the goroutine is done
+	)
+	go func() {
+		defer close(announced)
+		select {
+		case <-ready:
+			close(started)
+		case <-stopped:
+			// The server ended without ever listening — a refused bind,
+			// or a hook that never served. There is no URL to give, and
+			// the error on the way out says everything there is to say.
+			return
+		}
+		url := displayURL(*addr, srv.Port())
+		fmt.Fprintf(stdout, "grsh tour · %s\n%s\n", version, url)
+		fmt.Fprintln(stdout, "Each browser tab gets its own playground. Ctrl+C ends the tour and removes them.")
+		if *openBrowser {
+			launch(url)
+		}
+	}()
 
 	// rweb's Run installs its own SIGINT/SIGTERM handler and returns when
 	// one arrives, so shutdown here is "Run returned" rather than a signal
@@ -126,7 +179,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// registered channel, so the two race — and ours loses, because Run
 	// returns and main falls off the end while the handler is still
 	// tearing down. The playgrounds survive the process that made them.
-	runErr := serve(srv, ready)
+	runErr := serve(srv, started)
+	close(stopped)
+	<-announced
 
 	// Teardown runs whatever ended the server. Every visitor holds a
 	// directory in $TMPDIR and a live shell session, and neither a signal
@@ -141,6 +196,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitServe
 	}
 	return exitOK
+}
+
+// displayURL is the address to hand the user, built from what they asked
+// for and what the listener actually took. They differ in exactly one
+// case that matters — a request for port 0, where the kernel chooses —
+// and printing the request there gives out "http://127.0.0.1:0", which
+// is not a place.
+//
+// port is Server.Port, valid only after the listener is up; an empty one
+// means we could not learn it, and the requested port is a better answer
+// than nothing.
+func displayURL(requested, port string) string {
+	host, reqPort, err := net.SplitHostPort(requested)
+	if err != nil {
+		// Not a host:port at all. rweb accepts some of these (a bare
+		// "localhost:" among them) and there is nothing better to say
+		// than what we were handed.
+		return "http://" + requested
+	}
+	if port == "" {
+		port = reqPort
+	}
+	if host == "" {
+		// `-addr :7654` binds every interface, and no URL means "every
+		// interface". The machine that started the tour is the one that
+		// will be taking it.
+		host = "127.0.0.1"
+	}
+	// JoinHostPort rather than concatenation, so that an IPv6 literal
+	// keeps the brackets a URL needs around it.
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 // browse opens the page in the user's browser, and shrugs if it cannot —

@@ -30,10 +30,22 @@
 // flag, and that is not a security boundary — it is a reminder that there
 // is no boundary to speak of. Do not put this on a network.
 //
-// Visitors are cheap but not free: each one holds a playground on disk and
-// a live shell session, and they take turns to evaluate (see
-// tutor's eval gate), so this comfortably serves a few tabs on one machine
-// and nothing more ambitious than that.
+// # A process per visitor
+//
+// Each visitor gets a worker process of their own — see worker.go, which
+// explains why at length. The short version is that a grsh session's
+// working directory and environment ARE the process's, so students in one
+// process have to take turns, and one student's `sleep 30` is thirty
+// seconds of everyone else's time.
+//
+// The requirement that comes with it: a host must call IsWorker() before
+// its own startup and hand off to RunWorkerProcess, because a worker is
+// the same executable started again. Options.InProcess opts out and takes
+// the serialization back.
+//
+// Visitors are cheap but not free: each one holds a process, a playground
+// on disk and a live shell session, so this comfortably serves a few tabs
+// on one machine and nothing more ambitious than that.
 package tour
 
 import (
@@ -67,6 +79,20 @@ type Options struct {
 	// a sensible default.
 	IdleTimeout time.Duration
 	Verbose     bool
+	// InProcess runs every visitor's driver in this process instead of in
+	// a worker of their own.
+	//
+	// The default — a worker per visitor — is what makes students actually
+	// independent: a grsh session's working directory and environment are
+	// the PROCESS's, so sharing one means taking turns, and one student's
+	// `sleep 30` is thirty seconds of everyone else's time. See worker.go.
+	//
+	// The cost of that default is a requirement on the host: it must call
+	// tour.IsWorker() before its own startup and hand off to RunWorker,
+	// because a worker is this same executable started again. A host that
+	// cannot do that — or a test that wants no subprocesses — sets this
+	// and gets the old behaviour, serialization included.
+	InProcess bool
 	// Ready, when set, is closed as the server enters its listen loop.
 	// A caller that binds to port 0 needs it: the port is not knowable
 	// until the listener exists, and polling for it is a race dressed up
@@ -138,9 +164,18 @@ func (s *Server) Close() {
 	}
 	clear(s.visitors)
 	s.mu.Unlock()
+	// Concurrently, because each one may have a command to stop and a
+	// process to reap, and a shutdown that did them in turn would take as
+	// long as the slowest visitor times the number of tabs.
+	var wg sync.WaitGroup
 	for _, v := range vs {
-		v.close()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v.close()
+		}()
 	}
+	wg.Wait()
 }
 
 // routes wires the surface. It is deliberately small: two streams (input
@@ -295,7 +330,7 @@ func (s *Server) visitorFor(ctx rweb.Context, create bool) (*visitor, error) {
 	// Built outside the lock: opening a chapter writes a playground to
 	// disk, and holding the map's lock across that would serialize every
 	// first visit behind it.
-	v, err := newVisitor(s.opts.Store)
+	v, err := newVisitor(s.opts.Store, s.opts.InProcess)
 	if err != nil {
 		return nil, err
 	}

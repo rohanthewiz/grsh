@@ -65,7 +65,10 @@ import (
 // What is left after both of these is the serialization itself, and that
 // is not fixable at this layer: one student's `sleep 30` blocks every
 // other student's next command for thirty seconds. Isolating students
-// properly means a process each.
+// properly means a process each, which is what the web tour now does —
+// see internal/tour/worker.go. This gate is still correct and still what
+// runs when a host keeps its drivers in one process (tour's
+// Options.InProcess, and the terminal tutor, which only ever has one).
 var evalGate sync.Mutex
 
 // Driver runs the curriculum for one student outside the REPL loop.
@@ -170,6 +173,30 @@ func ResumeChapter(store Store) int {
 	}
 	idx, _ := resumeChapter(lessons(), store.Load)
 	return idx
+}
+
+// SnapshotProgress reads every record this student has, one per lesson.
+//
+// It exists for a host that cannot share the store itself. The web tour's
+// worker processes are the case: the database is a file one process holds
+// open, so the parent reads the whole of a student's progress once — it is
+// one small record per chapter — and hands it to the worker, which serves
+// its own Loads from the copy and posts its Saves back.
+//
+// Only lessons with a record appear, so "never started" stays
+// distinguishable from "started and reset", which is a distinction the
+// resume logic depends on.
+func SnapshotProgress(store Store) []Record {
+	if store == nil {
+		return nil
+	}
+	var out []Record
+	for _, l := range lessons() {
+		if rec, ok := store.Load(l.ID); ok {
+			out = append(out, rec)
+		}
+	}
+	return out
 }
 
 // Submit feeds one physical line of input.
