@@ -226,15 +226,24 @@ func (s *Server) input(ctx rweb.Context) error {
 	return ctx.WriteJSON(view)
 }
 
-// interrupt is the stop button. It does not take the visitor's lock — the
-// one moment it is worth anything is while a command is running and that
-// lock is held.
+// interrupt is the stop button, and the page's Ctrl+C. It does not take
+// the visitor's lock — the one moment it is worth anything is while a
+// command is running and that lock is held.
+//
+// `?hard=1` escalates to SIGKILL. The page asks for it on a second Ctrl+C,
+// which is the browser's version of the terminal habit: the first one asks
+// the pipeline to stop, the second stops it. The two are separate requests
+// rather than one call that retries, because nothing here should decide on
+// a student's behalf that a program has had long enough.
 func (s *Server) interrupt(ctx rweb.Context) error {
 	v, err := s.visitorFor(ctx, false)
 	if err != nil {
 		return ctx.SetStatus(404).WriteJSON(map[string]string{"error": "no session"})
 	}
-	return ctx.WriteJSON(map[string]bool{"signalled": v.d.Interrupt()})
+	if ctx.Request().QueryParam("hard") == "1" {
+		return ctx.WriteJSON(map[string]bool{"signalled": v.kill(), "hard": true})
+	}
+	return ctx.WriteJSON(map[string]bool{"signalled": v.interrupt(), "hard": false})
 }
 
 // reset throws the session away and starts the curriculum over with a

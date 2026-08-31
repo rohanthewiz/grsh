@@ -16,8 +16,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -29,47 +31,92 @@ import (
 
 const version = "0.2.0-dev"
 
-func main() {
+// Exit codes, named because the tests assert them: a tour that reported a
+// refused bind as success would be a bad thing to script against.
+const (
+	exitOK    = 0
+	exitServe = 1 // the listener failed while running
+	exitUsage = 2 // bad flags, or an address we will not bind
+)
+
+// The three things main does that a test cannot let it do, in variables so
+// a test can stand in for them.
+//
+// This is the only reason main is not one function: serve blocks until a
+// signal arrives, openStore takes the developer's own ~/.grsh_tutor.db,
+// and launch opens a browser window on the machine running the tests. What
+// is left — the flags, the wiring, and above all the shutdown order — is
+// the part worth pinning, and it is now reachable.
+var (
+	serve     = func(s *tour.Server, ready <-chan struct{}) error { return s.Run() }
+	openStore = func() tutor.Store { return tutor.OpenStore() }
+	launch    = browse
+)
+
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+
+// run is main with its edges injected. It returns the process's exit code
+// rather than calling os.Exit, so that the teardown below always happens.
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("grsh-tour", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var (
-		addr        = flag.String("addr", "127.0.0.1:7654", "listen address")
-		allowRemote = flag.Bool("allow-remote", false,
+		addr        = fs.String("addr", "127.0.0.1:7654", "listen address")
+		allowRemote = fs.Bool("allow-remote", false,
 			"permit a non-loopback bind — the tour runs shell commands as you, so mean it")
-		openBrowser = flag.Bool("open", true, "open a browser when the server starts")
-		progress    = flag.Bool("progress", false,
+		openBrowser = fs.Bool("open", true, "open a browser when the server starts")
+		progress    = fs.Bool("progress", false,
 			"remember chapter progress in ~/.grsh_tutor.db (holds the file open, so `grsh tutor` cannot)")
-		idle    = flag.Duration("idle", 30*time.Minute, "reclaim a playground after this long without a request")
-		verbose = flag.Bool("v", false, "log requests")
-		showVer = flag.Bool("version", false, "print version and exit")
+		idle    = fs.Duration("idle", 30*time.Minute, "reclaim a playground after this long without a request")
+		verbose = fs.Bool("v", false, "log requests")
+		showVer = fs.Bool("version", false, "print version and exit")
 	)
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		// -h is a request that was answered, not a mistake.
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitUsage
+	}
 	if *showVer {
-		fmt.Println("grsh-tour " + version)
-		return
+		fmt.Fprintln(stdout, "grsh-tour "+version)
+		return exitOK
 	}
 
+	// Ready is threaded through even in production, where nothing reads
+	// it: a listener on port 0 is not knowable until it exists, and the
+	// alternative for the test that needs the port is polling, which is a
+	// race dressed up as a retry.
+	ready := make(chan struct{}, 1)
 	opts := tour.Options{
 		Addr:        *addr,
 		AllowRemote: *allowRemote,
 		IdleTimeout: *idle,
 		Verbose:     *verbose,
+		Ready:       ready,
 	}
 	var store tutor.Store
 	if *progress {
-		store = tutor.OpenStore()
+		store = openStore()
 		opts.Store = store
 	}
 
 	srv, err := tour.New(opts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "grsh-tour: %v\n", err)
-		os.Exit(2)
+		// The loopback refusal lands here. Closing the store first: New
+		// failing means nothing will ever call the teardown below.
+		if store != nil {
+			_ = store.Close()
+		}
+		fmt.Fprintf(stderr, "grsh-tour: %v\n", err)
+		return exitUsage
 	}
 
 	url := "http://" + *addr
-	fmt.Printf("grsh tour · %s\n%s\n", version, url)
-	fmt.Println("Each browser tab gets its own playground. Ctrl+C ends the tour and removes them.")
+	fmt.Fprintf(stdout, "grsh tour · %s\n%s\n", version, url)
+	fmt.Fprintln(stdout, "Each browser tab gets its own playground. Ctrl+C ends the tour and removes them.")
 	if *openBrowser {
-		browse(url)
+		launch(url)
 	}
 
 	// rweb's Run installs its own SIGINT/SIGTERM handler and returns when
@@ -79,37 +126,43 @@ func main() {
 	// registered channel, so the two race — and ours loses, because Run
 	// returns and main falls off the end while the handler is still
 	// tearing down. The playgrounds survive the process that made them.
-	runErr := srv.Run()
+	runErr := serve(srv, ready)
 
 	// Teardown runs whatever ended the server. Every visitor holds a
 	// directory in $TMPDIR and a live shell session, and neither a signal
 	// nor a failed listener removes them on its own.
-	fmt.Fprintln(os.Stderr, "\ngrsh-tour: closing playgrounds…")
+	fmt.Fprintln(stderr, "\ngrsh-tour: closing playgrounds…")
 	srv.Close()
 	if store != nil {
 		_ = store.Close()
 	}
 	if runErr != nil {
-		fmt.Fprintf(os.Stderr, "grsh-tour: %v\n", runErr)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "grsh-tour: %v\n", runErr)
+		return exitServe
 	}
+	return exitOK
 }
 
 // browse opens the page in the user's browser, and shrugs if it cannot —
 // the address has already been printed, and a tour that refused to start
 // because it could not find a browser would be absurd.
 func browse(url string) {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
-	}
+	cmd := browseCmd(url)
 	// Started, not run: the launcher may outlive us on some desktops, and
 	// waiting on it would hold the tour's startup hostage to a browser
 	// that takes its time.
 	_ = cmd.Start()
+}
+
+// browseCmd is the per-platform half, split out so it can be checked
+// without opening a window on the machine running the tests.
+func browseCmd(url string) *exec.Cmd {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", url)
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		return exec.Command("xdg-open", url)
+	}
 }

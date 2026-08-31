@@ -2,6 +2,7 @@ package tutor
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -249,6 +250,61 @@ func TestDriversKeepSeparatePlaygrounds(t *testing.T) {
 	}
 	if got := bufB.String(); strings.Contains(got, "/notes") {
 		t.Errorf("driver A's cd moved driver B: %q", got)
+	}
+}
+
+// TestDriversKeepSeparateEnvironments is the cwd test's other half.
+//
+// `export` writes the real process environment (see internal/shellexec),
+// which is a deliberate choice for a shell and a hazard for a host running
+// several students in one process: without the restore in Driver.locked,
+// one student's export is every student's export, and — because exec hands
+// children os.Environ() — every student's child processes see it too.
+//
+// The three cases below are the three branches of that restore: a value
+// each driver owns differently, a variable one driver has and the other
+// never did, and a variable the neighbour deleted.
+func TestDriversKeepSeparateEnvironments(t *testing.T) {
+	t.Cleanup(func() {
+		for _, k := range []string{"TOUR_WHO", "TOUR_ONLY_A", "TOUR_SHARED"} {
+			_ = os.Unsetenv(k)
+		}
+	})
+	a, bufA := newTestDriver(t, 0)
+	b, bufB := newTestDriver(t, 0)
+
+	// Same name, different values: whoever ran last must not win.
+	a.Submit("export TOUR_WHO=alice")
+	b.Submit("export TOUR_WHO=bob")
+	bufA.Reset()
+	bufB.Reset()
+	a.Submit(`echo "who:$TOUR_WHO:"`)
+	b.Submit(`echo "who:$TOUR_WHO:"`)
+	if got := bufA.String(); !strings.Contains(got, "who:alice:") {
+		t.Errorf("driver A lost its own export: %q", got)
+	}
+	if got := bufB.String(); !strings.Contains(got, "who:bob:") {
+		t.Errorf("driver B lost its own export: %q", got)
+	}
+
+	// A name only one driver ever exported must be absent for the other,
+	// not merely stale.
+	a.Submit("export TOUR_ONLY_A=1")
+	bufB.Reset()
+	b.Submit(`echo "only:$TOUR_ONLY_A:"`)
+	if got := bufB.String(); !strings.Contains(got, "only::") {
+		t.Errorf("driver A's export leaked into driver B: %q", got)
+	}
+
+	// And an unset by one driver must not delete the other's copy — the
+	// branch that puts a missing variable back.
+	a.Submit("export TOUR_SHARED=keep")
+	b.Submit("export TOUR_SHARED=drop")
+	b.Submit("unset TOUR_SHARED")
+	bufA.Reset()
+	a.Submit(`echo "shared:$TOUR_SHARED:"`)
+	if got := bufA.String(); !strings.Contains(got, "shared:keep:") {
+		t.Errorf("driver B's unset reached driver A: %q", got)
 	}
 }
 

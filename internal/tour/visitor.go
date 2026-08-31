@@ -28,6 +28,12 @@ type visitor struct {
 	// behind the command it is stopping is not a stop button.
 	mu sync.Mutex
 	d  *tutor.Driver
+	// dMu guards the d POINTER, and nothing the pointer leads to. It
+	// exists because interrupt deliberately does not take mu: a restart
+	// swaps the driver while mu is held, and the signal path reads the
+	// field with mu belonging to someone else. Held for a load and a
+	// store, never across a call.
+	dMu sync.Mutex
 
 	seenMu sync.Mutex
 	seen   time.Time
@@ -66,8 +72,36 @@ func (v *visitor) start(store tutor.Store) error {
 	if err != nil {
 		return err
 	}
+	v.dMu.Lock()
 	v.d = d
+	v.dMu.Unlock()
 	return nil
+}
+
+// driver reads the current driver without waiting for whatever is running
+// on it. Only the signal path needs this; every other caller already holds
+// mu, which excludes the one writer.
+func (v *visitor) driver() *tutor.Driver {
+	v.dMu.Lock()
+	defer v.dMu.Unlock()
+	return v.d
+}
+
+// interrupt is SIGINT to the student's foreground pipeline: the stop
+// button, and Ctrl+C in the page's input.
+func (v *visitor) interrupt() bool {
+	d := v.driver()
+	return d != nil && d.Interrupt()
+}
+
+// kill is the escalation, for a pipeline that ignored SIGINT — a second
+// Ctrl+C, the way a terminal user reaches for `kill -9` after the first
+// one does nothing. Separated from interrupt rather than retried
+// automatically, because SIGKILL leaves no chance to clean up and the
+// student is better placed than a timer to decide they have waited enough.
+func (v *visitor) kill() bool {
+	d := v.driver()
+	return d != nil && d.Kill()
 }
 
 // submit feeds physical lines and returns the resulting View. The lines go

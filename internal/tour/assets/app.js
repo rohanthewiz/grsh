@@ -80,13 +80,60 @@ function wrap(chunk, state) {
   return cls.length ? `<span class="${cls.join(" ")}">${body}</span>` : body;
 }
 
+// The page keeps its own bound, because the server's is not one it can
+// borrow: the replay buffer caps what a RELOAD redraws, while a tab left
+// open for hours only ever grows — every write is another node, and a
+// transcript nobody has reloaded is a leak with a scrollbar. The numbers
+// are larger than the server's replay so a reload never visibly loses
+// something the live page still had, and the gap between them means
+// trimming runs occasionally rather than on every write.
+const TRANSCRIPT_MAX = 600000;   // characters, above which the head goes
+const TRANSCRIPT_KEEP = 450000;  // characters kept when it does
+let transcriptChars = 0;
+
 function append(text) {
   // Sticking to the bottom only when the reader is already there: a
   // student scrolled up to re-read a hint should not be yanked back down
   // by a background job's notification.
   const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 40;
   transcript.insertAdjacentHTML("beforeend", ansiToHTML(text));
+  transcriptChars += text.length;
+  trimTranscript();
   if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+}
+
+// trimTranscript drops leading nodes until the page is back under budget.
+//
+// Whole child nodes, never a slice of one: each span carries its own
+// classes, so removing any prefix of them leaves the rest rendering
+// exactly as before. There is no colour state to repair here — that is a
+// problem only the server's byte-stream trim has.
+function trimTranscript() {
+  if (transcriptChars <= TRANSCRIPT_MAX) return;
+  // Take the old notice down first so notices cannot stack up, one per
+  // trim, at the top of the transcript.
+  const old = transcript.firstElementChild;
+  if (old && old.classList.contains("trimmed")) {
+    transcriptChars -= old.textContent.length;
+    old.remove();
+  }
+  while (transcriptChars > TRANSCRIPT_KEEP && transcript.firstChild) {
+    transcriptChars -= transcript.firstChild.textContent.length;
+    transcript.firstChild.remove();
+  }
+  const note = document.createElement("span");
+  note.className = "trimmed d";
+  note.textContent = "[… earlier output dropped — this tab keeps the most recent output …]\n";
+  transcript.insertBefore(note, transcript.firstChild);
+  transcriptChars += note.textContent.length;
+}
+
+// clearTranscript empties both the DOM and the accounting that shadows it.
+// Two places, so it is a function: a reset that forgot the counter would
+// leave the next long session trimming a transcript that is not there.
+function clearTranscript() {
+  transcript.innerHTML = "";
+  transcriptChars = 0;
 }
 
 // ── the stream ────────────────────────────────────────────────────
@@ -98,13 +145,13 @@ function connect() {
     if (msg.replay) {
       // A replay IS the transcript, not an addition to it: a reconnect
       // that appended would double everything already on screen.
-      transcript.innerHTML = "";
+      clearTranscript();
       ansiState.bold = false; ansiState.dim = false; ansiState.fg = 0;
     }
     append(msg.text);
   });
   es.addEventListener("state", (e) => render(JSON.parse(e.data)));
-  es.addEventListener("clear", () => { transcript.innerHTML = ""; });
+  es.addEventListener("clear", () => clearTranscript());
   es.onerror = () => { /* EventSource reconnects on its own */ };
 }
 
@@ -289,6 +336,63 @@ lineInput.addEventListener("input", () => {
   }, 120);
 });
 
+// ── interrupt ─────────────────────────────────────────────────────
+//
+// Ctrl+C has to be caught on the DOCUMENT, not on the input, and that is
+// the whole reason this took a second pass: while a command runs the input
+// is disabled, and a disabled input receives no key events at all — so the
+// one moment Ctrl+C means anything is the one moment the obvious listener
+// is deaf.
+//
+// It is also the browser's copy shortcut. A keypress with something
+// selected is left alone; taking it would make the transcript unquotable,
+// which is a worse loss than a stop button that needs the mouse.
+
+let lastInterrupt = 0; // when the previous Ctrl+C was sent
+
+// interrupt asks the server to signal the running pipeline. `hard`
+// escalates to SIGKILL — the second Ctrl+C, once the first has visibly
+// failed to stop anything.
+async function interrupt(hard) {
+  lastInterrupt = Date.now();
+  append(hard ? "\x1b[2m[killing…]\x1b[0m\n" : "^C\n");
+  try {
+    const res = await fetch("/interrupt" + (hard ? "?hard=1" : ""), { method: "POST" });
+    const { signalled } = await res.json();
+    // Nothing running is not a failure — it is the ordinary case of Ctrl+C
+    // at an idle prompt — so only a hard kill that found nothing is worth
+    // a word, since the student asked for it twice by then.
+    if (hard && !signalled) append("\x1b[2m[nothing was running]\x1b[0m\n");
+  } catch (e) {
+    append("\x1b[33m[could not reach the tour server to interrupt]\x1b[0m\n");
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  // Lower-cased because Caps Lock makes it "C", and a student who has left
+  // Caps Lock on is exactly the student most likely to want out of what
+  // they just ran.
+  if (e.key?.toLowerCase() !== "c" || !e.ctrlKey || e.metaKey || e.altKey) return;
+  if ((window.getSelection()?.toString() ?? "") !== "") return; // let it copy
+  e.preventDefault();
+  if (!busy) {
+    // Idle, so there is nothing to signal: this is the prompt-level Ctrl+C,
+    // which in any shell abandons the half-typed line. Doing it locally
+    // rather than by round trip keeps it instant and keeps a discarded
+    // draft out of the session's history.
+    append("^C\n");
+    lineInput.value = "";
+    lane.innerHTML = "";
+    histPos = history.length;
+    lineInput.focus();
+    return;
+  }
+  // Busy. A second Ctrl+C while still busy escalates — the interval is
+  // there so a double-tap on one stubborn command is an escalation and two
+  // separate interrupts, minutes apart, are not.
+  interrupt(Date.now() - lastInterrupt < 3000);
+});
+
 $("btnTry").onclick = () => { lineInput.value = view.try.split("\n")[0]; lineInput.focus(); };
 $("btnHint").onclick = () => send(":hint");
 $("btnSol").onclick = () => send(":sol");
@@ -296,10 +400,12 @@ $("btnSkip").onclick = () => send(":skip");
 $("btnNext").onclick = () => send(":next");
 $("btnKeep").onclick = () => send(":keep");
 
-$("stop").onclick = () => fetch("/interrupt", { method: "POST" });
+// The button is Ctrl+C for the mouse, escalation included: a second click
+// on a command that ignored the first does what a second Ctrl+C does.
+$("stop").onclick = () => interrupt(busy && Date.now() - lastInterrupt < 3000);
 $("reset").onclick = async () => {
   if (!confirm("Throw this playground away and start the curriculum over?")) return;
-  transcript.innerHTML = "";
+  clearTranscript();
   const res = await fetch("/reset", { method: "POST" });
   if (res.ok) render(await res.json());
 };

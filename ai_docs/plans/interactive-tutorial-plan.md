@@ -314,7 +314,14 @@ progress must never cost a student their lesson.
    tabs on one machine, and one student's `sleep 30` delays another's
    next command. It binds to loopback and refuses more without
    `-allow-remote`, since it runs shell commands as the user.
-   Three bugs found by running it that no Go test could have caught
+   The gate now restores the ENVIRONMENT as well as the working
+   directory (2026-08-30). `export` writes process-global state too, so
+   one student's export was every student's, and every student's child
+   processes saw it — exec hands them `os.Environ()`. It is the same
+   record-and-reinstate the cwd already had, costing one `os.Environ()`
+   and a map per evaluation beside a fork. What is left needing a process
+   per visitor is the serialization itself, and only that.
+   Four bugs found by running it that no Go test could have caught
    alone, all now pinned: rweb labelled SSE responses `Content-Encoding:
    text/plain` (a media type where a content coding belongs), which Go's
    http client ignores and every browser treats as an undecodable body —
@@ -322,9 +329,26 @@ progress must never cost a student their lesson.
    which sends no such header; the tour's local override is gone and only
    the assertion remains); rweb's `Run` installs its own
    SIGTERM handler and returns, so a second handler in main raced it and
-   lost, leaking a playground per Ctrl+C; and the table of contents
+   lost, leaking a playground per Ctrl+C; the table of contents
    ticked off every chapter *before* the current one, congratulating a
-   student who had jumped for work they never did.
+   student who had jumped for work they never did; and the transcript's
+   bound, once it was made to cut on a line boundary, emptied itself on
+   any program whose output is one long line — macOS `base64` writes the
+   whole encoding unwrapped, so "advance to the next newline" found the
+   one at the END of the buffer and kept nothing. The walk is bounded now
+   (`internal/tour/sink.go`, lineScan), and the regression test is
+   written against output whose only newline is its last byte, because
+   that is the shape that breaks it.
+   Closing out (2026-08-30): the page has a real Ctrl+C. It is bound on
+   the DOCUMENT, not the input, because the input is disabled while a
+   command runs and a disabled input receives no key events — the one
+   moment it matters is the one moment the obvious listener is deaf. A
+   selection is left to the browser to copy; an idle Ctrl+C discards the
+   half-typed line locally; a second one while still busy escalates to
+   `Driver.Kill` through `POST /interrupt?hard=1`. And `cmd/grsh-tour` is
+   `run(args, stdout, stderr)` with three injectable seams, so the
+   shutdown order it exists to get right is finally its own test rather
+   than an inference from `tour`'s.
 
 ## Risks / open questions
 

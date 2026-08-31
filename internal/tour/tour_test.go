@@ -3,6 +3,7 @@ package tour
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -11,8 +12,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rohanthewiz/grsh/internal/tutor"
+	"github.com/rohanthewiz/rweb"
 )
 
 // newTestServer starts a tour on a loopback port the kernel picks, and
@@ -385,6 +388,195 @@ func TestRequireLoopback(t *testing.T) {
 	}
 }
 
+// TestTourInterruptStopsACommand is the stop button and the page's Ctrl+C
+// end to end: a real pipeline, a real SIGINT, and a Submit that returns
+// because of it.
+//
+// The signal path is the one part of the tour that must NOT wait for the
+// visitor's lock — Submit holds it for the whole of a running command — so
+// a test that only checked the reply on an idle session would pass with
+// the lock taken and prove nothing.
+func TestTourInterruptStopsACommand(t *testing.T) {
+	_, c, base := newTestServer(t)
+	get(t, c, base+"/")
+	events, stopStream := stream(t, c, base)
+	defer stopStream()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// The echo is the starting gun: `sleep` alone gives the test no way
+		// to know the pipeline has actually been forked, and interrupting
+		// before it exists would signal nothing and look like success.
+		submit(t, c, base, "echo running; sleep 30")
+	}()
+	waitFor(t, events, "running")
+
+	// Poll, because the two commands are one unit: `sleep` is forked a
+	// moment after `echo` reaches the page, and a single early SIGINT
+	// would find no foreground pipeline to deliver to.
+	deadline := time.After(15 * time.Second)
+	for signalled := false; !signalled; {
+		select {
+		case <-deadline:
+			t.Fatal("nothing was ever signalled")
+		case <-time.After(50 * time.Millisecond):
+		}
+		signalled = post(t, c, base+"/interrupt")["signalled"]
+	}
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("SIGINT did not end the command — a 30s sleep outlived it")
+	}
+}
+
+// TestTourInterruptEscalates: `?hard=1` is the second Ctrl+C. Nothing here
+// can portably prove SIGKILL beats a program that ignores SIGINT, so what
+// is pinned is the routing — that the parameter reaches Kill rather than
+// being silently ignored, which is how this would actually break.
+func TestTourInterruptEscalates(t *testing.T) {
+	_, c, base := newTestServer(t)
+	get(t, c, base+"/")
+
+	// Idle: both forms answer, and both say honestly that they signalled
+	// nothing. The page relies on that to stay quiet about an idle Ctrl+C.
+	for _, q := range []string{"", "?hard=1"} {
+		got := post(t, c, base+"/interrupt"+q)
+		if got["signalled"] {
+			t.Errorf("POST /interrupt%s on an idle session claimed to signal something", q)
+		}
+		if want := q != ""; got["hard"] != want {
+			t.Errorf("POST /interrupt%s reported hard=%v, want %v", q, got["hard"], want)
+		}
+	}
+
+	// And it is still a session-scoped capability, not an open endpoint.
+	bare := &http.Client{Timeout: 5 * time.Second}
+	res, err := bare.Post(base+"/interrupt", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 404 {
+		t.Errorf("POST /interrupt without a session: status %d, want 404", res.StatusCode)
+	}
+}
+
+// TestTranscriptTrimsOnLineBoundaries: the replay buffer is bounded, and
+// what it drops it drops cleanly.
+//
+// A window slid to an arbitrary byte can land inside a UTF-8 rune or an
+// ANSI escape, and both reach the browser as visible damage — a
+// replacement character, or `[1;36m` printed literally mid-word. Cutting
+// forward to a line boundary avoids both, and the notice is what keeps the
+// loss from looking like a session that began mid-sentence.
+func TestTranscriptTrimsOnLineBoundaries(t *testing.T) {
+	const limit = 4 << 10
+	s := newSink(limit)
+
+	// Coloured, accented lines: every line carries an escape sequence and a
+	// multi-byte rune, so a careless cut has plenty to land inside.
+	for i := range 400 {
+		fmt.Fprintf(s, "\x1b[36mline %d — naïve ✓\x1b[0m\n", i)
+	}
+	s.mu.Lock()
+	log := string(s.log)
+	trimmed := s.trimmed
+	s.mu.Unlock()
+
+	if !trimmed {
+		t.Fatalf("400 lines did not exceed a %d byte transcript (%d bytes held)", limit, len(log))
+	}
+	if len(log) > limit {
+		t.Errorf("transcript is %d bytes, over its %d byte limit", len(log), limit)
+	}
+	if !utf8.ValidString(log) {
+		t.Error("the trim cut a rune in half")
+	}
+	if !strings.HasPrefix(log, "\x1b[36mline ") {
+		t.Errorf("the trim did not land on a line boundary: %.40q", log)
+	}
+	if !strings.HasSuffix(log, "line 399 — naïve ✓\x1b[0m\n") {
+		t.Errorf("the trim dropped the tail instead of the head: %.60q", log[max(0, len(log)-60):])
+	}
+
+	// A browser attaching now must be told, and told before the text: a
+	// student who scrolls to the top should find the gap, not a sentence
+	// that starts nowhere. The notice ends in a reset, which also repairs
+	// the colour the cut left open.
+	raw := <-s.attach()
+	ev, ok := raw.(rweb.SSEvent)
+	if !ok {
+		t.Fatalf("attach delivered %T, not an SSE event", raw)
+	}
+	frame, _ := ev.Data.(string)
+	if !strings.Contains(frame, "earlier output dropped") {
+		t.Errorf("the replay did not admit the gap: %.120q", frame)
+	}
+	if !strings.Contains(frame, `4KB`) {
+		t.Errorf("the notice does not say how much is kept: %.120q", frame)
+	}
+
+	// A reset starts the accounting over; a stale flag would have every
+	// later replay apologising for a gap that is no longer there.
+	s.clear()
+	s.mu.Lock()
+	stillTrimmed := s.trimmed
+	s.mu.Unlock()
+	if stillTrimmed {
+		t.Error("clear left the transcript still marked as trimmed")
+	}
+}
+
+// TestTranscriptTrimsAnUnbrokenLine is the fallback path, and it is here
+// because the bug it describes shipped for an afternoon.
+//
+// A program whose output is one enormous line is not exotic: macOS
+// `base64` writes the whole encoding unwrapped, and the tour's playground
+// is a place students are invited to try exactly that sort of thing. Cut
+// forward to "the next newline" without a bound and the newline you find
+// is the one at the END of that line — so the trim keeps nothing, and a
+// student who floods their transcript reloads into an empty terminal.
+//
+// The trailing newline in the second case is the entire point. Without it
+// the search fails and the fallback runs for the right reason by accident;
+// with it, the search SUCCEEDS and returns an offset near the end of the
+// buffer, which is the case that was broken.
+func TestTranscriptTrimsAnUnbrokenLine(t *testing.T) {
+	const limit = 1 << 10
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{"no newline at all", strings.Repeat("é", limit)},
+		{"one line, newline only at the end", strings.Repeat("é", limit) + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSink(limit)
+			fmt.Fprint(s, tc.text)
+			s.mu.Lock()
+			log := string(s.log)
+			s.mu.Unlock()
+
+			if len(log) > limit {
+				t.Errorf("transcript is %d bytes, over its %d byte limit", len(log), limit)
+			}
+			if !utf8.ValidString(log) {
+				t.Error("the trim cut through a rune")
+			}
+			// The bound exists so that a long line costs at most a window,
+			// not the transcript. Half the limit is a generous floor that
+			// still fails loudly for a trim that kept nothing.
+			if len(log) < limit/2 {
+				t.Errorf("the trim kept only %d of %d bytes — a long line emptied the transcript",
+					len(log), limit)
+			}
+		})
+	}
+}
+
 // ── helpers ──────────────────────────────────────────────────────
 
 // stream opens an SSE connection and delivers one string per frame's data
@@ -444,3 +636,23 @@ func mustURL(t *testing.T, base string) *url.URL {
 
 // statDir is os.Stat, named for what the one caller asks of it.
 func statDir(dir string) (os.FileInfo, error) { return os.Stat(dir) }
+
+// post is a POST returning the decoded boolean map the signal endpoints
+// answer with, failing the test on anything but 200.
+func post(t *testing.T, c *http.Client, url string) map[string]bool {
+	t.Helper()
+	res, err := c.Post(url, "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("POST %s: status %d: %s", url, res.StatusCode, b)
+	}
+	var got map[string]bool
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatalf("decode %s: %v", url, err)
+	}
+	return got
+}

@@ -231,3 +231,14 @@ main {
 .f35 { color: #d3a0e0; }
 .f36 { color: var(--code); }
 .f37 { color: var(--fg); }
+
+/* The head-of-transcript notice. Italic and set apart, because it is the
+   page talking about itself rather than anything the shell printed, and a
+   student scrolled to the top should be able to tell those apart. */
+.trimmed {
+  display: block;
+  font-style: italic;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+}

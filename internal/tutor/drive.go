@@ -54,16 +54,18 @@ import (
 // evaluations the process cwd belongs to whoever ran last, which nothing
 // reads: every path a lesson touches is resolved during an Eval.
 //
-// The cost is real and worth stating: one student's `sleep 30` blocks
-// every other student's next command for thirty seconds. That is
-// acceptable for what this is — a local tool serving a handful of tabs on
-// one machine — and it is not fixable at this layer. Isolating students
-// properly means a process each.
+// The environment is restored the same way, and for the same reason.
+// `export` mutates process-global state too, so without this a variable
+// one student exported would be visible to every other student — and to
+// their child processes, since exec hands them os.Environ(). The cost is
+// one os.Environ() and a map per evaluation, which is nothing beside the
+// fork it is protecting; the leak it closes is the kind that shows up as
+// a chapter that passes for one tab and fails for the next.
 //
-// The environment is NOT restored the same way. `export` also mutates
-// process-global state, so a variable one student exports is visible to
-// another; no chapter's steps export anything, and snapshotting the whole
-// environment per evaluation would cost more than the leak does.
+// What is left after both of these is the serialization itself, and that
+// is not fixable at this layer: one student's `sleep 30` blocks every
+// other student's next command for thirty seconds. Isolating students
+// properly means a process each.
 var evalGate sync.Mutex
 
 // Driver runs the curriculum for one student outside the REPL loop.
@@ -85,6 +87,12 @@ type Driver struct {
 	// cwd is this driver's place in the filesystem, held across the gaps
 	// when another driver owns the process cwd. See evalGate.
 	cwd string
+
+	// env is the same idea for the process environment: what this driver
+	// left behind, reinstated before its next evaluation. Nil until the
+	// first one completes, which is what makes the very first restore a
+	// no-op rather than a wipe of the environment the server started with.
+	env []string
 
 	// buf and pend are repl.loop's continuation state, which lives on its
 	// stack there and has to live somewhere here: a host hands us one
@@ -418,9 +426,49 @@ func (d *Driver) locked(fn func()) {
 	if d.cwd != "" {
 		_ = os.Chdir(d.cwd)
 	}
+	d.restoreEnv()
 	fn()
-	// Whatever the student's `cd` did is where they now stand.
+	// Whatever the student's `cd` and `export` did is where they now stand.
 	if wd, err := os.Getwd(); err == nil {
 		d.cwd = wd
+	}
+	d.env = os.Environ()
+}
+
+// restoreEnv reinstates this driver's environment over whatever the last
+// driver to run left in the process. Callers hold evalGate.
+//
+// It is a three-way reconciliation rather than a clear-and-set because
+// there is no way to clear the environment atomically, and a moment with
+// no PATH in it is a moment a concurrently-forking child could see. So:
+// anything the process has that this driver did not is removed, anything
+// whose value differs is corrected, and anything missing is added. Most
+// evaluations change nothing and this does no syscalls at all.
+func (d *Driver) restoreEnv() {
+	if d.env == nil {
+		return // first evaluation: the process environment IS ours
+	}
+	want := make(map[string]string, len(d.env))
+	for _, kv := range d.env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k != "" {
+			want[k] = v
+		}
+	}
+	for _, kv := range os.Environ() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			continue
+		}
+		w, mine := want[k]
+		switch {
+		case !mine:
+			_ = os.Unsetenv(k) // another driver exported it; not ours
+		case w != v:
+			_ = os.Setenv(k, w)
+		}
+		delete(want, k)
+	}
+	for k, v := range want { // another driver unset it; put it back
+		_ = os.Setenv(k, v)
 	}
 }
